@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use solidcore::{EdgeId, FaceId};
 
+use crate::backend::FaceBackend;
+
 /// A length given outright or as a fraction of the model size (the diagonal of the
 /// box of the B-rep's vertices and edges, sampled).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -159,6 +161,10 @@ pub struct TessellateOptions {
     pub face_hook: Option<FaceHook>,
     /// Per-edge override hook, consulted for edges without a map entry.
     pub edge_hook: Option<EdgeHook>,
+    /// Supplies faces' interior grid lines (it may decline a face; the built-in sampled
+    /// grid then). The triangulation and refinement stay the same. `None`: the built-in
+    /// grid for every face.
+    pub backend: Option<Arc<dyn FaceBackend>>,
 }
 
 impl fmt::Debug for TessellateOptions {
@@ -177,6 +183,7 @@ impl fmt::Debug for TessellateOptions {
             .field("edge_overrides", &self.edge_overrides)
             .field("face_hook", &self.face_hook.as_ref().map(|_| "Fn"))
             .field("edge_hook", &self.edge_hook.as_ref().map(|_| "Fn"))
+            .field("backend", &self.backend.as_ref().map(|b| b.name()))
             .finish()
     }
 }
@@ -192,7 +199,7 @@ impl TessellateOptions {
     /// The options of a quality preset: chord tolerance relative to the model size and
     /// angle tolerance as listed on [`Quality`]; no length bounds, at most 250 000
     /// triangles per face, 32 refinement passes, every output on, no deviation
-    /// measurement, no overrides.
+    /// measurement, no overrides, no backend.
     #[must_use]
     pub fn preset(q: Quality) -> Self {
         let (chord, angle) = match q {
@@ -214,6 +221,7 @@ impl TessellateOptions {
             edge_overrides: BTreeMap::new(),
             face_hook: None,
             edge_hook: None,
+            backend: None,
         }
     }
 

@@ -1,21 +1,11 @@
-//! The B-spline fast path: grid line spacing per knot span from a bound on the second
-//! derivative, and grid evaluation one row at a time.
-//!
-//! On one knot span a curve's second derivative is a B-spline whose control points
-//! bound it, and every iso-curve of a surface is a convex combination of its pole rows,
-//! so the largest second-derivative control point over the rows bounds the sag of a
-//! chord of parameter length `h` by `h^2 * bound / 8` on every iso-curve at once (for
-//! rational surfaces the Cartesian poles give an estimate, not a bound). Grid
-//! evaluation computes each grid line's basis functions once, contracts the poles
-//! along it to one row, and evaluates every point of the line as a short dot product.
-//! (Idea from the nurbs-grid-mesh design note, Apache-2.0; own code.)
+//! A B-spline surface evaluated directly (one point with its first derivatives, the
+//! basis on the stack): the evaluation fast path for faces whose surface evaluates
+//! through its B-spline. It does no meshing: dense NURBS faces can go to the
+//! nurbs-grid-mesh backend ([`crate::backend`]).
 
 use solidcore::math::{Point3, Vec3};
 use solidcore::nurbs::b_spline_surface::BSplineSurface;
 use solidcore::surface::surface::{Surface, SurfaceKind};
-
-/// Most grid cells one knot span gets from the bound.
-const MAX_CELLS_PER_SPAN: f64 = 64.0;
 
 /// A B-spline surface as plain arrays: degrees, full knot vectors and homogeneous poles.
 #[derive(Debug, Clone)]
@@ -55,162 +45,91 @@ fn b_spline(s: &Surface) -> Option<&BSplineSurface> {
     }
 }
 
+/// A surface's B-spline as plain arrays: degrees, full knot vectors, pole counts,
+/// Cartesian poles (`(i, j)` at `i * nv + j`) and weights when rational.
+#[derive(Debug, Clone)]
+pub(crate) struct Canonical {
+    pub p: usize,
+    pub q: usize,
+    pub uk: Vec<f64>,
+    pub vk: Vec<f64>,
+    pub nu: usize,
+    pub nv: usize,
+    pub poles: Vec<[f64; 3]>,
+    pub weights: Option<Vec<f64>>,
+}
+
+/// The B-spline arrays of `s`, `None` for a surface evaluated otherwise or with
+/// inconsistent arrays.
+pub(crate) fn canonical_arrays(s: &Surface) -> Option<Canonical> {
+    let c = b_spline(s)?.canonical().ok()?;
+    let uk = expand(&c.u_knots, &c.u_multiplicities);
+    let vk = expand(&c.v_knots, &c.v_multiplicities);
+    let (p, q) = (c.u_degree, c.v_degree);
+    let nu = uk.len().checked_sub(p + 1)?;
+    let nv = vk.len().checked_sub(q + 1)?;
+    if nu == 0 || nv == 0 || c.control_points.len() != nu.checked_mul(nv)? {
+        return None;
+    }
+    let rational = c.weights.len() == c.control_points.len();
+    Some(Canonical {
+        p,
+        q,
+        uk,
+        vk,
+        nu,
+        nv,
+        poles: c
+            .control_points
+            .iter()
+            .map(|pt| [pt.x, pt.y, pt.z])
+            .collect(),
+        weights: rational.then(|| c.weights.clone()),
+    })
+}
+
 impl Nurbs {
     /// The B-spline data of `s`, `None` for a surface evaluated otherwise or with
     /// inconsistent arrays.
     pub(crate) fn from_surface(s: &Surface) -> Option<Self> {
-        let c = b_spline(s)?.canonical().ok()?;
-        let uk = expand(&c.u_knots, &c.u_multiplicities);
-        let vk = expand(&c.v_knots, &c.v_multiplicities);
-        let (p, q) = (c.u_degree, c.v_degree);
-        let nu = uk.len().checked_sub(p + 1)?;
-        let nv = vk.len().checked_sub(q + 1)?;
-        if nu == 0 || nv == 0 || c.control_points.len() != nu.checked_mul(nv)? {
-            return None;
-        }
-        let rational = c.weights.len() == c.control_points.len();
+        let c = canonical_arrays(s)?;
         let pw = c
-            .control_points
+            .poles
             .iter()
             .enumerate()
-            .map(|(i, pt)| {
-                let w = if rational {
-                    c.weights.get(i).copied().unwrap_or(1.0)
-                } else {
-                    1.0
-                };
-                [pt.x * w, pt.y * w, pt.z * w, w]
+            .map(|(i, [x, y, z])| {
+                let w = c
+                    .weights
+                    .as_ref()
+                    .and_then(|w| w.get(i))
+                    .copied()
+                    .unwrap_or(1.0);
+                [x * w, y * w, z * w, w]
             })
             .collect();
         Some(Self {
-            p,
-            q,
-            uk,
-            vk,
-            nu,
-            nv,
+            p: c.p,
+            q: c.q,
+            uk: c.uk,
+            vk: c.vk,
+            nu: c.nu,
+            nv: c.nv,
             pw,
         })
+    }
+
+    /// Knot spans (of nonzero length) meeting `[lo, hi]` in u (`along_u`) or v.
+    pub(crate) fn spans_in(&self, along_u: bool, lo: f64, hi: f64) -> usize {
+        let k = if along_u { &self.uk } else { &self.vk };
+        k.windows(2)
+            .filter(|w| matches!(w, [a, b] if b > a && *b > lo && *a < hi))
+            .count()
     }
 
     fn pole(&self, i: usize, j: usize) -> Option<[f64; 4]> {
         self.pw
             .get(i.checked_mul(self.nv)?.checked_add(j)?)
             .copied()
-    }
-
-    /// Grid lines in u (`along_u`) or v over `[lo, hi]`: spaced so that the cells the
-    /// second-derivative bound of each knot span asks for at chord tolerance `chord`
-    /// (over the pole rows acting on `other`) add up to one per cell, with a line at
-    /// every knot where the surface may kink (multiplicity at least the degree).
-    pub(crate) fn lines(
-        &self,
-        along_u: bool,
-        lo: f64,
-        hi: f64,
-        other: (f64, f64),
-        chord: f64,
-    ) -> Vec<f64> {
-        let (deg, knots, n) = if along_u {
-            (self.p, &self.uk, self.nu)
-        } else {
-            (self.q, &self.vk, self.nv)
-        };
-        let (odeg, oknots, on) = if along_u {
-            (self.q, &self.vk, self.nv)
-        } else {
-            (self.p, &self.uk, self.nu)
-        };
-        // the pole rows that act on the other direction's range
-        let r0 = span(oknots, odeg, on, other.0).saturating_sub(odeg);
-        let r1 = span(oknots, odeg, on, other.1).min(on.saturating_sub(1));
-        let multiplicity = |t: f64| knots.iter().filter(|k| **k == t).count();
-        let mut out = Vec::new();
-        // cells accumulated since the last line
-        let mut acc = 0.0_f64;
-        for s in deg..n {
-            let (Some(&a), Some(&b)) = (knots.get(s), knots.get(s + 1)) else {
-                continue;
-            };
-            if b <= a || b.is_nan() || b <= lo || a >= hi {
-                continue;
-            }
-            if a > lo && multiplicity(a) >= deg.max(1) {
-                out.push(a);
-                acc = 0.0;
-            }
-            let (a, b) = (a.max(lo), b.min(hi));
-            let bound = self.second_derivative_bound(along_u, s, (r0, r1));
-            let total = if bound > 0.0 && chord > 0.0 {
-                ((b - a) * (bound / (8.0 * chord)).sqrt()).min(MAX_CELLS_PER_SPAN)
-            } else {
-                0.0
-            };
-            if total <= 0.0 || total.is_nan() {
-                continue;
-            }
-            let per_param = total / (b - a);
-            let mut need = 1.0 - acc;
-            let mut pos = a;
-            let mut remaining = total;
-            while remaining >= need {
-                pos += need / per_param;
-                if pos < hi {
-                    out.push(pos);
-                }
-                remaining -= need;
-                need = 1.0;
-            }
-            acc = 1.0 - need + remaining;
-        }
-        out
-    }
-
-    /// The largest second-derivative control point (Cartesian) of knot span `s` in u
-    /// (`along_u`) or v over pole rows `rows` of the other direction.
-    fn second_derivative_bound(&self, along_u: bool, s: usize, rows: (usize, usize)) -> f64 {
-        let (deg, knots) = if along_u {
-            (self.p, &self.uk)
-        } else {
-            (self.q, &self.vk)
-        };
-        if deg < 2 {
-            return 0.0;
-        }
-        let k = |i: usize| knots.get(i).copied().unwrap_or(0.0);
-        let point = |i: usize, r: usize| -> Option<Vec3> {
-            let w = if along_u {
-                self.pole(i, r)?
-            } else {
-                self.pole(r, i)?
-            };
-            if w[3] == 0.0 {
-                return None;
-            }
-            Some(Vec3::new(w[0] / w[3], w[1] / w[3], w[2] / w[3]))
-        };
-        let pf = deg as f64;
-        let mut bound = 0.0_f64;
-        for r in rows.0..=rows.1 {
-            for i in s.saturating_sub(deg)..=s.saturating_sub(2) {
-                let (Some(p0), Some(p1), Some(p2)) =
-                    (point(i, r), point(i + 1, r), point(i + 2, r))
-                else {
-                    continue;
-                };
-                let d1 = k(i + deg + 1) - k(i + 1);
-                let d2 = k(i + deg + 2) - k(i + 2);
-                let d = k(i + deg + 1) - k(i + 2);
-                if !(d1 > 0.0 && d2 > 0.0 && d > 0.0) {
-                    continue;
-                }
-                let a = (p2 - p1) * (pf / d2);
-                let c = (p1 - p0) * (pf / d1);
-                let q2 = (a - c) * ((pf - 1.0) / d);
-                bound = bound.max(q2.length());
-            }
-        }
-        bound
     }
 
     /// Point, `Su` and `Sv` at `(u, v)`; `None` where it does not evaluate.
@@ -235,74 +154,6 @@ impl Nurbs {
         let su = (Vec3::new(au[0], au[1], au[2]) - p * au[3]) / a[3];
         let sv = (Vec3::new(av[0], av[1], av[2]) - p * av[3]) / a[3];
         Some((p, su, sv))
-    }
-
-    /// Point, `Su` and `Sv` at the grid points `(us[i], vs[j])` of `wanted`, in its
-    /// order, one u line at a time: each line's basis is computed once and the poles
-    /// contracted to one row along v. `None` for a point that does not evaluate.
-    pub(crate) fn eval_grid(
-        &self,
-        us: &[f64],
-        vs: &[f64],
-        wanted: &[(usize, usize)],
-    ) -> Vec<Option<(Point3, Vec3, Vec3)>> {
-        let mut out = vec![None; wanted.len()];
-        let vb: Vec<Option<Basis>> = vs
-            .iter()
-            .map(|v| basis(&self.vk, self.q, self.nv, *v))
-            .collect();
-        // wanted points by u line
-        let mut order: Vec<usize> = (0..wanted.len()).collect();
-        order.sort_by_key(|w| wanted.get(*w).map(|x| x.0));
-        let mut row = vec![[0.0; 4]; self.nv];
-        let mut drow = vec![[0.0; 4]; self.nv];
-        let mut current: Option<usize> = None;
-        let mut ub: Option<Basis> = None;
-        for w in order {
-            let Some(&(i, j)) = wanted.get(w) else {
-                continue;
-            };
-            if current != Some(i) {
-                current = Some(i);
-                ub = us.get(i).and_then(|u| basis(&self.uk, self.p, self.nu, *u));
-                if let Some(b) = &ub {
-                    for (jj, (r, dr)) in row.iter_mut().zip(drow.iter_mut()).enumerate() {
-                        *r = [0.0; 4];
-                        *dr = [0.0; 4];
-                        for (l, (n, dn)) in b.n().iter().zip(b.dn()).enumerate() {
-                            if let Some(pw) = self.pole(b.first + l, jj) {
-                                axpy(r, *n, &pw);
-                                axpy(dr, *dn, &pw);
-                            }
-                        }
-                    }
-                }
-            }
-            let (Some(_), Some(Some(bv))) = (&ub, vb.get(j)) else {
-                continue;
-            };
-            let mut a = [0.0; 4];
-            let mut au = [0.0; 4];
-            let mut av = [0.0; 4];
-            for (l, (n, dn)) in bv.n().iter().zip(bv.dn()).enumerate() {
-                let (Some(r), Some(dr)) = (row.get(bv.first + l), drow.get(bv.first + l)) else {
-                    continue;
-                };
-                axpy(&mut a, *n, r);
-                axpy(&mut au, *n, dr);
-                axpy(&mut av, *dn, r);
-            }
-            if a[3] == 0.0 {
-                continue;
-            }
-            let p = Vec3::new(a[0] / a[3], a[1] / a[3], a[2] / a[3]);
-            let su = (Vec3::new(au[0], au[1], au[2]) - p * au[3]) / a[3];
-            let sv = (Vec3::new(av[0], av[1], av[2]) - p * av[3]) / a[3];
-            if let Some(o) = out.get_mut(w) {
-                *o = Some((p, su, sv));
-            }
-        }
-        out
     }
 }
 
@@ -375,7 +226,11 @@ fn basis(knots: &[f64], deg: usize, n: usize, t: f64) -> Option<Basis> {
         *r0 = 1.0;
     }
     for r in 1..=deg {
-        prev = row;
+        // the r functions of degree r - 1 (copying the whole row costs more than
+        // the recurrence at low degree)
+        for (p, x) in prev.iter_mut().zip(row.iter()).take(r) {
+            *p = *x;
+        }
         for jj in 0..=r {
             // N_{s-r+jj, r}
             let i = (s + jj).checked_sub(r)?;

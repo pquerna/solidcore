@@ -20,6 +20,19 @@ use crate::options::{EdgeParams, FaceParams, TessellateOptions};
 pub const MAX_EDGE_DEPTH: u32 = 30;
 /// Most points of one edge polyline; more is an error.
 pub const MAX_EDGE_POINTS: usize = 1 << 20;
+/// Edge segments smaller than this fraction of the chord tolerance are not split.
+const MIN_SPLIT_FRACTION: f64 = 1e-3;
+/// Most pieces one [`SegmentSplit`] divides a segment into.
+pub const MAX_SPLIT_PIECES: u32 = 64;
+
+/// A boundary segment a face asks to have divided ([`EdgeSet::split_segments`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SegmentSplit {
+    /// The mesh vertices of two neighbouring points of one edge polyline (sorted).
+    pub segment: [u32; 2],
+    /// The equal parameter pieces it should become (at most [`MAX_SPLIT_PIECES`]).
+    pub pieces: u32,
+}
 
 /// The edge polylines of a B-rep and the mesh vertices they hold: the shared input of
 /// every face ([`crate::tessellate_face`]). Its positions are the mesh's first vertices:
@@ -116,11 +129,11 @@ impl EdgeSet {
         Ok(())
     }
 
-    /// Splits the polyline segments between the mesh vertex pairs `segments` (each a
-    /// pair of neighbouring points of one edge polyline, in either order) at their
-    /// parameter midpoints, keeping every other point; returns the edges changed, in
-    /// id order. Pairs that are no polyline segment, and edges at their segment limit,
-    /// are left alone.
+    /// Splits each polyline segment of `segments` (a pair of neighbouring points of one
+    /// edge polyline, in either order; the most pieces asked when one is listed twice)
+    /// into equal parameter pieces, keeping every other point; returns the edges
+    /// changed, in id order. Pairs that are no polyline segment are left alone, and an
+    /// edge stops gaining points at its segment limit.
     ///
     /// # Errors
     ///
@@ -129,14 +142,17 @@ impl EdgeSet {
         &mut self,
         k: &Kernel,
         b: &Brep,
-        segments: &[[u32; 2]],
+        segments: &[SegmentSplit],
     ) -> Result<Vec<EdgeId>> {
-        let wanted: BTreeSet<[u32; 2]> = segments
-            .iter()
-            .map(|[x, y]| if x < y { [*x, *y] } else { [*y, *x] })
-            .collect();
-        // (edge index, segment index) of every wanted segment
-        let mut at: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        let mut wanted: BTreeMap<[u32; 2], u32> = BTreeMap::new();
+        for r in segments {
+            let [x, y] = r.segment;
+            let key = if x < y { [x, y] } else { [y, x] };
+            let n = wanted.entry(key).or_insert(0);
+            *n = (*n).max(r.pieces.min(MAX_SPLIT_PIECES));
+        }
+        // (edge index, segment index, pieces) of every wanted segment
+        let mut at: BTreeMap<usize, Vec<(usize, u32)>> = BTreeMap::new();
         for (ei, poly) in self.edges.iter().enumerate() {
             if poly.degenerate {
                 continue;
@@ -144,8 +160,8 @@ impl EdgeSet {
             for (si, w) in poly.vertices.windows(2).enumerate() {
                 if let [x, y] = w {
                     let key = if x < y { [*x, *y] } else { [*y, *x] };
-                    if wanted.contains(&key) {
-                        at.entry(ei).or_default().push(si);
+                    if let Some(n) = wanted.get(&key) {
+                        at.entry(ei).or_default().push((si, *n));
                     }
                 }
             }
@@ -168,21 +184,29 @@ impl EdgeSet {
                 .unwrap_or(u32::MAX) as usize;
             // back to front, so earlier indices stay valid
             segs.sort_unstable_by(|a, c| c.cmp(a));
-            for si in segs {
+            let before = poly.params.len();
+            for (si, n) in segs {
                 let (Some(&t0), Some(&t1)) = (poly.params.get(si), poly.params.get(si + 1)) else {
                     continue;
                 };
-                let tm = (t0 + t1) / 2.0;
-                if !(tm > t0 && tm < t1)
-                    || poly.params.len() >= MAX_EDGE_POINTS
-                    || poly.params.len() > limit
-                {
-                    continue;
+                // the new points in order after point si
+                for i in 1..n {
+                    let tm = t0 + (t1 - t0) * f64::from(i) / f64::from(n);
+                    let prev = poly.params.get(si + i as usize - 1).copied().unwrap_or(t0);
+                    if !(tm > prev && tm < t1)
+                        || poly.params.len() >= MAX_EDGE_POINTS
+                        || poly.params.len() > limit
+                    {
+                        break;
+                    }
+                    let (p, _) = curve_eval(k, curve, tm, false)?;
+                    let v = self.push(p)?;
+                    poly.params.insert(si + i as usize, tm);
+                    poly.vertices.insert(si + i as usize, v);
                 }
-                let (p, _) = curve_eval(k, curve, tm, false)?;
-                let v = self.push(p)?;
-                poly.params.insert(si + 1, tm);
-                poly.vertices.insert(si + 1, v);
+            }
+            if poly.params.len() == before {
+                continue;
             }
             changed.push(poly.edge);
             if let Some(slot) = self.edges.get_mut(ei) {
@@ -357,9 +381,17 @@ impl EdgeSet {
                     let (pm, dm) = curve_eval(k, curve, tm, false)?;
                     (tm, (pm, dm))
                 };
+                // a segment far below the chord tolerance is left alone (a tangent or
+                // normal still turning there is a singular point's, as at a fillet's
+                // collapsed corner)
+                let size =
+                    s.p0.distance(s.p1)
+                        .max(s.p0.distance(mid.0))
+                        .max(s.p1.distance(mid.0));
                 let can = s.depth < MAX_EDGE_DEPTH
                     && segments < p.max_segments as usize
-                    && s.p0.distance(s.p1) >= 2.0 * p.min_len;
+                    && s.p0.distance(s.p1) >= 2.0 * p.min_len
+                    && size >= MIN_SPLIT_FRACTION * p.chord;
                 let quarters = if can {
                     Some(Self::needs_split(k, curve, &s, mid.0, interval, faces, p)?)
                 } else {

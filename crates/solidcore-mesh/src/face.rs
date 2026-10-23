@@ -20,12 +20,13 @@ use solidcore::topology::edgeuse::p1 as eu1;
 use solidcore::topology::{Brep, EdgeuseId, FaceuseId};
 use solidcore::{FaceId, Result};
 
-use crate::edges::EdgeSet;
+use crate::backend::{BackendFace, FaceBackend, FaceMeshView};
+use crate::edges::{EdgeSet, SegmentSplit, MAX_SPLIT_PIECES};
 use crate::geom::{
     angle, closes, foot, invalid, invert_point, power_of_two, segment_distance, surface_normal,
     surface_point, surface_scales,
 };
-use crate::grid::{grid_lines, MAX_CELL_ASPECT};
+use crate::grid::{grid_lines, MAX_CELL_ASPECT, SAMPLE_GRID};
 use crate::mesh::EdgePolyline;
 use crate::nurbs::Nurbs;
 use crate::options::FaceParams;
@@ -54,7 +55,7 @@ const MIN_POINT_GAP: f64 = 1e-6;
 const MAX_POLE_SEGMENTS: u32 = 1024;
 /// Most generations of refinement points below a boundary or grid point: a criterion
 /// still failing there (a singular point, a kink in the surface) stops refining.
-pub const MAX_LOCAL_DEPTH: u8 = 16;
+pub const MAX_LOCAL_DEPTH: u8 = 48;
 /// Largest loop a face with no area in UV is ear-clipped from, in points.
 const MAX_EAR_LOOP: usize = 256;
 
@@ -116,6 +117,7 @@ type Cdt =
 
 /// The mesh of one face, ready to join a [`crate::Mesh`] ([`crate::assemble`]).
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // independent flags
 pub struct FaceMesh {
     /// The face.
     pub face: FaceId,
@@ -146,6 +148,12 @@ pub struct FaceMesh {
     /// Triangles whose measured deviation exceeds the chord tolerance plus the largest
     /// gap of their corners.
     pub triangles_over: usize,
+    /// The backend that placed the face's grid lines (`None`: the built-in grid).
+    pub backend: Option<&'static str>,
+    /// A backend took the face and failed; the built-in grid was used.
+    pub backend_failed: bool,
+    /// The backend's own measure of the face's deviation (when measured).
+    pub backend_deviation: Option<f64>,
 }
 
 /// A face being meshed, kept between levels.
@@ -188,15 +196,26 @@ pub(crate) struct FaceState {
     good: BTreeSet<[usize; 3]>,
     /// Interior edges found within the tolerances at the current level.
     good_edges: BTreeSet<[usize; 2]>,
-    /// Boundary segments (mesh vertex pairs) too long for a bad triangle on them to be
-    /// refined from inside: the edge polylines should be split there.
-    requests: Vec<[u32; 2]>,
+    /// The tolerances [`FaceState::good`] and [`FaceState::good_edges`] were found
+    /// for (a vertex id keeps its position, so they hold until those change).
+    good_for: Option<FaceParams>,
+    /// Boundary segments too long for a bad triangle on or next to them to be refined
+    /// from inside: the edge polylines should be split there.
+    requests: Vec<SegmentSplit>,
+    /// The grid lines `(us, vs)` of the current level.
+    lines: (Vec<f64>, Vec<f64>),
     /// The edges of the face's loops.
     edges_used: BTreeSet<solidcore::EdgeId>,
     /// A refinement point was refused at [`MAX_LOCAL_DEPTH`] this level.
     depth_capped: bool,
     /// Cells of the last grid inserted.
     grid_cells: usize,
+    /// The backend that placed the face's grid lines at this level.
+    backend: Option<&'static str>,
+    /// The UV box of the loops at the last refinement.
+    bbox: Extent2d,
+    /// A backend took the face and failed; the triangulation meshed it instead.
+    backend_failed: bool,
 }
 
 /// The outward side of face `f`: `+1` when it is the surface normal's side. A solid's
@@ -283,10 +302,15 @@ impl FaceState {
             ears: Vec::new(),
             good: BTreeSet::new(),
             good_edges: BTreeSet::new(),
+            good_for: None,
             requests: Vec::new(),
+            lines: (Vec::new(), Vec::new()),
             edges_used: BTreeSet::new(),
             depth_capped: false,
             grid_cells: 0,
+            backend: None,
+            backend_failed: false,
+            bbox: Extent2d::new(),
         })
     }
 
@@ -503,12 +527,17 @@ impl FaceState {
         b: &Brep,
         edges: &EdgeSet,
         p: &FaceParams,
+        backend: Option<&dyn FaceBackend>,
     ) -> Result<()> {
         let s = surface_of(b, self.face)?;
-        self.good.clear();
-        self.good_edges.clear();
+        if self.good_for != Some(*p) {
+            self.good.clear();
+            self.good_edges.clear();
+            self.good_for = Some(*p);
+        }
         self.unconverged = false;
         self.depth_capped = false;
+        self.backend_failed = false;
         self.requests.clear();
         let loops = self.face_loops(k, b, s, edges, p)?;
         if loops.is_empty() {
@@ -521,11 +550,45 @@ impl FaceState {
         if !(bbox.u_min() <= bbox.u_max() && bbox.v_min() <= bbox.v_max()) {
             return Err(invalid("face loops have no UV points"));
         }
-        let (us, vs) = if bbox.u_min() < bbox.u_max() && bbox.v_min() < bbox.v_max() {
-            grid_lines(k, s, &bbox, self.speed, p, self.nurbs.as_ref())?
+        let (mut us, mut vs) = if bbox.u_min() < bbox.u_max() && bbox.v_min() < bbox.v_max() {
+            // a B-spline is sampled once per knot span at least
+            let samples = self.nurbs.as_ref().map_or(SAMPLE_GRID, |nb| {
+                nb.spans_in(true, bbox.u_min(), bbox.u_max())
+                    .max(nb.spans_in(false, bbox.v_min(), bbox.v_max()))
+            });
+            grid_lines(k, s, &bbox, self.speed, p, samples)?
         } else {
             (Vec::new(), Vec::new())
         };
+        self.bbox = bbox;
+        // a backend's lines, where denser than the sampled ones (those keep the angle
+        // tolerance)
+        self.backend = None;
+        if let Some(be) =
+            backend.filter(|_| bbox.u_min() < bbox.u_max() && bbox.v_min() < bbox.v_max())
+        {
+            let face = BackendFace {
+                face: self.face,
+                surface: s,
+                bbox,
+                chord: p.chord,
+                angle: p.angle,
+            };
+            match be.grid_lines(k, &face) {
+                Some(Ok((bu, bv))) => {
+                    self.backend = Some(be.name());
+                    if bu.len() > us.len() {
+                        us = bu;
+                    }
+                    if bv.len() > vs.len() {
+                        vs = bv;
+                    }
+                }
+                // the sampled grid for a face the backend failed on
+                Some(Err(_)) => self.backend_failed = true,
+                None => {}
+            }
+        }
         let step =
             |lines: &[f64], lo: f64, hi: f64, sc: f64| (hi - lo) * sc / (lines.len() + 1) as f64;
         let has_pole = loops.iter().flatten().any(|q| q.pole_next);
@@ -567,6 +630,7 @@ impl FaceState {
 
         // the boundary, pole runs expanded
         let expanded = self.expand_poles(&loops, scaled_step);
+
         if first || remetric || !self.update_boundary(k, s, &loops, &expanded)? {
             self.rebuild(k, s, &loops, &expanded)?;
         }
@@ -591,19 +655,21 @@ impl FaceState {
             self.insert_grid(k, s, &us, &vs, scaled_step)?;
             self.grid_cells = cells;
         }
+        self.lines = (us, vs);
 
         // refinement
         let mut converged = false;
+        let mut changed: Option<Vec<FixedVertexHandle>> = None;
         for _ in 0..p.max_passes {
             if self.cdt.num_inner_faces() >= p.max_triangles {
                 break;
             }
-            let candidates = self.refine_candidates(k, s, p)?;
+            let candidates = self.refine_candidates(k, s, p, changed.as_deref())?;
             if candidates.is_empty() {
                 converged = true;
                 break;
             }
-            let mut added = 0;
+            let mut inserted = Vec::new();
             for (uv, depth) in candidates {
                 if self.cdt.num_inner_faces() >= p.max_triangles {
                     break;
@@ -627,9 +693,10 @@ impl FaceState {
                 }) {
                     continue;
                 }
-                self.insert_interior(k, s, uv, None, depth)?;
-                added += 1;
+                inserted.push(self.insert_interior(k, s, uv, None, depth)?);
             }
+            let added = inserted.len();
+            changed = Some(inserted);
             if added == 0 {
                 converged = true;
                 break;
@@ -872,14 +939,19 @@ impl FaceState {
             self.constrain(k, s, ha, hc)?;
         }
         if !old.is_empty() {
+            // which points are inside, all decided on the boundary's triangulation (an
+            // insertion makes faces the flood fill has not seen)
             let inside = inside_faces(&self.cdt);
-            for id in old {
-                let Some(uv) = self.vertices.get(id).map(|v| v.uv) else {
-                    continue;
-                };
-                if self.clear_of_boundary(&inside, uv, 0.0) {
-                    self.insert_existing(id)?;
-                }
+            let keep: Vec<usize> = old
+                .into_iter()
+                .filter(|id| {
+                    self.vertices
+                        .get(*id)
+                        .is_some_and(|v| self.clear_of_boundary(&inside, v.uv, 0.0))
+                })
+                .collect();
+            for id in keep {
+                self.insert_existing(id)?;
             }
         }
         Ok(())
@@ -1070,26 +1142,11 @@ impl FaceState {
                 }
             }
         }
-        // the B-spline fast path evaluates the wanted points line by line
-        let fast = self.nurbs.as_ref().map(|nb| nb.eval_grid(us, vs, &wanted));
-        let cross_sign = self.fast.map(|x| x * self.sense);
-        for (w, (i, j)) in wanted.iter().enumerate() {
-            let (Some(u), Some(v)) = (us.get(*i), vs.get(*j)) else {
+        for (i, j) in wanted {
+            let (Some(u), Some(v)) = (us.get(i), vs.get(j)) else {
                 continue;
             };
-            let uv = Point2::new(*u, *v);
-            let pre = match (&fast, cross_sign) {
-                (Some(f), Some(sign)) => f.get(w).copied().flatten().map(|(pt, su, sv)| {
-                    // near a pole the fast cross product is noise: the surface's own
-                    // normal then
-                    let n = unit_cross(su, sv)
-                        .map(|n| n * (sign * self.sense))
-                        .or_else(|| self.outward(k, s, uv));
-                    (pt, n)
-                }),
-                _ => None,
-            };
-            self.insert_interior(k, s, uv, pre, 0)?;
+            self.insert_interior(k, s, Point2::new(*u, *v), None, 0)?;
         }
         Ok(())
     }
@@ -1157,6 +1214,70 @@ impl FaceState {
                 .all(|f| is_inside(inside, f) && constraint_clearance(&self.cdt, f, pos) >= need)
     }
 
+    /// Asks for boundary segment `r.segment` to be split (into the most pieces asked).
+    fn request(&mut self, r: SegmentSplit) {
+        match self.requests.iter_mut().find(|q| q.segment == r.segment) {
+            Some(q) => q.pieces = q.pieces.max(r.pieces),
+            None => self.requests.push(r),
+        }
+    }
+
+    /// The request to split boundary segment `e` (between two mesh vertices) into one
+    /// piece more than the grid lines it crosses, at least two.
+    fn split_request(&self, e: FixedUndirectedEdgeHandle) -> Option<SegmentSplit> {
+        let [va, vb] = self.cdt.undirected_edge(e).vertices();
+        let a = self.vertices.get(va.data().id)?;
+        let b = self.vertices.get(vb.data().id)?;
+        let (x, y) = (a.vertex?, b.vertex?);
+        if x == y {
+            return None;
+        }
+        let crossed = |lines: &[f64], p: f64, q: f64| {
+            let (lo, hi) = if p < q { (p, q) } else { (q, p) };
+            lines.iter().filter(|t| **t > lo && **t < hi).count()
+        };
+        let n = crossed(&self.lines.0, a.uv.x, b.uv.x)
+            .max(crossed(&self.lines.1, a.uv.y, b.uv.y))
+            .saturating_add(1);
+        let pieces = u32::try_from(n)
+            .unwrap_or(MAX_SPLIT_PIECES)
+            .clamp(2, MAX_SPLIT_PIECES);
+        Some(SegmentSplit {
+            segment: if x < y { [x, y] } else { [y, x] },
+            pieces,
+        })
+    }
+
+    /// The split request for the boundary segment nearest `uv` (inside the loops) when
+    /// it is longer than `len` (scaled UV).
+    fn blocking_segment(&self, inside: &[bool], uv: Point2, len: f64) -> Option<SegmentSplit> {
+        let pos = self.scaled(uv);
+        let f = match self.cdt.locate(pos) {
+            PositionInTriangulation::OnFace(f) => f,
+            PositionInTriangulation::OnEdge(e) => {
+                let d = self.cdt.directed_edge(e);
+                [d.face().as_inner(), d.rev().face().as_inner()]
+                    .into_iter()
+                    .flatten()
+                    .next()?
+                    .fix()
+            }
+            _ => return None,
+        };
+        if !is_inside(inside, f) {
+            return None;
+        }
+        let (_, e) = nearest_constraint(&self.cdt, f, pos);
+        let e = e?;
+        let [x, y] = self.cdt.undirected_edge(e).positions();
+        let seg = ((y.x - x.x).powi(2) + (y.y - x.y).powi(2)).sqrt();
+        if seg > len {
+            self.split_request(e)
+        } else {
+            None
+        }
+    }
+
     /// A point a quarter of directed edge `e`'s length beyond its midpoint, on the side
     /// away from `e`'s face, when it falls inside the loops clear of the boundary.
     fn beyond_chord(
@@ -1191,17 +1312,43 @@ impl FaceState {
         k: &Kernel,
         s: &Surface,
         p: &FaceParams,
+        changed: Option<&[FixedVertexHandle]>,
     ) -> Result<Vec<(Point2, u8)>> {
         let inside = inside_faces(&self.cdt);
+        // every triangle and edge, or (after a pass that only inserted points) those
+        // around the new points: every other one was checked with the same neighbours
+        let (faces, edges): (
+            Vec<FixedFaceHandle<InnerTag>>,
+            Vec<FixedUndirectedEdgeHandle>,
+        ) = match changed {
+            None => (
+                self.cdt.inner_faces().map(|f| f.fix()).collect(),
+                self.cdt.undirected_edges().map(|e| e.fix()).collect(),
+            ),
+            Some(vs) => {
+                let mut fs = BTreeSet::new();
+                let mut es = BTreeSet::new();
+                for v in vs {
+                    for e in self.cdt.vertex(*v).out_edges() {
+                        es.insert(e.fix().as_undirected());
+                        if let Some(f) = e.face().as_inner() {
+                            fs.insert(f.fix());
+                        }
+                    }
+                }
+                (fs.into_iter().collect(), es.into_iter().collect())
+            }
+        };
         let tol = p.chord;
         let mut split_edges: Vec<FixedUndirectedEdgeHandle> = Vec::new();
         let mut marked: BTreeSet<usize> = BTreeSet::new();
-        let mut centroids: Vec<(Point2, f64, Option<[u32; 2]>, u8)> = Vec::new();
+        let mut centroids: Vec<(Point2, f64, Option<SegmentSplit>, u8)> = Vec::new();
         let mut newly_good = Vec::new();
-        for face in self.cdt.inner_faces() {
-            if !is_inside(&inside, face.fix()) {
+        for fh in faces {
+            if !is_inside(&inside, fh) {
                 continue;
             }
+            let face = self.cdt.face(fh);
             let [va, vb, vc] = face.vertices();
             let ids = {
                 let mut x = [va.data().id, vb.data().id, vc.data().id];
@@ -1297,13 +1444,7 @@ impl FaceState {
             let depth = a.depth.max(b.depth).max(c.depth).saturating_add(1);
             if self.cdt.is_constraint_edge(ue) {
                 // too close to that boundary segment, the segment itself is split
-                let [x, y] = e
-                    .vertices()
-                    .map(|v| self.vertices.get(v.data().id).and_then(|w| w.vertex));
-                let request = match (x, y) {
-                    (Some(x), Some(y)) if x != y => Some(if x < y { [x, y] } else { [y, x] }),
-                    _ => None,
-                };
+                let request = self.split_request(ue);
                 centroids.push((uv, CLEARANCE_FRACTION * longest_len.sqrt(), request, depth));
             } else if [a, b, c].iter().all(|x| x.boundary) {
                 // all corners on the boundary (an ear between boundary points):
@@ -1317,8 +1458,9 @@ impl FaceState {
             }
         }
         let mut good_edges = Vec::new();
-        for edge in self.cdt.undirected_edges() {
-            if self.cdt.is_constraint_edge(edge.fix()) || marked.contains(&edge.fix().index()) {
+        for eh in edges {
+            let edge = self.cdt.undirected_edge(eh);
+            if self.cdt.is_constraint_edge(eh) || marked.contains(&eh.index()) {
                 continue;
             }
             let [va, vb] = edge.vertices();
@@ -1378,6 +1520,10 @@ impl FaceState {
                 self.depth_capped = true;
             } else if self.clear_of_boundary(&inside, uv, CLEARANCE_FRACTION * len) {
                 out.push((uv, depth));
+            } else if let Some(r) = self.blocking_segment(&inside, uv, len) {
+                // a boundary segment longer than the edge keeps the split off it (a fan
+                // from a long segment's ends): that segment is split
+                self.request(r);
             }
         }
         for (uv, need, request, depth) in centroids {
@@ -1386,9 +1532,7 @@ impl FaceState {
             } else if self.clear_of_boundary(&inside, uv, need) {
                 out.push((uv, depth));
             } else if let Some(r) = request {
-                if !self.requests.contains(&r) {
-                    self.requests.push(r);
-                }
+                self.request(r);
             }
         }
         Ok(out)
@@ -1476,7 +1620,13 @@ impl FaceState {
     }
 
     /// The face's mesh now, over the vertices its triangles use.
-    pub(crate) fn snapshot(&self, k: &Kernel, b: &Brep, chord: Option<f64>) -> Result<FaceMesh> {
+    pub(crate) fn snapshot(
+        &self,
+        k: &Kernel,
+        b: &Brep,
+        chord: Option<f64>,
+        backend: Option<&dyn FaceBackend>,
+    ) -> Result<FaceMesh> {
         let tris = self.triangles();
         let mut local: BTreeMap<usize, u32> = BTreeMap::new();
         let mut m = FaceMesh {
@@ -1493,6 +1643,9 @@ impl FaceState {
             gaps: Vec::new(),
             deviation: None,
             triangles_over: 0,
+            backend: self.backend,
+            backend_failed: self.backend_failed,
+            backend_deviation: None,
         };
         for t in &tris {
             let mut corners = [0u32; 3];
@@ -1522,6 +1675,22 @@ impl FaceState {
             let (dev, over) = crate::deviation::face_mesh_deviation(k, s, &self.domain, &m, chord);
             m.deviation = Some(dev);
             m.triangles_over = over;
+            // the backend's own measure of a face whose grid it placed
+            if let (Some(be), Some(_)) = (backend, self.backend) {
+                let face = BackendFace {
+                    face: self.face,
+                    surface: s,
+                    bbox: self.bbox,
+                    chord,
+                    angle: 0.0,
+                };
+                let view = FaceMeshView {
+                    uvs: &m.uvs,
+                    positions: &m.positions,
+                    triangles: &m.triangles,
+                };
+                m.backend_deviation = be.deviation(k, &face, &view);
+            }
         }
         Ok(m)
     }
@@ -1531,10 +1700,10 @@ impl FaceState {
         self.face
     }
 
-    /// Boundary segments, as sorted mesh vertex pairs, that the last refinement could
-    /// not resolve from inside the face: splitting them in the edge polylines
+    /// Boundary segments (sorted mesh vertex pairs, with the pieces each should become)
+    /// that the last refinement could not resolve from inside the face: splitting them in the edge polylines
     /// ([`EdgeSet::split_segments`]) and refining again lets it.
-    pub(crate) fn requests(&self) -> &[[u32; 2]] {
+    pub(crate) fn requests(&self) -> &[SegmentSplit] {
         &self.requests
     }
 
@@ -1785,13 +1954,27 @@ fn segment_distance_2d(p: spade::Point2<f64>, a: spade::Point2<f64>, b: spade::P
 /// The distance from `p` (in face `f`) to the nearest constraint edge of `f` or of its
 /// neighbours.
 fn constraint_clearance(cdt: &Cdt, f: FixedFaceHandle<InnerTag>, p: spade::Point2<f64>) -> f64 {
-    let mut best = f64::INFINITY;
+    nearest_constraint(cdt, f, p).0
+}
+
+/// The nearest constraint edge to `p` of face `f` and its neighbours, and its distance
+/// (infinite and `None` when there is none).
+fn nearest_constraint(
+    cdt: &Cdt,
+    f: FixedFaceHandle<InnerTag>,
+    p: spade::Point2<f64>,
+) -> (f64, Option<FixedUndirectedEdgeHandle>) {
+    let mut best = (f64::INFINITY, None);
     for e in cdt.face(f).adjacent_edges() {
         let mut check =
             |x: spade::handles::DirectedEdgeHandle<'_, CdtVertex, (), spade::CdtEdge<()>, ()>| {
-                if cdt.is_constraint_edge(x.fix().as_undirected()) {
+                let u = x.fix().as_undirected();
+                if cdt.is_constraint_edge(u) {
                     let [a, b] = x.positions();
-                    best = best.min(segment_distance_2d(p, a, b));
+                    let d = segment_distance_2d(p, a, b);
+                    if d < best.0 {
+                        best = (d, Some(u));
+                    }
                 }
             };
         check(e);

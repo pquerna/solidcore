@@ -45,6 +45,9 @@ pub struct MeshStats {
     pub face_deviation: Option<f64>,
     /// Of [`MeshStats::max_deviation`], the part from edge segments.
     pub edge_deviation: Option<f64>,
+    /// Largest deviation of the faces whose grid a backend placed, by the backend's own
+    /// measure (when measured).
+    pub backend_deviation: Option<f64>,
     /// Triangles whose measured deviation exceeds their face's chord tolerance plus the
     /// gap of their corners from the surface (the B-rep's own edge/face gaps).
     pub triangles_over: usize,
@@ -91,6 +94,10 @@ pub struct Mesh {
     /// Faces with no area in UV that were filled by clipping ears off their boundary
     /// loop in 3D.
     pub ear_clipped_faces: Vec<FaceId>,
+    /// Faces whose grid lines a [`crate::backend::FaceBackend`] placed.
+    pub backend_faces: Vec<FaceId>,
+    /// Faces a backend took and failed on; the built-in grid was used.
+    pub backend_failed_faces: Vec<FaceId>,
     /// Measurements and effort.
     pub stats: MeshStats,
 }

@@ -240,7 +240,7 @@ fn per_face_api_matches_tessellate() {
             })
             .collect();
         for _ in 0..MAX_BOUNDARY_ROUNDS {
-            let mut requests: Vec<[u32; 2]> = faces
+            let mut requests: Vec<SegmentSplit> = faces
                 .iter()
                 .flat_map(|t| t.boundary_requests().iter().copied())
                 .collect();

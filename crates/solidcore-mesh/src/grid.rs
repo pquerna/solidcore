@@ -7,7 +7,6 @@ use solidcore::surface::surface::Surface;
 use solidcore::Result;
 
 use crate::geom::{angle, segment_distance, surface_normal, surface_point};
-use crate::nurbs::Nurbs;
 use crate::options::FaceParams;
 
 /// Most interior grid lines per UV direction of one face.
@@ -18,24 +17,26 @@ pub const MAX_GRID_LINES: usize = 2048;
 const GRID_CHORD_MARGIN: f64 = 0.7;
 /// A direction whose sample intervals all need less than this many cells is straight.
 const STRAIGHT: f64 = 0.05;
-/// Cells per direction of the sample grid that sizes a face's grid.
-const SAMPLE_GRID: usize = 8;
+/// Fewest cells per direction of the sample grid that sizes a face's grid.
+pub(crate) const SAMPLE_GRID: usize = 8;
+/// Most cells per direction of that sample grid (a B-spline asks for one per knot span).
+const MAX_SAMPLE_GRID: usize = 48;
 /// Largest aspect ratio, in scaled UV, of a curved face's grid cells.
 pub(crate) const MAX_CELL_ASPECT: f64 = 6.0;
 
 /// The interior grid lines `(us, vs)` over `bbox` (strictly inside it, increasing):
 /// from the chord deviation, normal turning and length between neighbouring points of
-/// a sample grid, refined per knot span for a B-spline (`nurbs`), with cells of bounded
-/// aspect in scaled UV on a curved face. A flat face gets none.
+/// a sample grid, with cells of bounded aspect in scaled UV on a curved face. A flat face
+/// gets none.
 pub(crate) fn grid_lines(
     k: &Kernel,
     s: &Surface,
     bbox: &Extent2d,
     scale: (f64, f64),
     p: &FaceParams,
-    nurbs: Option<&Nurbs>,
+    samples: usize,
 ) -> Result<(Vec<f64>, Vec<f64>)> {
-    let n = SAMPLE_GRID;
+    let n = samples.clamp(SAMPLE_GRID, MAX_SAMPLE_GRID);
     let at = |i: usize, j: usize| {
         Point2::new(
             bbox.u_min() + (bbox.u_max() - bbox.u_min()) * i as f64 / n as f64,
@@ -79,35 +80,8 @@ pub(crate) fn grid_lines(
             *c = c.max(need((i, j), (i, j + 1))?);
         }
     }
-    let mut us = lines_from(&cu, bbox.u_min(), bbox.u_max());
-    let mut vs = lines_from(&cv, bbox.v_min(), bbox.v_max());
-    // a B-spline's lines come from its knot spans' second-derivative bound; the sampled
-    // lines stay where they are denser (the angle tolerance can ask for more)
-    if let Some(nb) = nurbs {
-        let curved = |c: &[f64]| c.iter().any(|x| *x > 0.0);
-        if curved(&cu) || curved(&cv) {
-            let nu = nb.lines(
-                true,
-                bbox.u_min(),
-                bbox.u_max(),
-                (bbox.v_min(), bbox.v_max()),
-                GRID_CHORD_MARGIN * p.chord,
-            );
-            let nv = nb.lines(
-                false,
-                bbox.v_min(),
-                bbox.v_max(),
-                (bbox.u_min(), bbox.u_max()),
-                GRID_CHORD_MARGIN * p.chord,
-            );
-            if nu.len() > us.len() {
-                us = nu;
-            }
-            if nv.len() > vs.len() {
-                vs = nv;
-            }
-        }
-    }
+    let us = lines_from(&cu, bbox.u_min(), bbox.u_max());
+    let vs = lines_from(&cv, bbox.v_min(), bbox.v_max());
     let lu = (bbox.u_max() - bbox.u_min()) * scale.0;
     let lv = (bbox.v_max() - bbox.v_min()) * scale.1;
     let mut us = tidy(us, bbox.u_min(), bbox.u_max());

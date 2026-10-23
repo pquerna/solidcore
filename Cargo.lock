@@ -254,6 +254,7 @@ dependencies = [
 name = "solidcore-mesh"
 version = "0.0.1"
 dependencies = [
+ "nurbs-grid-mesh",
  "solidcore",
  "spade",
 ]

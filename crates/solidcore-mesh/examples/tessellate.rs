@@ -12,6 +12,8 @@
 //! - `--stl <path>`: binary STL of the (last) model; `--json <path>`: the viewer JSON
 //!   (schema below).
 //! - `--edges-only`: only the edge polylines.
+//! - `--grid-backend <min poles>` (feature `nurbs-grid-mesh`): grid lines of B-spline faces with at
+//!   least that many control points come from the nurbs-grid-mesh backend.
 //! - `--lods <r1,r2,...>`: nested levels at these relative chords ([`solidcore_mesh::Tessellator`]),
 //!   each timed against an independent run, with its measured deviation.
 //! - `--bench`: every model at relative chords 1e-2, 1e-3 and 1e-4, with time,
@@ -131,6 +133,26 @@ struct Args {
     per_face: bool,
 }
 
+#[cfg(feature = "nurbs-grid-mesh")]
+#[allow(clippy::unnecessary_wraps)] // the same signature as without the feature
+fn grid_backend(
+    min_poles: usize,
+) -> Result<Option<std::sync::Arc<dyn solidcore_mesh::backend::FaceBackend>>, String> {
+    Ok(Some(std::sync::Arc::new(
+        solidcore_mesh::backend::NurbsGridBackend {
+            min_poles,
+            ..Default::default()
+        },
+    )))
+}
+
+#[cfg(not(feature = "nurbs-grid-mesh"))]
+fn grid_backend(
+    _: usize,
+) -> Result<Option<std::sync::Arc<dyn solidcore_mesh::backend::FaceBackend>>, String> {
+    Err("--grid-backend needs the nurbs-grid-mesh feature".into())
+}
+
 fn parse() -> Result<Args, String> {
     let mut a = Args {
         models: Vec::new(),
@@ -171,6 +193,11 @@ fn parse() -> Result<Args, String> {
             "--per-face" => a.per_face = true,
             "--bench" => a.bench = true,
             "--no-ref" => a.no_ref = true,
+            "--grid-backend" => {
+                // nurbs-grid-mesh for B-spline faces of at least this many poles
+                let min = num(it.next(), "--grid-backend")? as usize;
+                a.opts.backend = grid_backend(min)?;
+            }
             "--measure" => a.opts.measure_deviation = true,
             "--lods" => {
                 let s = it.next().ok_or("--lods needs r1,r2,...")?;
@@ -247,7 +274,7 @@ fn summary(m: &Mesh) -> String {
         .max_deviation
         .map_or("-".to_string(), |d| format!("{d:.3e}"));
     format!(
-        "V {} T {} degenerate {degenerate} flipped {flipped} open {} nonmanifold {} inconsistent {} failures {} unconverged {} split {} ears {} inverted {} dev {dev}",
+        "V {} T {} degenerate {degenerate} flipped {flipped} open {} nonmanifold {} inconsistent {} failures {} unconverged {} split {} ears {} inverted {} grid backend {} (failed {}) dev {dev}",
         m.used_vertices(),
         m.triangles.len(),
         r.open.len(),
@@ -258,6 +285,8 @@ fn summary(m: &Mesh) -> String {
         m.split_boundary_faces.len(),
         m.ear_clipped_faces.len(),
         m.inverted_edgeuses.len(),
+        m.backend_faces.len(),
+        m.backend_failed_faces.len(),
     )
 }
 
@@ -417,6 +446,25 @@ fn main() -> Result<(), String> {
             }
             println!("   triangles per face: {count:?}");
             println!("   unconverged: {:?}", m.unconverged_faces);
+            if !a.edges_only {
+                let d = solidcore_mesh::deviation(&k, &b, &m, m.stats.chord_tolerance)
+                    .map_err(|e| e.to_string())?;
+                let mut flips: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+                for t in &d.flipped_triangles {
+                    if let Some(f) = m.triangle_faces.get(*t) {
+                        flips.entry(f.index()).or_default().push(*t);
+                    }
+                }
+                for (f, ts) in &flips {
+                    let first = ts.first().and_then(|t| {
+                        Some((m.triangle_points(*m.triangles.get(*t)?)?, *m.uvs.get(*t)?))
+                    });
+                    println!(
+                        "   face {f}: {} flipped against the surface, first {first:?}",
+                        ts.len()
+                    );
+                }
+            }
         }
         last = Some((model.clone(), m));
     }

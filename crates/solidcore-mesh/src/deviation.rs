@@ -44,6 +44,8 @@ pub struct DeviationReport {
     /// Triangles wound against their face's outward side: the facet normal opposes the
     /// outward surface normal at the foot of the triangle's centroid.
     pub flipped: usize,
+    /// The flipped triangles' indices, in order.
+    pub flipped_triangles: Vec<usize>,
 }
 
 /// The largest sample distance of one triangle (UVs `uv`, corners `p`) from surface `s`.
@@ -171,6 +173,7 @@ pub fn deviation(k: &Kernel, b: &Brep, mesh: &Mesh, tolerance: f64) -> Result<De
         if let Some(n) = surface_normal(k, s, at) {
             if n.dot(facet) * crate::face::outward_sense(b, *f)? < 0.0 {
                 r.flipped += 1;
+                r.flipped_triangles.push(i);
             }
         }
         if d > tolerance {

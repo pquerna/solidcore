@@ -72,6 +72,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backend;
 mod deviation;
 mod edges;
 mod face;
@@ -82,7 +83,7 @@ mod nurbs;
 mod options;
 
 pub use deviation::{deviation, DeviationReport};
-pub use edges::{EdgeSet, MAX_EDGE_DEPTH, MAX_EDGE_POINTS};
+pub use edges::{EdgeSet, SegmentSplit, MAX_EDGE_DEPTH, MAX_EDGE_POINTS, MAX_SPLIT_PIECES};
 pub use face::{FaceMesh, MAX_LOCAL_DEPTH};
 pub use grid::MAX_GRID_LINES;
 pub use mesh::{EdgePolyline, EdgeReport, Failure, Mesh, MeshStats};
@@ -191,7 +192,7 @@ pub const MAX_BOUNDARY_ROUNDS: usize = 4;
 /// 1. [`tessellate_edge_set`];
 /// 2. per face, [`FaceTessellation::new`] and [`FaceTessellation::refine`];
 /// 3. up to [`MAX_BOUNDARY_ROUNDS`] times: every face's
-///    [`FaceTessellation::boundary_requests`] (sorted, deduplicated) into
+///    [`FaceTessellation::boundary_requests`] (sorted) into
 ///    [`EdgeSet::split_segments`], then [`FaceTessellation::refine`] again for the
 ///    faces that [use](FaceTessellation::uses_edge) a changed edge;
 /// 4. per face, [`FaceTessellation::mesh`], joined in face order by [`assemble`].
@@ -225,13 +226,14 @@ impl FaceTessellation {
     ) -> Result<()> {
         check_options(opts)?;
         let p = opts.face_params(self.state.face(), edges.model_size);
-        self.state.refine(k, b, edges, &p)
+        self.state.refine(k, b, edges, &p, opts.backend.as_deref())
     }
 
-    /// Boundary segments (sorted mesh vertex pairs) the last refinement could not
-    /// resolve from inside the face; see [`EdgeSet::split_segments`].
+    /// Boundary segments (sorted mesh vertex pairs, with the pieces each should become)
+    /// the last refinement could not resolve from inside the face; see
+    /// [`EdgeSet::split_segments`].
     #[must_use]
-    pub fn boundary_requests(&self) -> &[[u32; 2]] {
+    pub fn boundary_requests(&self) -> &[SegmentSplit] {
         self.state.requests()
     }
 
@@ -254,8 +256,12 @@ impl FaceTessellation {
         opts: &TessellateOptions,
     ) -> Result<FaceMesh> {
         let p = opts.face_params(self.state.face(), edges.model_size);
-        self.state
-            .snapshot(k, b, opts.measure_deviation.then_some(p.chord))
+        self.state.snapshot(
+            k,
+            b,
+            opts.measure_deviation.then_some(p.chord),
+            opts.backend.as_deref(),
+        )
     }
 
     /// Keeps the mesh vertices [`assemble`] gave this face's interior vertices, so a
@@ -415,6 +421,16 @@ fn append_face(
     if fm.split_boundary {
         mesh.split_boundary_faces.push(fm.face);
     }
+    if fm.backend.is_some() {
+        mesh.backend_faces.push(fm.face);
+    }
+    if fm.backend_failed {
+        mesh.backend_failed_faces.push(fm.face);
+    }
+    if let Some(d) = fm.backend_deviation {
+        mesh.stats.backend_deviation =
+            Some(mesh.stats.backend_deviation.map_or(d, |x: f64| x.max(d)));
+    }
     if fm.ear_clipped {
         mesh.ear_clipped_faces.push(fm.face);
     }
@@ -541,7 +557,7 @@ impl<'a> Tessellator<'a> {
                 slot.state
                     .as_mut()
                     .ok_or_else(|| invalid("face state missing"))?
-                    .refine(k, b, edges, &p)
+                    .refine(k, b, edges, &p, opts.backend.as_deref())
             };
             if let Err(error) = run(slot) {
                 slot.state = None;
@@ -554,7 +570,7 @@ impl<'a> Tessellator<'a> {
         // boundary segments faces could not refine from inside are split in the edge
         // polylines, and the faces along them refined again
         for _ in 0..MAX_BOUNDARY_ROUNDS {
-            let mut requests: Vec<[u32; 2]> = self
+            let mut requests: Vec<SegmentSplit> = self
                 .faces
                 .iter()
                 .filter_map(|s| s.state.as_ref())
@@ -593,7 +609,12 @@ impl<'a> Tessellator<'a> {
             let Some(st) = slot.state.as_mut() else {
                 continue;
             };
-            match st.snapshot(k, b, opts.measure_deviation.then_some(p.chord)) {
+            match st.snapshot(
+                k,
+                b,
+                opts.measure_deviation.then_some(p.chord),
+                opts.backend.as_deref(),
+            ) {
                 Ok(mut fm) => {
                     append_face(&mut mesh, &mut self.edges.positions, &mut fm, opts);
                     st.adopt(&fm);

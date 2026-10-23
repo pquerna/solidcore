@@ -393,6 +393,11 @@ fn main() -> Result<(), String> {
                 .collect();
             // one nested refinement, level by level (each level's time without and
             // with its deviation measurement), against independent runs
+            let (vol, area) = if a.no_ref {
+                (None, None)
+            } else {
+                reference(&k, &b)
+            };
             let mut nested = solidcore_mesh::Tessellator::new(&k, &b).map_err(|e| e.to_string())?;
             let mut ms = Vec::new();
             let (mut total, mut total_alone) = (0.0, 0.0);
@@ -408,10 +413,12 @@ fn main() -> Result<(), String> {
                 total += level_ms;
                 total_alone += alone_ms;
                 println!(
-                    "{model} level rel {r:e}: {level_ms:.1} ms (alone {alone_ms:.1} ms, {} triangles) | {} | measured deviation {:.3e}",
+                    "{model} level rel {r:e}: {level_ms:.1} ms (alone {alone_ms:.1} ms, {} triangles) | {} | measured deviation {:.3e} | volume {} area {}",
                     alone.triangles.len(),
                     summary(&m),
-                    d.max
+                    d.max,
+                    rel(m.volume(), vol),
+                    rel(m.area(), area),
                 );
                 ms.push(m);
             }

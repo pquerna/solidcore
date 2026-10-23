@@ -1,12 +1,10 @@
 //! Interior grid lines of a face: where its Steiner points go before refinement.
 
 use solidcore::geom::extent2d::Extent2d;
-use solidcore::kernel::Kernel;
-use solidcore::math::Point2;
-use solidcore::surface::surface::Surface;
+use solidcore::math::{Point2, Point3, Vec3};
 use solidcore::Result;
 
-use crate::geom::{angle, segment_distance, surface_normal, surface_point};
+use crate::geom::{angle, segment_distance};
 use crate::options::FaceParams;
 
 /// Most interior grid lines per UV direction of one face.
@@ -27,10 +25,9 @@ pub(crate) const MAX_CELL_ASPECT: f64 = 6.0;
 /// The interior grid lines `(us, vs)` over `bbox` (strictly inside it, increasing):
 /// from the chord deviation, normal turning and length between neighbouring points of
 /// a sample grid, with cells of bounded aspect in scaled UV on a curved face. A flat face
-/// gets none.
+/// gets none. `eval` gives the surface point and normal (if any) at a UV point.
 pub(crate) fn grid_lines(
-    k: &Kernel,
-    s: &Surface,
+    eval: &dyn Fn(Point2) -> Result<(Point3, Option<Vec3>)>,
     bbox: &Extent2d,
     scale: (f64, f64),
     p: &FaceParams,
@@ -48,7 +45,7 @@ pub(crate) fn grid_lines(
     for j in 0..=n {
         for i in 0..=n {
             let uv = at(i, j);
-            pts.push((surface_point(k, s, uv)?, surface_normal(k, s, uv)));
+            pts.push(eval(uv)?);
         }
     }
     let sample = |i: usize, j: usize| pts.get(j * (n + 1) + i);
@@ -57,7 +54,7 @@ pub(crate) fn grid_lines(
             return Ok(0.0);
         };
         let (ua, ub) = (at(a.0, a.1), at(b.0, b.1));
-        let pm = surface_point(k, s, Point2::new((ua.x + ub.x) / 2.0, (ua.y + ub.y) / 2.0))?;
+        let (pm, _) = eval(Point2::new((ua.x + ub.x) / 2.0, (ua.y + ub.y) / 2.0))?;
         let mut m = (segment_distance(pm, *pa, *pb) / (GRID_CHORD_MARGIN * p.chord)).sqrt();
         if let (Some(na), Some(nb)) = (na, nb) {
             m = m.max(angle(*na, *nb) / p.angle);

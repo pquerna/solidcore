@@ -141,7 +141,7 @@ mod grid {
         /// The face's surface as nurbs-grid-mesh's, when it is dense enough and the
         /// arrays evaluate like the kernel's surface.
         fn surface(&self, k: &Kernel, face: &BackendFace<'_>) -> Option<NurbsSurface> {
-            let c = canonical_arrays(face.surface)?;
+            let c = canonical_arrays(k, face.surface)?;
             if c.nu.saturating_mul(c.nv) < self.min_poles {
                 return None;
             }

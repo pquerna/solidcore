@@ -10,8 +10,10 @@ use solidcore::{Result, SolidError};
 
 pub(crate) const OP: &str = "solidcore_mesh::tessellate";
 
+/// Times a Gauss-Newton step is halved before the search stops.
+const DAMPING_HALVINGS: usize = 6;
 /// Gauss-Newton steps of a UV polish.
-const POLISH_STEPS: usize = 8;
+const POLISH_STEPS: usize = 12;
 /// Cells per direction of the coarse search that seeds a point inversion.
 const INVERT_GRID: usize = 16;
 
@@ -129,14 +131,24 @@ pub(crate) fn foot(
         }
         let du = (b1 * a22 - b2 * a12) / det;
         let dv = (a11 * b2 - a12 * b1) / det;
-        let next = clamp_uv(Point2::new(uv.x + du, uv.y + dv), domain);
-        let Ok(q) = s.evaluate_point(k, next) else {
+        // damped: halve a step that does not bring the point closer (a kink in the
+        // parameterisation, a far start)
+        let mut improved = None;
+        let mut f = 1.0;
+        for _ in 0..DAMPING_HALVINGS {
+            let next = clamp_uv(Point2::new(uv.x + du * f, uv.y + dv * f), domain);
+            if let Ok(q) = s.evaluate_point(k, next) {
+                let d = q.distance(target);
+                if d < best {
+                    improved = Some((d, next));
+                    break;
+                }
+            }
+            f *= 0.5;
+        }
+        let Some((d, next)) = improved else {
             break;
         };
-        let d = q.distance(target);
-        if d >= best || d.is_nan() {
-            break;
-        }
         best = d;
         uv = next;
     }

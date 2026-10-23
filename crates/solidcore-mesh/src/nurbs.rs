@@ -213,6 +213,30 @@ impl Nurbs {
         bound
     }
 
+    /// Point, `Su` and `Sv` at `(u, v)`; `None` where it does not evaluate.
+    pub(crate) fn eval(&self, u: f64, v: f64) -> Option<(Point3, Vec3, Vec3)> {
+        let bu = basis(&self.uk, self.p, self.nu, u)?;
+        let bv = basis(&self.vk, self.q, self.nv, v)?;
+        let mut a = [0.0; 4];
+        let mut au = [0.0; 4];
+        let mut av = [0.0; 4];
+        for (i, (nu, dnu)) in bu.n().iter().zip(bu.dn()).enumerate() {
+            for (j, (nv, dnv)) in bv.n().iter().zip(bv.dn()).enumerate() {
+                let pw = self.pole(bu.first + i, bv.first + j)?;
+                axpy(&mut a, nu * nv, &pw);
+                axpy(&mut au, dnu * nv, &pw);
+                axpy(&mut av, nu * dnv, &pw);
+            }
+        }
+        if a[3] == 0.0 {
+            return None;
+        }
+        let p = Vec3::new(a[0] / a[3], a[1] / a[3], a[2] / a[3]);
+        let su = (Vec3::new(au[0], au[1], au[2]) - p * au[3]) / a[3];
+        let sv = (Vec3::new(av[0], av[1], av[2]) - p * av[3]) / a[3];
+        Some((p, su, sv))
+    }
+
     /// Point, `Su` and `Sv` at the grid points `(us[i], vs[j])` of `wanted`, in its
     /// order, one u line at a time: each line's basis is computed once and the poles
     /// contracted to one row along v. `None` for a point that does not evaluate.
@@ -245,7 +269,7 @@ impl Nurbs {
                     for (jj, (r, dr)) in row.iter_mut().zip(drow.iter_mut()).enumerate() {
                         *r = [0.0; 4];
                         *dr = [0.0; 4];
-                        for (l, (n, dn)) in b.n.iter().zip(&b.dn).enumerate() {
+                        for (l, (n, dn)) in b.n().iter().zip(b.dn()).enumerate() {
                             if let Some(pw) = self.pole(b.first + l, jj) {
                                 axpy(r, *n, &pw);
                                 axpy(dr, *dn, &pw);
@@ -260,7 +284,7 @@ impl Nurbs {
             let mut a = [0.0; 4];
             let mut au = [0.0; 4];
             let mut av = [0.0; 4];
-            for (l, (n, dn)) in bv.n.iter().zip(&bv.dn).enumerate() {
+            for (l, (n, dn)) in bv.n().iter().zip(bv.dn()).enumerate() {
                 let (Some(r), Some(dr)) = (row.get(bv.first + l), drow.get(bv.first + l)) else {
                     continue;
                 };
@@ -289,13 +313,28 @@ fn axpy(acc: &mut [f64; 4], s: f64, x: &[f64; 4]) {
     }
 }
 
-/// Nonzero basis functions and their first derivatives at one parameter.
+/// Most nonzero basis functions at a parameter (degree + 1); higher degrees take the
+/// general path.
+const MAX_BASIS: usize = 32;
+
+/// Nonzero basis functions and their first derivatives at one parameter, on the stack.
 #[derive(Debug, Clone)]
 struct Basis {
     /// Index of the pole the first function belongs to.
     first: usize,
-    n: Vec<f64>,
-    dn: Vec<f64>,
+    len: usize,
+    values: [f64; MAX_BASIS],
+    derivs: [f64; MAX_BASIS],
+}
+
+impl Basis {
+    fn n(&self) -> &[f64] {
+        self.values.get(..self.len).unwrap_or(&[])
+    }
+
+    fn dn(&self) -> &[f64] {
+        self.derivs.get(..self.len).unwrap_or(&[])
+    }
 }
 
 /// The knot span holding `t` (clamped to the valid range `deg..n`).
@@ -321,16 +360,23 @@ fn span(knots: &[f64], deg: usize, n: usize, t: f64) -> usize {
 }
 
 /// The basis functions of degree `deg` and their derivatives at `t` (the Cox-de Boor
-/// triangle with the derivative from the degree `deg - 1` functions).
+/// triangle with the derivative from the degree `deg - 1` functions); `None` past
+/// [`MAX_BASIS`] functions or for knots too short.
 fn basis(knots: &[f64], deg: usize, n: usize, t: f64) -> Option<Basis> {
+    if deg + 1 > MAX_BASIS {
+        return None;
+    }
     let s = span(knots, deg, n, t);
     let k = |i: usize| knots.get(i).copied();
-    // ndu[r] are the degree-r functions N_{s-r..s}
-    let mut ndu = vec![1.0];
-    let mut prev = vec![1.0];
+    // row[r] holds the degree-r functions N_{s-r..s}; prev the row before
+    let mut row = [0.0; MAX_BASIS];
+    let mut prev = [0.0; MAX_BASIS];
+    if let Some(r0) = row.get_mut(0) {
+        *r0 = 1.0;
+    }
     for r in 1..=deg {
-        let mut next = vec![0.0; r + 1];
-        for (jj, slot) in next.iter_mut().enumerate() {
+        prev = row;
+        for jj in 0..=r {
             // N_{s-r+jj, r}
             let i = (s + jj).checked_sub(r)?;
             let mut v = 0.0;
@@ -348,43 +394,42 @@ fn basis(knots: &[f64], deg: usize, n: usize, t: f64) -> Option<Basis> {
                     v += (k(i + r + 1)? - t) / d * right;
                 }
             }
-            *slot = v;
-        }
-        if r == deg {
-            ndu = next;
-        } else {
-            prev = next;
+            if let Some(slot) = row.get_mut(jj) {
+                *slot = v;
+            }
         }
     }
-    if deg == 0 {
-        return Some(Basis {
-            first: s,
-            n: ndu,
-            dn: vec![0.0],
-        });
-    }
-    // derivatives from the degree deg - 1 functions (prev)
     let first = s.checked_sub(deg)?;
-    let pf = deg as f64;
-    let mut dn = vec![0.0; deg + 1];
-    for (jj, slot) in dn.iter_mut().enumerate() {
-        let i = first + jj;
-        let mut v = 0.0;
-        if jj >= 1 {
-            let d = k(i + deg)? - k(i)?;
-            if d > 0.0 {
-                v += pf / d * prev.get(jj - 1).copied().unwrap_or(0.0);
+    let mut derivs = [0.0; MAX_BASIS];
+    if deg > 0 {
+        // from the degree deg - 1 functions (prev)
+        let pf = deg as f64;
+        for jj in 0..=deg {
+            let i = first + jj;
+            let mut v = 0.0;
+            if jj >= 1 {
+                let d = k(i + deg)? - k(i)?;
+                if d > 0.0 {
+                    v += pf / d * prev.get(jj - 1).copied().unwrap_or(0.0);
+                }
+            }
+            if jj < deg {
+                let d = k(i + deg + 1)? - k(i + 1)?;
+                if d > 0.0 {
+                    v -= pf / d * prev.get(jj).copied().unwrap_or(0.0);
+                }
+            }
+            if let Some(slot) = derivs.get_mut(jj) {
+                *slot = v;
             }
         }
-        if jj < deg {
-            let d = k(i + deg + 1)? - k(i + 1)?;
-            if d > 0.0 {
-                v -= pf / d * prev.get(jj).copied().unwrap_or(0.0);
-            }
-        }
-        *slot = v;
     }
-    Some(Basis { first, n: ndu, dn })
+    Some(Basis {
+        first,
+        len: deg + 1,
+        values: row,
+        derivs,
+    })
 }
 
 #[cfg(test)]
@@ -398,8 +443,8 @@ mod tests {
         for i in 0..=100 {
             let t = f64::from(i) / 100.0;
             let b = basis(&knots, 3, n, t).unwrap();
-            assert!((b.n.iter().sum::<f64>() - 1.0).abs() < 1e-14, "t {t}");
-            assert!(b.dn.iter().sum::<f64>().abs() < 1e-11, "t {t}");
+            assert!((b.n().iter().sum::<f64>() - 1.0).abs() < 1e-14, "t {t}");
+            assert!(b.dn().iter().sum::<f64>().abs() < 1e-11, "t {t}");
             assert!(b.first + 3 < n);
         }
     }

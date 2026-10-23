@@ -376,6 +376,55 @@ fn seams_and_poles() {
     }
 }
 
+/// A backend that asks for a million lines each way on every face, unsorted, with
+/// junk outside the box.
+struct Hostile;
+
+impl backend::FaceBackend for Hostile {
+    fn name(&self) -> &'static str {
+        "hostile"
+    }
+
+    fn grid_lines(
+        &self,
+        _k: &Kernel,
+        face: &backend::BackendFace<'_>,
+    ) -> Option<solidcore::Result<(Vec<f64>, Vec<f64>)>> {
+        let b = face.bbox;
+        let lines = |lo: f64, hi: f64| -> Vec<f64> {
+            (0..1_000_000)
+                .rev()
+                .map(|i| lo + (hi - lo) * f64::from(i) / 1e6)
+                .chain([f64::NAN, f64::INFINITY, lo - 1.0, hi + 1.0])
+                .collect()
+        };
+        Some(Ok((
+            lines(b.u_min(), b.u_max()),
+            lines(b.v_min(), b.v_max()),
+        )))
+    }
+}
+
+#[test]
+fn backend_lines_are_bounded() {
+    let Some((k, b)) = build("box", primitives()[0].1) else {
+        return;
+    };
+    let mut o = TessellateOptions::default();
+    o.max_triangles_per_face = 5_000;
+    o.backend = Some(std::sync::Arc::new(Hostile));
+    let m = tessellate(&k, &b, &o).unwrap();
+    assert!(m.failures.is_empty(), "{:?}", m.failures);
+    assert!(m.backend_faces.len() == 6, "{:?}", m.backend_faces);
+    let mut per_face: BTreeMap<u32, usize> = BTreeMap::new();
+    for f in &m.triangle_faces {
+        *per_face.entry(f.index()).or_insert(0) += 1;
+    }
+    // the budget, plus what the boundary and one last insertion add
+    assert!(per_face.values().all(|n| *n <= 2 * 5_000), "{per_face:?}");
+    let _ = check_closed("box with a hostile backend", &k, &b, &m);
+}
+
 #[test]
 fn options_are_honoured() {
     let Some((k, b)) = build("cylinder", primitives()[1].1) else {

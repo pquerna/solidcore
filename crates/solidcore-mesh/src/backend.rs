@@ -52,7 +52,9 @@ pub trait FaceBackend: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// The face's interior grid lines `(us, vs)`, increasing and strictly inside
-    /// `face.bbox`; `None` to decline the face (the built-in grid then).
+    /// `face.bbox`; `None` to decline the face (the built-in grid then). Whatever it
+    /// returns is bounded like the built-in grid: sorted, clipped to the box and thinned
+    /// to [`crate::MAX_GRID_LINES`] per direction and the face's triangle budget.
     ///
     /// # Errors
     ///
@@ -92,6 +94,7 @@ mod grid {
     use solidcore::{Result, SolidError};
 
     use super::{BackendFace, FaceBackend, FaceMeshView};
+    use crate::grid::MAX_GRID_LINES;
     use crate::nurbs::canonical_arrays;
 
     const OP: &str = "solidcore_mesh::NurbsGridBackend";
@@ -104,7 +107,8 @@ mod grid {
     pub struct NurbsGridBackend {
         /// Fewest control points (u count times v count) of a face it takes.
         pub min_poles: usize,
-        /// Most grid lines per knot span.
+        /// Most grid lines per knot span (fewer when the spans times this would pass
+        /// [`crate::MAX_GRID_LINES`]).
         pub max_lines_per_span: usize,
         /// The lines are placed for this fraction of the chord tolerance (the
         /// triangulation's diagonals sag like the cells, so a margin saves refinement).
@@ -139,9 +143,20 @@ mod grid {
 
     impl NurbsGridBackend {
         /// The face's surface as nurbs-grid-mesh's, when it is dense enough and the
-        /// arrays evaluate like the kernel's surface.
-        fn surface(&self, k: &Kernel, face: &BackendFace<'_>) -> Option<NurbsSurface> {
+        /// arrays evaluate like the kernel's surface, with its knot span counts in u
+        /// and v.
+        fn surface(
+            &self,
+            k: &Kernel,
+            face: &BackendFace<'_>,
+        ) -> Option<(NurbsSurface, [usize; 2])> {
             let c = canonical_arrays(k, face.surface)?;
+            let spans = |kv: &[f64]| {
+                kv.windows(2)
+                    .filter(|w| matches!(w, [a, b] if b > a))
+                    .count()
+            };
+            let spans = [spans(&c.uk), spans(&c.vk)];
             if c.nu.saturating_mul(c.nv) < self.min_poles {
                 return None;
             }
@@ -171,7 +186,7 @@ mod grid {
                     }
                 }
             }
-            Some(ns)
+            Some((ns, spans))
         }
     }
 
@@ -185,17 +200,21 @@ mod grid {
             k: &Kernel,
             face: &BackendFace<'_>,
         ) -> Option<Result<(Vec<f64>, Vec<f64>)>> {
-            let ns = self.surface(k, face)?;
+            let (ns, spans) = self.surface(k, face)?;
             let tol = self.chord_fraction * face.chord;
             let b = face.bbox;
-            let lines = |dir: Dir, lo: f64, hi: f64| -> Result<Vec<f64>> {
-                let g = grid_lines(&ns, dir, tol, hi - lo, self.max_lines_per_span)
-                    .map_err(|e| err(&e))?;
+            let lines = |dir: Dir, spans: usize, lo: f64, hi: f64| -> Result<Vec<f64>> {
+                // lines per span times spans stays within MAX_GRID_LINES
+                let per_span = self
+                    .max_lines_per_span
+                    .min(MAX_GRID_LINES / spans.max(1))
+                    .max(1);
+                let g = grid_lines(&ns, dir, tol, hi - lo, per_span).map_err(|e| err(&e))?;
                 Ok(g.lines.into_iter().filter(|t| *t > lo && *t < hi).collect())
             };
             Some(
-                lines(Dir::U, b.u_min(), b.u_max())
-                    .and_then(|us| Ok((us, lines(Dir::V, b.v_min(), b.v_max())?))),
+                lines(Dir::U, spans[0], b.u_min(), b.u_max())
+                    .and_then(|us| Ok((us, lines(Dir::V, spans[1], b.v_min(), b.v_max())?))),
             )
         }
 
@@ -205,7 +224,7 @@ mod grid {
             face: &BackendFace<'_>,
             mesh: &FaceMeshView<'_>,
         ) -> Option<f64> {
-            let ns = self.surface(k, face)?;
+            let (ns, _) = self.surface(k, face)?;
             let m = TrimmedMesh {
                 positions: mesh.positions.iter().map(|p| [p.x, p.y, p.z]).collect(),
                 uvs: mesh.uvs.iter().map(|q| [q.x, q.y]).collect(),

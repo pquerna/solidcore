@@ -157,12 +157,21 @@ fn check_closed(name: &str, k: &Kernel, b: &Brep, m: &Mesh) -> f64 {
         }
     }
     let d = deviation(k, b, m, m.stats.chord_tolerance).unwrap();
+    assert_eq!(d.flipped, 0, "{name}: triangles wound against the surface");
+    // within the chord tolerance, plus the B-rep's own edge/face gap (measured runs)
+    let gap = m.stats.boundary_gap.unwrap_or(0.0);
     assert!(
-        d.max <= 1.05 * m.stats.chord_tolerance,
-        "{name}: measured deviation {} over chord {}",
+        d.max <= 1.05 * (m.stats.chord_tolerance + gap),
+        "{name}: measured deviation {} over chord {} + gap {gap}",
         d.max,
         m.stats.chord_tolerance
     );
+    if m.stats.max_deviation.is_some() {
+        assert_eq!(
+            m.stats.triangles_over, 0,
+            "{name}: triangles over chord + gap"
+        );
+    }
     d.max
 }
 
@@ -519,19 +528,21 @@ fn read(k: &mut Kernel, rel: &str) -> Option<Brep> {
 }
 
 /// Manifold solids from upstream's test models.
-const MODELS: [&str; 12] = [
+const MODELS: [&str; 14] = [
     "Fillet/vase3.smb",
     "Fillet/crown.smb",
     "Defeature/Platte.smb",
-    "Solids/nurb_fillet.smb",
-    "Fillet/rollover_corner.smb",
-    "Fillet/bottle.smb",
+    "Fillet/letter_g.smb",
     "Fillet/bolt.smb",
     "Fillet/cube_sphere2.smb",
+    "Fillet/torii_fillet.smb",
+    "Fillet/Heart.smb",
+    "Fillet/box_diff_3cyls.smb",
+    "Fillet/nurb_box1.smb",
     "Solids/revolution.smb",
     "Solids/sphere.smb",
-    "Solids/cylinder.smb",
-    "Fillet/box_diff_3cyls.smb",
+    "Mouse.smb",
+    "toruswvy.smb",
 ];
 
 #[test]
@@ -551,8 +562,9 @@ fn corpus_models_watertight_within_tolerance() {
         let area = brep_area(&k, &b, 1e-6).unwrap();
         let mut errors = Vec::new();
         for r in [1e-2, 1e-3, 1e-4] {
-            let m =
-                tessellate(&k, &b, &TessellateOptions::default().with_relative_chord(r)).unwrap();
+            let mut o = TessellateOptions::default().with_relative_chord(r);
+            o.measure_deviation = true;
+            let m = tessellate(&k, &b, &o).unwrap();
             check_closed(rel, &k, &b, &m);
             errors.push(((m.volume() - volume) / volume, (m.area() - area) / area));
         }

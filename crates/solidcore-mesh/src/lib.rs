@@ -378,19 +378,19 @@ fn append_face(
                     .copied()
                     .unwrap_or(Vec3::new(0.0, 0.0, 0.0))
             });
-            // a corner without surface normal takes the triangle's own
-            if n.iter().any(|x| x.length_squared() == 0.0) {
-                let p = t.map(|i| {
-                    fm.positions
-                        .get(i as usize)
-                        .copied()
-                        .unwrap_or(Vec3::new(0.0, 0.0, 0.0))
-                });
-                let g = (p[1] - p[0]).cross(p[2] - p[0]).unitize_or_z();
-                for x in &mut n {
-                    if x.length_squared() == 0.0 {
-                        *x = g;
-                    }
+            // a corner without surface normal, or whose surface normal points against
+            // the triangle (a singular point or crease at that corner), takes the
+            // triangle's own
+            let p = t.map(|i| {
+                fm.positions
+                    .get(i as usize)
+                    .copied()
+                    .unwrap_or(Vec3::new(0.0, 0.0, 0.0))
+            });
+            let g = (p[1] - p[0]).cross(p[2] - p[0]);
+            for x in &mut n {
+                if x.length_squared() == 0.0 || x.dot(g) <= 0.0 {
+                    *x = g.unitize_or_z();
                 }
             }
             mesh.normals.push(n);

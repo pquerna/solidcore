@@ -328,7 +328,7 @@ fn main() -> Result<(), String> {
                 mo.measure_deviation = true;
                 let mm = tessellate(&k, &b, &mo).map_err(|e| e.to_string())?;
                 println!(
-                    "{model} rel {r:e} chord {:.3e}: {ms:.1} ms | {} | {} | measured max {:.3e} ({:.2}x chord), B-rep gap {:.1e}, over chord+gap {} | volume {} area {}",
+                    "{model} rel {r:e} chord {:.3e}: {ms:.1} ms | {} | {} | measured max {:.3e} ({:.2}x chord), B-rep gap {:.1e}, over chord+gap {}, flipped against surface {} | volume {} area {}",
                     m.stats.chord_tolerance,
                     summary(&m),
                     topology(&b, &m),
@@ -336,6 +336,7 @@ fn main() -> Result<(), String> {
                     d.max / m.stats.chord_tolerance,
                     mm.stats.boundary_gap.unwrap_or(0.0),
                     mm.stats.triangles_over,
+                    d.flipped,
                     rel(m.volume(), vol),
                     rel(m.area(), area),
                 );

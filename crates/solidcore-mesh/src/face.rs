@@ -44,6 +44,9 @@ const SLIVER: f64 = 0.02;
 /// The B-spline fast path is used when it agrees with the surface's own evaluation
 /// within this fraction of the face's size.
 const FAST_PATH_AGREEMENT: f64 = 1e-12;
+/// A finer level inserts its grid when it has this many times the cells of the last
+/// grid inserted.
+const REGRID_FACTOR: usize = 4;
 /// Refinement points closer than this fraction of the grid step to a point already
 /// there are dropped.
 const MIN_POINT_GAP: f64 = 1e-6;
@@ -151,8 +154,11 @@ pub(crate) struct FaceState {
     face: FaceId,
     /// The UV the triangulation is centred on.
     origin: Point2,
-    /// UV scale factors (powers of two near the mean `|Su|`, `|Sv|`).
+    /// UV scale factors of the triangulation (powers of two): the speed scaling with
+    /// the metric of the grid's cells (see [`FaceState::refine`]).
     scale: (f64, f64),
+    /// Powers of two near the mean `|Su|`, `|Sv|`.
+    speed: (f64, f64),
     /// `+1` when the outward side is the surface normal's.
     sense: f64,
     /// Triangles counter-clockwise in UV face inward and are wound the other way.
@@ -189,12 +195,14 @@ pub(crate) struct FaceState {
     edges_used: BTreeSet<solidcore::EdgeId>,
     /// A refinement point was refused at [`MAX_LOCAL_DEPTH`] this level.
     depth_capped: bool,
+    /// Cells of the last grid inserted.
+    grid_cells: usize,
 }
 
 /// The outward side of face `f`: `+1` when it is the surface normal's side. A solid's
 /// outward side faces its void region: the face use whose region is void looks out
 /// along its orientation. A sheet (no or both sides void) takes its upward face use's.
-fn outward_sense(b: &Brep, f: FaceId) -> Result<f64> {
+pub(crate) fn outward_sense(b: &Brep, f: FaceId) -> Result<f64> {
     let up = b
         .face(f)?
         .faceuse
@@ -257,6 +265,7 @@ impl FaceState {
             face: f,
             origin: domain.mid(),
             scale,
+            speed: scale,
             sense,
             flip: false,
             domain: natural,
@@ -277,6 +286,7 @@ impl FaceState {
             requests: Vec::new(),
             edges_used: BTreeSet::new(),
             depth_capped: false,
+            grid_cells: 0,
         })
     }
 
@@ -512,30 +522,41 @@ impl FaceState {
             return Err(invalid("face loops have no UV points"));
         }
         let (us, vs) = if bbox.u_min() < bbox.u_max() && bbox.v_min() < bbox.v_max() {
-            grid_lines(k, s, &bbox, self.scale, p, self.nurbs.as_ref())?
+            grid_lines(k, s, &bbox, self.speed, p, self.nurbs.as_ref())?
         } else {
             (Vec::new(), Vec::new())
         };
         let step =
             |lines: &[f64], lo: f64, hi: f64, sc: f64| (hi - lo) * sc / (lines.len() + 1) as f64;
         let has_pole = loops.iter().flatten().any(|q| q.pole_next);
-        if self.boundary.is_empty() && !has_pole {
-            // the triangulation's metric, fixed at the first level: UV scaled so the
-            // grid cells the tolerances ask for are about square (at most
-            // MAX_CELL_ASPECT to one), so Delaunay triangles are long where the surface
-            // is straight (along a ruling) and refinement splits across it. A face
-            // with a pole keeps the speed scaling (near a pole the grid's cells say
-            // nothing about the surface).
-            let hu = step(&us, bbox.u_min(), bbox.u_max(), self.scale.0);
-            let hv = step(&vs, bbox.v_min(), bbox.v_max(), self.scale.1);
+        let first = self.boundary.is_empty();
+        let mut metric = self.speed;
+        if !has_pole {
+            // the triangulation's metric: UV scaled so the grid cells the tolerances
+            // ask for are about square (at most MAX_CELL_ASPECT to one), so Delaunay
+            // triangles are long where the surface is straight (along a ruling) and
+            // refinement splits across it. A face with a pole keeps the speed scaling
+            // (near a pole the grid's cells say nothing about the surface).
+            let hu = step(&us, bbox.u_min(), bbox.u_max(), self.speed.0);
+            let hv = step(&vs, bbox.v_min(), bbox.v_max(), self.speed.1);
             let h = hu.min(hv);
             if h > 0.0 && h.is_finite() {
                 let (hu, hv) = (hu.min(MAX_CELL_ASPECT * h), hv.min(MAX_CELL_ASPECT * h));
-                self.scale = (
-                    power_of_two(self.scale.0 * h / hu),
-                    power_of_two(self.scale.1 * h / hv),
+                metric = (
+                    power_of_two(self.speed.0 * h / hu),
+                    power_of_two(self.speed.1 * h / hv),
                 );
             }
+        }
+        // a finer level whose cells have another shape triangulates its points (all
+        // kept) again in the new metric
+        let ratio = |m: (f64, f64)| m.0 / m.1;
+        let remetric = !first && {
+            let r = ratio(metric) / ratio(self.scale);
+            !(0.5..=2.0).contains(&r)
+        };
+        if first || remetric {
+            self.scale = metric;
         }
         let scaled_step = step(&us, bbox.u_min(), bbox.u_max(), self.scale.0).min(step(
             &vs,
@@ -546,8 +567,7 @@ impl FaceState {
 
         // the boundary, pole runs expanded
         let expanded = self.expand_poles(&loops, scaled_step);
-        let first = self.boundary.is_empty();
-        if first || !self.update_boundary(k, s, &loops, &expanded)? {
+        if first || remetric || !self.update_boundary(k, s, &loops, &expanded)? {
             self.rebuild(k, s, &loops, &expanded)?;
         }
         self.boundary = expanded
@@ -562,8 +582,15 @@ impl FaceState {
         if first {
             self.check_fast_path(k, s, &bbox, self.size);
         }
-        // grid points, away from the boundary and the points already there
-        self.insert_grid(k, s, &us, &vs, scaled_step)?;
+        // grid points, away from the boundary and the points already there; a finer
+        // level adds its grid only when it is much denser than the last one inserted
+        // (else it refines the earlier triangles: a grid on top of a similar one would
+        // only crowd it)
+        let cells = (us.len() + 1) * (vs.len() + 1);
+        if first || cells >= REGRID_FACTOR * self.grid_cells {
+            self.insert_grid(k, s, &us, &vs, scaled_step)?;
+            self.grid_cells = cells;
+        }
 
         // refinement
         let mut converged = false;

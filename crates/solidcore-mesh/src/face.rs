@@ -41,6 +41,9 @@ const MIN_SPLIT_FRACTION: f64 = 1e-3;
 /// A triangle whose doubled area is below this fraction of its longest edge squared is
 /// a sliver: its normal is not compared with the surface's.
 const SLIVER: f64 = 0.02;
+/// The B-spline fast path is used when it agrees with the surface's own evaluation
+/// within this fraction of the face's size.
+const FAST_PATH_AGREEMENT: f64 = 1e-12;
 /// Refinement points closer than this fraction of the grid step to a point already
 /// there are dropped.
 const MIN_POINT_GAP: f64 = 1e-6;
@@ -159,6 +162,11 @@ pub(crate) struct FaceState {
     /// Periods of a surface closed in u or v (over its natural domain).
     period: (Option<f64>, Option<f64>),
     nurbs: Option<Nurbs>,
+    /// The model size (bounds the fast path's disagreement).
+    size: f64,
+    /// With [`FaceState::nurbs`] checked against the surface: the sign turning its
+    /// `Su x Sv` outward. Points and normals then come from the B-spline directly.
+    fast: Option<f64>,
     cdt: Cdt,
     vertices: Vec<FaceVertex>,
     /// The boundary loops as inserted (pole runs expanded).
@@ -254,6 +262,8 @@ impl FaceState {
             domain: natural,
             period,
             nurbs: Nurbs::from_surface(surface),
+            size: model_size,
+            fast: None,
             cdt: Cdt::new(),
             vertices: Vec::new(),
             boundary: Vec::new(),
@@ -284,7 +294,51 @@ impl FaceState {
         )
     }
 
+    /// The surface point at `uv` (from the B-spline directly when checked).
+    fn point(&self, k: &Kernel, s: &Surface, uv: Point2) -> Result<Point3> {
+        if let (Some(nb), Some(_)) = (&self.nurbs, self.fast) {
+            if let Some((p, _, _)) = nb.eval(uv.x, uv.y).filter(|e| crate::geom::finite3(e.0)) {
+                return Ok(p);
+            }
+        }
+        surface_point(k, s, uv)
+    }
+
+    /// Checks the B-spline fast path against the surface's own evaluation at a sample
+    /// grid of `bbox` and turns it on when they agree (and `Su x Sv` gives the normal's
+    /// side).
+    fn check_fast_path(&mut self, k: &Kernel, s: &Surface, bbox: &Extent2d, size: f64) {
+        self.fast = None;
+        let Some(nb) = &self.nurbs else {
+            return;
+        };
+        for j in 0..=4 {
+            for i in 0..=4 {
+                let uv = Point2::new(
+                    bbox.u_min() + (bbox.u_max() - bbox.u_min()) * f64::from(i) / 4.0,
+                    bbox.v_min() + (bbox.v_max() - bbox.v_min()) * f64::from(j) / 4.0,
+                );
+                let (Some((p, _, _)), Ok(q)) = (nb.eval(uv.x, uv.y), s.evaluate_point(k, uv))
+                else {
+                    return;
+                };
+                let d = p.distance(q);
+                if d > FAST_PATH_AGREEMENT * size || d.is_nan() {
+                    return;
+                }
+            }
+        }
+        self.fast = self.cross_sign(k, s).map(|c| c * self.sense);
+    }
+
     fn outward(&self, k: &Kernel, s: &Surface, uv: Point2) -> Option<Vec3> {
+        if let (Some(nb), Some(sign)) = (&self.nurbs, self.fast) {
+            if let Some((_, su, sv)) = nb.eval(uv.x, uv.y) {
+                if let Some(n) = unit_cross(su, sv) {
+                    return Some(n * sign);
+                }
+            }
+        }
         surface_normal(k, s, uv).map(|n| n * self.sense)
     }
 
@@ -335,7 +389,7 @@ impl FaceState {
     ) -> Result<FixedVertexHandle> {
         let (xyz, normal) = match xyz {
             Some(x) => x,
-            None => (surface_point(k, s, uv)?, self.outward(k, s, uv)),
+            None => (self.point(k, s, uv)?, self.outward(k, s, uv)),
         };
         self.insert(FaceVertex {
             uv,
@@ -505,6 +559,9 @@ impl FaceState {
             self.remove_stale_interior();
         }
 
+        if first {
+            self.check_fast_path(k, s, &bbox, self.size);
+        }
         // grid points, away from the boundary and the points already there
         self.insert_grid(k, s, &us, &vs, scaled_step)?;
 
@@ -988,7 +1045,7 @@ impl FaceState {
         }
         // the B-spline fast path evaluates the wanted points line by line
         let fast = self.nurbs.as_ref().map(|nb| nb.eval_grid(us, vs, &wanted));
-        let cross_sign = self.cross_sign(k, s);
+        let cross_sign = self.fast.map(|x| x * self.sense);
         for (w, (i, j)) in wanted.iter().enumerate() {
             let (Some(u), Some(v)) = (us.get(*i), vs.get(*j)) else {
                 continue;
@@ -996,9 +1053,11 @@ impl FaceState {
             let uv = Point2::new(*u, *v);
             let pre = match (&fast, cross_sign) {
                 (Some(f), Some(sign)) => f.get(w).copied().flatten().map(|(pt, su, sv)| {
-                    let c = su.cross(sv);
-                    let l = c.length();
-                    let n = (l.is_finite() && l > 0.0).then(|| c * (sign * self.sense / l));
+                    // near a pole the fast cross product is noise: the surface's own
+                    // normal then
+                    let n = unit_cross(su, sv)
+                        .map(|n| n * (sign * self.sense))
+                        .or_else(|| self.outward(k, s, uv));
                     (pt, n)
                 }),
                 _ => None,
@@ -1161,7 +1220,7 @@ impl FaceState {
                         a.uv.x * w[0] + b.uv.x * w[1] + c.uv.x * w[2],
                         a.uv.y * w[0] + b.uv.y * w[1] + c.uv.y * w[2],
                     );
-                    let pt = surface_point(k, s, q)?;
+                    let pt = self.point(k, s, q)?;
                     if ((pt - a.xyz).dot(n) / nl).abs() > tol + a.gap.max(b.gap).max(c.gap) {
                         bad = true;
                         break;
@@ -1267,7 +1326,7 @@ impl FaceState {
             let uv = Point2::new((a.uv.x + b.uv.x) / 2.0, (a.uv.y + b.uv.y) / 2.0);
             let mut split = p.max_len.is_some_and(|l| len > l);
             if !split {
-                let pt = surface_point(k, s, uv)?;
+                let pt = self.point(k, s, uv)?;
                 split = segment_distance(pt, a.xyz, b.xyz) > tol + a.gap.max(b.gap);
             }
             if split && marked.insert(edge.fix().index()) {
@@ -1565,6 +1624,15 @@ impl MapContext<'_> {
         }
         Ok(out)
     }
+}
+
+/// `su x sv` as a unit vector, `None` where it is too small against the tangents to
+/// give a direction (a pole).
+fn unit_cross(su: Vec3, sv: Vec3) -> Option<Vec3> {
+    let c = su.cross(sv);
+    let l = c.length();
+    let m = su.length_squared().max(sv.length_squared());
+    (l.is_finite() && l > 1e-10 * m).then(|| c / l)
 }
 
 /// How far `xyz` is from the surface point at `uv` (`0` when it does not evaluate).

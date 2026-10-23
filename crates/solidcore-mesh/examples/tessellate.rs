@@ -12,7 +12,8 @@
 //! - `--stl <path>`: binary STL of the (last) model; `--json <path>`: the viewer JSON
 //!   (schema below).
 //! - `--edges-only`: only the edge polylines.
-//! - `--lods <r1,r2,...>`: nested levels at these relative chords; prints each level.
+//! - `--lods <r1,r2,...>`: nested levels at these relative chords ([`solidcore_mesh::Tessellator`]),
+//!   each timed against an independent run, with its measured deviation.
 //! - `--bench`: every model at relative chords 1e-2, 1e-3 and 1e-4, with time,
 //!   counts, watertightness, measured deviation and volume and area against the
 //!   B-rep's integrated ones (`--no-ref` skips the integration).
@@ -37,9 +38,7 @@ use solidcore::topology::brep::p7::read_from_file;
 use solidcore::topology::database_io::FileType;
 use solidcore::topology::Brep;
 use solidcore::EntityRef;
-use solidcore_mesh::{
-    tessellate, tessellate_edges, tessellate_lods, Mesh, Quality, TessellateOptions, Tolerance,
-};
+use solidcore_mesh::{tessellate, tessellate_edges, Mesh, Quality, TessellateOptions, Tolerance};
 
 const PRIMITIVES: [&str; 9] = [
     "box",
@@ -262,6 +261,36 @@ fn summary(m: &Mesh) -> String {
     )
 }
 
+/// The B-rep's kind and the mesh's open edges split into those along a B-rep edge with
+/// one face (a sheet's boundary, expected) and the others (holes).
+fn topology(b: &Brep, m: &Mesh) -> String {
+    let solid = solidcore::topology::brep::p2::is_manifold_solid(b).unwrap_or(false);
+    let mut lamina = std::collections::BTreeSet::new();
+    for e in &m.edges {
+        let faces = solidcore::topology::edge::faces(b, e.edge, None).map_or(0, |f| f.len());
+        if faces <= 1 {
+            for (x, y) in e.vertices.iter().zip(e.vertices.iter().skip(1)) {
+                lamina.insert((*x.min(y), *x.max(y)));
+            }
+        }
+    }
+    let r = m.edge_report();
+    let holes = r
+        .open
+        .iter()
+        .filter(|[x, y]| !lamina.contains(&(*x, *y)))
+        .count();
+    format!(
+        "{} | open on sheet boundary {} | open elsewhere {holes}",
+        if solid {
+            "solid"
+        } else {
+            "not a manifold solid"
+        },
+        r.open.len() - holes
+    )
+}
+
 fn rel(a: f64, b: Option<f64>) -> String {
     b.map_or("-".into(), |b| format!("{:+.2e}", (a - b) / b))
 }
@@ -299,9 +328,10 @@ fn main() -> Result<(), String> {
                 mo.measure_deviation = true;
                 let mm = tessellate(&k, &b, &mo).map_err(|e| e.to_string())?;
                 println!(
-                    "{model} rel {r:e} chord {:.3e}: {ms:.1} ms | {} | measured max {:.3e} ({:.2}x chord), B-rep gap {:.1e}, over chord+gap {} | volume {} area {}",
+                    "{model} rel {r:e} chord {:.3e}: {ms:.1} ms | {} | {} | measured max {:.3e} ({:.2}x chord), B-rep gap {:.1e}, over chord+gap {} | volume {} area {}",
                     m.stats.chord_tolerance,
                     summary(&m),
+                    topology(&b, &m),
                     d.max,
                     d.max / m.stats.chord_tolerance,
                     mm.stats.boundary_gap.unwrap_or(0.0),
@@ -331,13 +361,34 @@ fn main() -> Result<(), String> {
                     o
                 })
                 .collect();
-            let t = Instant::now();
-            let ms = tessellate_lods(&k, &b, &opts).map_err(|e| e.to_string())?;
-            let total = t.elapsed().as_secs_f64() * 1e3;
-            for (r, m) in levels.iter().zip(&ms) {
-                println!("{model} level rel {r:e}: {}", summary(m));
+            // one nested refinement, level by level (each level's time without and
+            // with its deviation measurement), against independent runs
+            let mut nested = solidcore_mesh::Tessellator::new(&k, &b).map_err(|e| e.to_string())?;
+            let mut ms = Vec::new();
+            let (mut total, mut total_alone) = (0.0, 0.0);
+            for (r, o) in levels.iter().zip(&opts) {
+                let t = Instant::now();
+                let m = nested.level(o).map_err(|e| e.to_string())?;
+                let level_ms = t.elapsed().as_secs_f64() * 1e3;
+                let t = Instant::now();
+                let alone = tessellate(&k, &b, o).map_err(|e| e.to_string())?;
+                let alone_ms = t.elapsed().as_secs_f64() * 1e3;
+                let d = solidcore_mesh::deviation(&k, &b, &m, m.stats.chord_tolerance)
+                    .map_err(|e| e.to_string())?;
+                total += level_ms;
+                total_alone += alone_ms;
+                println!(
+                    "{model} level rel {r:e}: {level_ms:.1} ms (alone {alone_ms:.1} ms, {} triangles) | {} | measured deviation {:.3e}",
+                    alone.triangles.len(),
+                    summary(&m),
+                    d.max
+                );
+                ms.push(m);
             }
-            println!("{model}: {} levels in {total:.1} ms", ms.len());
+            println!(
+                "{model}: {} nested levels in {total:.1} ms, independent runs {total_alone:.1} ms",
+                ms.len()
+            );
             last = ms.into_iter().last().map(|m| (model.clone(), m));
             continue;
         }

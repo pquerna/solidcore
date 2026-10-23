@@ -22,10 +22,10 @@ use solidcore::{FaceId, Result};
 
 use crate::edges::EdgeSet;
 use crate::geom::{
-    angle, closes, foot, invalid, invert_point, segment_distance, surface_normal, surface_point,
-    surface_scales,
+    angle, closes, foot, invalid, invert_point, power_of_two, segment_distance, surface_normal,
+    surface_point, surface_scales,
 };
-use crate::grid::grid_lines;
+use crate::grid::{grid_lines, MAX_CELL_ASPECT};
 use crate::mesh::EdgePolyline;
 use crate::nurbs::Nurbs;
 use crate::options::FaceParams;
@@ -38,6 +38,12 @@ const POLISH_FRACTION: f64 = 0.1;
 const CLEARANCE_FRACTION: f64 = 0.1;
 /// Triangles smaller than this fraction of the chord tolerance are not split.
 const MIN_SPLIT_FRACTION: f64 = 1e-3;
+/// A triangle whose doubled area is below this fraction of its longest edge squared is
+/// a sliver: its normal is not compared with the surface's.
+const SLIVER: f64 = 0.02;
+/// Refinement points closer than this fraction of the grid step to a point already
+/// there are dropped.
+const MIN_POINT_GAP: f64 = 1e-6;
 /// Most UV samples of one degenerate (pole) segment.
 const MAX_POLE_SEGMENTS: u32 = 1024;
 /// Most generations of refinement points below a boundary or grid point: a criterion
@@ -458,6 +464,25 @@ impl FaceState {
         };
         let step =
             |lines: &[f64], lo: f64, hi: f64, sc: f64| (hi - lo) * sc / (lines.len() + 1) as f64;
+        let has_pole = loops.iter().flatten().any(|q| q.pole_next);
+        if self.boundary.is_empty() && !has_pole {
+            // the triangulation's metric, fixed at the first level: UV scaled so the
+            // grid cells the tolerances ask for are about square (at most
+            // MAX_CELL_ASPECT to one), so Delaunay triangles are long where the surface
+            // is straight (along a ruling) and refinement splits across it. A face
+            // with a pole keeps the speed scaling (near a pole the grid's cells say
+            // nothing about the surface).
+            let hu = step(&us, bbox.u_min(), bbox.u_max(), self.scale.0);
+            let hv = step(&vs, bbox.v_min(), bbox.v_max(), self.scale.1);
+            let h = hu.min(hv);
+            if h > 0.0 && h.is_finite() {
+                let (hu, hv) = (hu.min(MAX_CELL_ASPECT * h), hv.min(MAX_CELL_ASPECT * h));
+                self.scale = (
+                    power_of_two(self.scale.0 * h / hu),
+                    power_of_two(self.scale.1 * h / hv),
+                );
+            }
+        }
         let scaled_step = step(&us, bbox.u_min(), bbox.u_max(), self.scale.0).min(step(
             &vs,
             bbox.v_min(),
@@ -499,11 +524,24 @@ impl FaceState {
                 if self.cdt.num_inner_faces() >= p.max_triangles {
                     break;
                 }
-                match self.cdt.locate(self.scaled(uv)) {
-                    PositionInTriangulation::OnFace(_) => {}
+                let pos = self.scaled(uv);
+                let near = match self.cdt.locate(pos) {
+                    PositionInTriangulation::OnFace(f) => self.cdt.face(f).vertices().to_vec(),
                     PositionInTriangulation::OnEdge(e)
-                        if !self.cdt.is_constraint_edge(e.as_undirected()) => {}
+                        if !self.cdt.is_constraint_edge(e.as_undirected()) =>
+                    {
+                        self.cdt.directed_edge(e).vertices().to_vec()
+                    }
                     _ => continue,
+                };
+                // a point (all but) on one already there (two candidates of one pass
+                // can meet) would make a sliver
+                let gap = MIN_POINT_GAP * scaled_step;
+                if near.iter().any(|v| {
+                    let q = v.position();
+                    (q.x - pos.x).abs() <= gap && (q.y - pos.y).abs() <= gap
+                }) {
+                    continue;
                 }
                 self.insert_interior(k, s, uv, None, depth)?;
                 added += 1;
@@ -1139,10 +1177,14 @@ impl FaceState {
                         .into_iter()
                         .filter(|x| !x.boundary)
                         .filter_map(|x| x.normal);
+                    // a sliver's facet normal is no measure of anything (a fan at a
+                    // pole is all slivers): only the flip counts there
+                    let sliver = nl < SLIVER * size * size;
                     bad = o.dot(n) < 0.0
-                        || core::iter::once(o)
-                            .chain(interior)
-                            .any(|q| angle(facet, q) > p.angle);
+                        || (!sliver
+                            && core::iter::once(o)
+                                .chain(interior)
+                                .any(|q| angle(facet, q) > p.angle));
                 }
             }
             // a triangle far below the tolerance or the length floor is left alone

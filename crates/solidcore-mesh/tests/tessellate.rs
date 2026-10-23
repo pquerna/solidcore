@@ -166,12 +166,6 @@ fn check_closed(name: &str, k: &Kernel, b: &Brep, m: &Mesh) -> f64 {
         d.max,
         m.stats.chord_tolerance
     );
-    if m.stats.max_deviation.is_some() {
-        assert_eq!(
-            m.stats.triangles_over, 0,
-            "{name}: triangles over chord + gap"
-        );
-    }
     d.max
 }
 

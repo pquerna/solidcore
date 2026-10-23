@@ -12,7 +12,6 @@ keywords = ["cad", "brep", "nurbs", "geometry", "solid-modeling"]
 categories = ["graphics", "mathematics", "science"]
 
 [dependencies]
-spade = "2.15"
 thiserror.workspace = true
 
 [lints]

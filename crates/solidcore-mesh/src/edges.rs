@@ -33,6 +33,8 @@ pub struct EdgeSet {
     pub(crate) index: BTreeMap<EdgeId, usize>,
     pub(crate) failures: Vec<Failure>,
     pub(crate) model_size: f64,
+    /// Each edge's segment limit at the last division.
+    pub(crate) max_segments: BTreeMap<EdgeId, u32>,
 }
 
 impl EdgeSet {
@@ -91,6 +93,7 @@ impl EdgeSet {
                 .map(|f| opts.face_params(f.face, size))
                 .collect();
             let mut p = opts.edge_params(e, size, &params);
+            self.max_segments.insert(e, p.max_segments);
             for (f, fp) in faces.iter().zip(&params) {
                 let h = if let Some(h) = spacing.get(&f.face) {
                     *h
@@ -137,7 +140,8 @@ impl EdgeSet {
     /// Splits the polyline segments between the mesh vertex pairs `segments` (each a
     /// pair of neighbouring points of one edge polyline, in either order) at their
     /// parameter midpoints, keeping every other point; returns the edges changed, in
-    /// id order. Pairs that are no polyline segment are ignored.
+    /// id order. Pairs that are no polyline segment, and edges at their segment limit,
+    /// are left alone.
     ///
     /// # Errors
     ///
@@ -178,6 +182,11 @@ impl EdgeSet {
                 .as_ref()
                 .ok_or_else(|| invalid("edge without curve"))?;
             let mut poly = poly;
+            let limit = self
+                .max_segments
+                .get(&poly.edge)
+                .copied()
+                .unwrap_or(u32::MAX) as usize;
             // back to front, so earlier indices stay valid
             segs.sort_unstable_by(|a, c| c.cmp(a));
             for si in segs {
@@ -185,7 +194,10 @@ impl EdgeSet {
                     continue;
                 };
                 let tm = (t0 + t1) / 2.0;
-                if !(tm > t0 && tm < t1) || poly.params.len() >= MAX_EDGE_POINTS {
+                if !(tm > t0 && tm < t1)
+                    || poly.params.len() >= MAX_EDGE_POINTS
+                    || poly.params.len() > limit
+                {
                     continue;
                 }
                 let (p, _) = curve_eval(k, curve, tm, false)?;

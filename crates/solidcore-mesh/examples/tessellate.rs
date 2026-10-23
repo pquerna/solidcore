@@ -119,6 +119,7 @@ fn load(k: &mut Kernel, model: &str) -> Result<Brep, String> {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)] // command-line flags
 struct Args {
     models: Vec<String>,
     opts: TessellateOptions,
@@ -248,7 +249,11 @@ fn main() -> Result<(), String> {
             }
         };
         if a.bench {
-            let (vol, area) = if a.no_ref { (None, None) } else { reference(&k, &b) };
+            let (vol, area) = if a.no_ref {
+                (None, None)
+            } else {
+                reference(&k, &b)
+            };
             for r in [1e-2, 1e-3, 1e-4] {
                 let mut o = a.opts.clone();
                 o.chord_tolerance = Tolerance::Relative(r);

@@ -51,6 +51,9 @@ const REGRID_FACTOR: usize = 4;
 /// Refinement points closer than this fraction of the grid step to a point already
 /// there are dropped.
 const MIN_POINT_GAP: f64 = 1e-6;
+/// A triangle across a fold of its surface is split while larger than this many
+/// chord tolerances.
+const FOLD_SIZE: f64 = 4.0;
 /// Most UV samples of one degenerate (pole) segment.
 const MAX_POLE_SEGMENTS: u32 = 1024;
 /// Most generations of refinement points below a boundary or grid point: a criterion
@@ -1407,14 +1410,18 @@ impl FaceState {
                     }
                 }
                 // the surface folds over inside the triangle (its normal reverses
-                // between corners): no triangle there can follow it, so only the chord
-                // counts
+                // between corners): no triangle there can follow it, so no flip or
+                // angle test
                 let normals: Vec<Vec3> = [a, b, c].iter().filter_map(|x| x.normal).collect();
                 let folded = normals
                     .iter()
                     .enumerate()
                     .any(|(i, x)| normals.iter().skip(i + 1).any(|y| x.dot(*y) < 0.0));
-                if bad || folded {
+                if folded {
+                    // ... and its size: a fold is resolved down to a band of small
+                    // triangles along it
+                    bad = bad || size > FOLD_SIZE * tol;
+                } else if bad {
                 } else if let Some(o) = self.outward(k, s, uv) {
                     // flipped, or turned from the surface by more than the angle
                     // tolerance at the centroid or an interior corner (a boundary

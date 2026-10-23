@@ -12,6 +12,12 @@ use crate::options::FaceParams;
 
 /// Most interior grid lines per UV direction of one face.
 pub const MAX_GRID_LINES: usize = 2048;
+/// The grid is sized for this fraction of the chord tolerance, so the triangles it
+/// makes (whose diagonals sag like its cells) pass refinement's check with a margin
+/// instead of failing it by rounding.
+const GRID_CHORD_MARGIN: f64 = 0.7;
+/// A direction whose sample intervals all need less than this many cells is straight.
+const STRAIGHT: f64 = 0.05;
 /// Cells per direction of the sample grid that sizes a face's grid.
 const SAMPLE_GRID: usize = 8;
 /// Largest aspect ratio, in scaled UV, of a curved face's grid cells.
@@ -51,7 +57,7 @@ pub(crate) fn grid_lines(
         };
         let (ua, ub) = (at(a.0, a.1), at(b.0, b.1));
         let pm = surface_point(k, s, Point2::new((ua.x + ub.x) / 2.0, (ua.y + ub.y) / 2.0))?;
-        let mut m = (segment_distance(pm, *pa, *pb) / p.chord).sqrt();
+        let mut m = (segment_distance(pm, *pa, *pb) / (GRID_CHORD_MARGIN * p.chord)).sqrt();
         if let (Some(na), Some(nb)) = (na, nb) {
             m = m.max(angle(*na, *nb) / p.angle);
         }
@@ -75,48 +81,63 @@ pub(crate) fn grid_lines(
     }
     let mut us = lines_from(&cu, bbox.u_min(), bbox.u_max());
     let mut vs = lines_from(&cv, bbox.v_min(), bbox.v_max());
+    // a B-spline's lines come from its knot spans' second-derivative bound; the sampled
+    // lines stay where they are denser (the angle tolerance can ask for more)
     if let Some(nb) = nurbs {
         let curved = |c: &[f64]| c.iter().any(|x| *x > 0.0);
         if curved(&cu) || curved(&cv) {
-            us.extend(nb.lines(
+            let nu = nb.lines(
                 true,
                 bbox.u_min(),
                 bbox.u_max(),
                 (bbox.v_min(), bbox.v_max()),
-                p.chord,
-            ));
-            vs.extend(nb.lines(
+                GRID_CHORD_MARGIN * p.chord,
+            );
+            let nv = nb.lines(
                 false,
                 bbox.v_min(),
                 bbox.v_max(),
                 (bbox.u_min(), bbox.u_max()),
-                p.chord,
-            ));
+                GRID_CHORD_MARGIN * p.chord,
+            );
+            if nu.len() > us.len() {
+                us = nu;
+            }
+            if nv.len() > vs.len() {
+                vs = nv;
+            }
         }
     }
     let lu = (bbox.u_max() - bbox.u_min()) * scale.0;
     let lv = (bbox.v_max() - bbox.v_min()) * scale.1;
     let mut us = tidy(us, bbox.u_min(), bbox.u_max());
     let mut vs = tidy(vs, bbox.v_min(), bbox.v_max());
-    // cells of bounded aspect: a direction left coarse gets uniform lines at a spacing
-    // comparable to the other's mean spacing
+    // cells of bounded aspect: a curved direction left coarse gets uniform lines at a
+    // spacing comparable to the other's mean spacing. A straight direction (a ruling:
+    // no sag, no turning) gets none, so the triangles run along the rulings, as flat as
+    // their boundary chords; refinement splits any that sag after all.
+    let straight = |c: &[f64]| c.iter().all(|x| *x < STRAIGHT);
     if !us.is_empty() || !vs.is_empty() {
         let hu = lu / (us.len() + 1) as f64;
         let hv = lv / (vs.len() + 1) as f64;
         let h = hu.min(hv);
         if h > 0.0 {
-            us = with_uniform(
-                us,
-                bbox.u_min(),
-                bbox.u_max(),
-                (lu / (MAX_CELL_ASPECT * h)).ceil(),
-            );
-            vs = with_uniform(
-                vs,
-                bbox.v_min(),
-                bbox.v_max(),
-                (lv / (MAX_CELL_ASPECT * h)).ceil(),
-            );
+            if !straight(&cu) {
+                us = with_uniform(
+                    us,
+                    bbox.u_min(),
+                    bbox.u_max(),
+                    (lu / (MAX_CELL_ASPECT * h)).ceil(),
+                );
+            }
+            if !straight(&cv) {
+                vs = with_uniform(
+                    vs,
+                    bbox.v_min(),
+                    bbox.v_max(),
+                    (lv / (MAX_CELL_ASPECT * h)).ceil(),
+                );
+            }
         }
     }
     // bounded work: at most MAX_GRID_LINES per direction, and about the face's
@@ -197,36 +218,6 @@ fn with_uniform(lines: Vec<f64>, lo: f64, hi: f64, cells: f64) -> Vec<f64> {
         prev = t;
     }
     tidy(out, lo, hi)
-}
-
-/// The typical grid spacing (model units, roughly arc length) of face surface `s` over
-/// `domain` at tolerances `p`: the smaller mean cell size of its grid, `None` for a flat
-/// face (no grid lines).
-pub(crate) fn face_spacing(
-    k: &Kernel,
-    s: &Surface,
-    domain: &Extent2d,
-    p: &FaceParams,
-) -> Option<f64> {
-    if !(domain.u_min() < domain.u_max() && domain.v_min() < domain.v_max()) {
-        return None;
-    }
-    let scale = crate::geom::surface_scales(k, s, domain);
-    // a direction the surface does not move in (a collapsed face) sets no spacing
-    let mid = domain.mid();
-    let (_, su, sv) = s.evaluate_1st_derivatives(k, mid, false, false).ok()?;
-    if !(su.length() > 1e-9 * p.chord.max(1e-300) && sv.length() > 1e-9 * p.chord.max(1e-300)) {
-        return None;
-    }
-    let (us, vs) = grid_lines(k, s, domain, scale, p, None).ok()?;
-    if us.is_empty() && vs.is_empty() {
-        return None;
-    }
-    let lu = (domain.u_max() - domain.u_min()) * scale.0 / (us.len() + 1) as f64;
-    let lv = (domain.v_max() - domain.v_min()) * scale.1 / (vs.len() + 1) as f64;
-    // never below the chord tolerance
-    let h = lu.min(lv).max(p.chord);
-    (h.is_finite() && h > 0.0).then_some(h)
 }
 
 #[cfg(test)]

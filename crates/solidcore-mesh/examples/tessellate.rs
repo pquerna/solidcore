@@ -211,14 +211,44 @@ fn reference(k: &Kernel, b: &Brep) -> (Option<f64>, Option<f64>) {
     (v, brep_area(k, b, 1e-7).ok())
 }
 
+/// Triangles with (almost) no area, and triangles a corner normal points against.
+fn bad_triangles(m: &Mesh) -> (usize, usize) {
+    let (mut degenerate, mut flipped) = (0, 0);
+    let size2 = m.stats.model_size * m.stats.model_size;
+    for (i, t) in m.triangles.iter().enumerate() {
+        let Some([a, b, c]) = m.triangle_points(*t) else {
+            continue;
+        };
+        let g = (b - a).cross(c - a);
+        if g.length() <= 1e-14 * size2 {
+            degenerate += 1;
+            if std::env::var("WORST").is_ok() {
+                println!(
+                    "   degenerate {t:?}: {a:?} {b:?} {c:?} uv {:?}",
+                    m.uvs.get(i)
+                );
+            }
+            continue;
+        }
+        if m.normals
+            .get(i)
+            .is_some_and(|n| n.iter().any(|x| x.dot(g) <= 0.0))
+        {
+            flipped += 1;
+        }
+    }
+    (degenerate, flipped)
+}
+
 fn summary(m: &Mesh) -> String {
     let r = m.edge_report();
+    let (degenerate, flipped) = bad_triangles(m);
     let dev = m
         .stats
         .max_deviation
         .map_or("-".to_string(), |d| format!("{d:.3e}"));
     format!(
-        "V {} T {} open {} nonmanifold {} inconsistent {} failures {} unconverged {} split {} ears {} inverted {} dev {dev}",
+        "V {} T {} degenerate {degenerate} flipped {flipped} open {} nonmanifold {} inconsistent {} failures {} unconverged {} split {} ears {} inverted {} dev {dev}",
         m.used_vertices(),
         m.triangles.len(),
         r.open.len(),

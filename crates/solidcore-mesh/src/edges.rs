@@ -13,7 +13,6 @@ use solidcore::topology::Brep;
 use solidcore::{EdgeId, EntityRef, FaceId, Result, VertexId};
 
 use crate::geom::{angle, curve_eval, invalid, segment_distance, surface_normal};
-use crate::grid::{face_spacing, MAX_CELL_ASPECT};
 use crate::mesh::{EdgePolyline, Failure};
 use crate::options::{EdgeParams, FaceParams, TessellateOptions};
 
@@ -83,34 +82,14 @@ impl EdgeSet {
     /// `opts`. A finer level only adds points: every earlier point stays, with its id.
     pub(crate) fn refine(&mut self, k: &Kernel, b: &Brep, opts: &TessellateOptions) -> Result<()> {
         let size = self.model_size;
-        // each face's typical grid spacing: an edge's segments stay within a few cells
-        // of it, so the triangles along the edge are not slivers
-        let mut spacing: BTreeMap<FaceId, Option<f64>> = BTreeMap::new();
         for e in bl::edges(b, None)? {
             let faces = edge_faces(b, e)?;
             let params: Vec<FaceParams> = faces
                 .iter()
                 .map(|f| opts.face_params(f.face, size))
                 .collect();
-            let mut p = opts.edge_params(e, size, &params);
+            let p = opts.edge_params(e, size, &params);
             self.max_segments.insert(e, p.max_segments);
-            for (f, fp) in faces.iter().zip(&params) {
-                let h = if let Some(h) = spacing.get(&f.face) {
-                    *h
-                } else {
-                    let mut domain = b.face(f.face)?.uv_domain;
-                    if !(domain.u_min() < domain.u_max() && domain.v_min() < domain.v_max()) {
-                        domain = f.surface.natural_uv_domain();
-                    }
-                    let h = face_spacing(k, f.surface, &domain, fp);
-                    spacing.insert(f.face, h);
-                    h
-                };
-                if let Some(h) = h {
-                    let l = MAX_CELL_ASPECT * h;
-                    p.max_len = Some(p.max_len.map_or(l, |m| m.min(l)));
-                }
-            }
             let slot = self.index.get(&e).copied();
             let result = match slot.and_then(|i| self.edges.get(i)).cloned() {
                 Some(poly) => self.refine_edge(k, b, &faces, &p, poly),

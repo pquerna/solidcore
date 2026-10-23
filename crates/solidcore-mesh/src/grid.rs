@@ -111,12 +111,33 @@ pub(crate) fn grid_lines(
             }
         }
     }
-    // bounded work: at most MAX_GRID_LINES per direction, and about the face's
-    // triangle budget in total
-    let budget = (p.max_triangles / 2).max(1);
+    Ok(bounded(us, vs, bbox, p.max_triangles))
+}
+
+/// Grid lines `(us, vs)` from any source made safe to insert: finite, sorted, strictly
+/// inside `bbox`, without near duplicates, at most [`MAX_GRID_LINES`] per direction and
+/// about `max_triangles` triangles in all (every other line dropped until they fit).
+pub(crate) fn bounded(
+    us: Vec<f64>,
+    vs: Vec<f64>,
+    bbox: &Extent2d,
+    max_triangles: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    // a huge list is thinned before it is sorted, so the work stays bounded
+    let thin = |l: Vec<f64>| {
+        let n = l.len().div_ceil(4 * MAX_GRID_LINES).max(1);
+        if n > 1 {
+            l.into_iter().step_by(n).collect()
+        } else {
+            l
+        }
+    };
+    let mut us = tidy(thin(us), bbox.u_min(), bbox.u_max());
+    let mut vs = tidy(thin(vs), bbox.v_min(), bbox.v_max());
+    let budget = (max_triangles / 2).max(1);
     while us.len() > MAX_GRID_LINES
         || vs.len() > MAX_GRID_LINES
-        || (us.len() + 1) * (vs.len() + 1) > budget
+        || (us.len() + 1).saturating_mul(vs.len() + 1) > budget
     {
         if us.len() >= vs.len() {
             us = us.into_iter().step_by(2).collect();
@@ -127,7 +148,7 @@ pub(crate) fn grid_lines(
             break;
         }
     }
-    Ok((us, vs))
+    (us, vs)
 }
 
 /// Lines over `[lo, hi]` for sample intervals needing `cells[i]` cells each (a
@@ -211,5 +232,19 @@ mod tests {
         let u = with_uniform(vec![0.1], 0.0, 1.0, 4.0);
         assert!(u.windows(2).all(|w| w[1] - w[0] <= 0.25 + 1e-12));
         assert!(lines_from(&[1e300], 0.0, 1.0).len() <= MAX_GRID_LINES);
+        // any source is bounded, sorted and inside the box
+        let bbox = Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0);
+        let huge: Vec<f64> = (0..1_000_000).rev().map(|i| f64::from(i) / 1e6).collect();
+        let (us, vs) = bounded(huge.clone(), huge, &bbox, 10_000);
+        assert!(us.len() <= MAX_GRID_LINES && vs.len() <= MAX_GRID_LINES);
+        assert!((us.len() + 1) * (vs.len() + 1) <= 5_000);
+        assert!(us.windows(2).all(|w| w[0] < w[1]) && us.iter().all(|t| *t > 0.0 && *t < 1.0));
+        let (us, _) = bounded(
+            vec![f64::NAN, 2.0, -1.0, 0.5, 0.5],
+            Vec::new(),
+            &bbox,
+            10_000,
+        );
+        assert_eq!(us, vec![0.5]);
     }
 }

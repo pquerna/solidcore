@@ -26,7 +26,7 @@ use crate::geom::{
     angle, closes, foot, invalid, invert_point, power_of_two, segment_distance, surface_normal,
     surface_point, surface_scales,
 };
-use crate::grid::{grid_lines, MAX_CELL_ASPECT, SAMPLE_GRID};
+use crate::grid::{bounded, grid_lines, MAX_CELL_ASPECT, SAMPLE_GRID};
 use crate::mesh::EdgePolyline;
 use crate::nurbs::Nurbs;
 use crate::options::FaceParams;
@@ -602,6 +602,8 @@ impl FaceState {
                 None => {}
             }
         }
+        // whichever source they came from, the lines are bounded like the built-in ones
+        let (us, vs) = bounded(us, vs, &bbox, p.max_triangles);
         let step =
             |lines: &[f64], lo: f64, hi: f64, sc: f64| (hi - lo) * sc / (lines.len() + 1) as f64;
         let has_pole = loops.iter().flatten().any(|q| q.pole_next);
@@ -661,7 +663,7 @@ impl FaceState {
         // only crowd it)
         let cells = (us.len() + 1) * (vs.len() + 1);
         if first || cells >= REGRID_FACTOR * self.grid_cells {
-            self.insert_grid(k, s, &us, &vs, scaled_step)?;
+            self.insert_grid(k, s, &us, &vs, scaled_step, p.max_triangles)?;
             self.grid_cells = cells;
         }
         self.lines = (us, vs);
@@ -1116,7 +1118,8 @@ impl FaceState {
     }
 
     /// Inserts the grid points inside the loops that are clear of the boundary (0.3 of
-    /// the step) and of the points already there (half the step).
+    /// the step) and of the points already there (half the step), until the triangulation has
+    /// `max_triangles` triangles.
     fn insert_grid(
         &mut self,
         k: &Kernel,
@@ -1124,6 +1127,7 @@ impl FaceState {
         us: &[f64],
         vs: &[f64],
         scaled_step: f64,
+        max_triangles: usize,
     ) -> Result<()> {
         if us.is_empty() && vs.is_empty() {
             return Ok(());
@@ -1152,6 +1156,10 @@ impl FaceState {
             }
         }
         for (i, j) in wanted {
+            // the face's triangle budget holds whatever the lines asked for
+            if self.cdt.num_inner_faces() >= max_triangles {
+                break;
+            }
             let (Some(u), Some(v)) = (us.get(i), vs.get(j)) else {
                 continue;
             };

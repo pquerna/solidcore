@@ -190,7 +190,7 @@ impl Default for TessellateOptions {
 
 impl TessellateOptions {
     /// The options of a quality preset: chord tolerance relative to the model size and
-    /// angle tolerance as listed on [`Quality`]; no length bounds, at most 1 000 000
+    /// angle tolerance as listed on [`Quality`]; no length bounds, at most 250 000
     /// triangles per face, 32 refinement passes, every output on, no deviation
     /// measurement, no overrides.
     #[must_use]
@@ -206,7 +206,7 @@ impl TessellateOptions {
             max_edge_length: None,
             min_edge_length: 0.0,
             edge: EdgeOptions::default(),
-            max_triangles_per_face: 1_000_000,
+            max_triangles_per_face: 250_000,
             max_refine_passes: 32,
             output: OutputOptions::default(),
             measure_deviation: false,

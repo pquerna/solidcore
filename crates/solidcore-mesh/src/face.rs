@@ -289,7 +289,7 @@ impl FaceState {
             flip: false,
             domain: natural,
             period,
-            nurbs: Nurbs::from_surface(surface),
+            nurbs: Nurbs::from_surface(k, surface),
             size: model_size,
             fast: None,
             cdt: Cdt::new(),
@@ -550,13 +550,23 @@ impl FaceState {
         if !(bbox.u_min() <= bbox.u_max() && bbox.v_min() <= bbox.v_max()) {
             return Err(invalid("face loops have no UV points"));
         }
+        let first = self.boundary.is_empty();
         let (mut us, mut vs) = if bbox.u_min() < bbox.u_max() && bbox.v_min() < bbox.v_max() {
-            // a B-spline is sampled once per knot span at least
-            let samples = self.nurbs.as_ref().map_or(SAMPLE_GRID, |nb| {
-                nb.spans_in(true, bbox.u_min(), bbox.u_max())
-                    .max(nb.spans_in(false, bbox.v_min(), bbox.v_max()))
-            });
-            grid_lines(k, s, &bbox, self.speed, p, samples)?
+            if first {
+                // the B-spline fast path, before anything is evaluated
+                self.check_fast_path(k, s, &bbox, self.size);
+            }
+            // a B-spline (on the fast path) is sampled once per knot span at least
+            let samples =
+                self.nurbs
+                    .as_ref()
+                    .filter(|_| self.fast.is_some())
+                    .map_or(SAMPLE_GRID, |nb| {
+                        nb.spans_in(true, bbox.u_min(), bbox.u_max())
+                            .max(nb.spans_in(false, bbox.v_min(), bbox.v_max()))
+                    });
+            let eval = |uv: Point2| Ok((self.point(k, s, uv)?, self.outward(k, s, uv)));
+            grid_lines(&eval, &bbox, self.speed, p, samples)?
         } else {
             (Vec::new(), Vec::new())
         };
@@ -592,7 +602,6 @@ impl FaceState {
         let step =
             |lines: &[f64], lo: f64, hi: f64, sc: f64| (hi - lo) * sc / (lines.len() + 1) as f64;
         let has_pole = loops.iter().flatten().any(|q| q.pole_next);
-        let first = self.boundary.is_empty();
         let mut metric = self.speed;
         if !has_pole {
             // the triangulation's metric: UV scaled so the grid cells the tolerances
@@ -643,9 +652,6 @@ impl FaceState {
             self.remove_stale_interior();
         }
 
-        if first {
-            self.check_fast_path(k, s, &bbox, self.size);
-        }
         // grid points, away from the boundary and the points already there; a finer
         // level adds its grid only when it is much denser than the last one inserted
         // (else it refines the earlier triangles: a grid on top of a similar one would
@@ -1400,7 +1406,15 @@ impl FaceState {
                         break;
                     }
                 }
-                if bad {
+                // the surface folds over inside the triangle (its normal reverses
+                // between corners): no triangle there can follow it, so only the chord
+                // counts
+                let normals: Vec<Vec3> = [a, b, c].iter().filter_map(|x| x.normal).collect();
+                let folded = normals
+                    .iter()
+                    .enumerate()
+                    .any(|(i, x)| normals.iter().skip(i + 1).any(|y| x.dot(*y) < 0.0));
+                if bad || folded {
                 } else if let Some(o) = self.outward(k, s, uv) {
                     // flipped, or turned from the surface by more than the angle
                     // tolerance at the centroid or an interior corner (a boundary

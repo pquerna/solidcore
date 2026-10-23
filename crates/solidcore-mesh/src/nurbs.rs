@@ -3,6 +3,7 @@
 //! through its B-spline. It does no meshing: dense NURBS faces can go to the
 //! nurbs-grid-mesh backend ([`crate::backend`]).
 
+use solidcore::kernel::Kernel;
 use solidcore::math::{Point3, Vec3};
 use solidcore::nurbs::b_spline_surface::BSplineSurface;
 use solidcore::surface::surface::{Surface, SurfaceKind};
@@ -60,9 +61,23 @@ pub(crate) struct Canonical {
 }
 
 /// The B-spline arrays of `s`, `None` for a surface evaluated otherwise or with
-/// inconsistent arrays.
-pub(crate) fn canonical_arrays(s: &Surface) -> Option<Canonical> {
-    let c = b_spline(s)?.canonical().ok()?;
+/// inconsistent arrays. A surface of extrusion without its B-spline yet (a lazy
+/// generator, whose every evaluation makes one) gets it made once here.
+pub(crate) fn canonical_arrays(k: &Kernel, s: &Surface) -> Option<Canonical> {
+    let b = b_spline(s)?;
+    arrays(b).or_else(|| match s.kind() {
+        SurfaceKind::SurfOfExtrusion(e) => {
+            let mut e = (**e).clone();
+            e.make_nurb(k).ok()?;
+            arrays(e.base())
+        }
+        _ => None,
+    })
+}
+
+/// The arrays of B-spline `b`, `None` when they are inconsistent.
+fn arrays(b: &BSplineSurface) -> Option<Canonical> {
+    let c = b.canonical().ok()?;
     let uk = expand(&c.u_knots, &c.u_multiplicities);
     let vk = expand(&c.v_knots, &c.v_multiplicities);
     let (p, q) = (c.u_degree, c.v_degree);
@@ -91,8 +106,8 @@ pub(crate) fn canonical_arrays(s: &Surface) -> Option<Canonical> {
 impl Nurbs {
     /// The B-spline data of `s`, `None` for a surface evaluated otherwise or with
     /// inconsistent arrays.
-    pub(crate) fn from_surface(s: &Surface) -> Option<Self> {
-        let c = canonical_arrays(s)?;
+    pub(crate) fn from_surface(k: &Kernel, s: &Surface) -> Option<Self> {
+        let c = canonical_arrays(k, s)?;
         let pw = c
             .poles
             .iter()

@@ -42,7 +42,6 @@ pub mod geom;
 pub mod heal;
 pub mod intersect;
 pub mod mass;
-pub mod mesh;
 pub mod nurbs;
 pub mod offset;
 pub mod primitive;

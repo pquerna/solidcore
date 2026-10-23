@@ -228,3 +228,19 @@ pub(crate) fn face_spacing(
     let h = lu.min(lv).max(p.chord);
     (h.is_finite() && h > 0.0).then_some(h)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lines_are_sorted_inside_and_bounded() {
+        assert!(lines_from(&[0.2, 0.5, 0.9], 0.0, 3.0).is_empty());
+        let l = tidy(lines_from(&[2.0, 1.0, 3.0], 0.0, 3.0), 0.0, 3.0);
+        assert_eq!(l.len(), 5);
+        assert!(l.windows(2).all(|w| w[0] < w[1]) && l.iter().all(|t| *t > 0.0 && *t < 3.0));
+        let u = with_uniform(vec![0.1], 0.0, 1.0, 4.0);
+        assert!(u.windows(2).all(|w| w[1] - w[0] <= 0.25 + 1e-12));
+        assert!(lines_from(&[1e300], 0.0, 1.0).len() <= MAX_GRID_LINES);
+    }
+}

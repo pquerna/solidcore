@@ -1671,7 +1671,8 @@ fn constraint_clearance(cdt: &Cdt, f: FixedFaceHandle<InnerTag>, p: spade::Point
 /// of unit normal `n`: triangles counter-clockwise about `n`, empty when it fails.
 fn ear_clip_polygon(pts: &[Point3], n: Vec3) -> Vec<[usize; 3]> {
     // a frame of the plane
-    let Ok([x, y, _]) = n.make_unit_ortho_vectors(None) else {
+    // (`n` itself is the first axis it returns)
+    let Ok([_, x, y]) = n.make_unit_ortho_vectors(None) else {
         return Vec::new();
     };
     let (x, y) = if x.cross(y).dot(n) < 0.0 {
@@ -1725,4 +1726,82 @@ fn ear_clip_polygon(pts: &[Point3], n: Vec3) -> Vec<[usize; 3]> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn area(pts: &[Point3], tris: &[[usize; 3]]) -> f64 {
+        tris.iter()
+            .map(|t| {
+                (pts[t[1]] - pts[t[0]])
+                    .cross(pts[t[2]] - pts[t[0]])
+                    .length()
+                    / 2.0
+            })
+            .sum()
+    }
+
+    #[test]
+    fn ear_clipping_covers_the_polygon() {
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        // an L of area 3, counter-clockwise about +z
+        let l = [
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+            Point3::new(2.0, 1.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(1.0, 2.0, 0.0),
+            Point3::new(0.0, 2.0, 0.0),
+        ];
+        let t = ear_clip_polygon(&l, z);
+        assert_eq!(t.len(), 4);
+        assert!((area(&l, &t) - 3.0).abs() < 1e-12);
+        // every triangle counter-clockwise about the normal
+        for [a, b, c] in &t {
+            assert!((l[*b] - l[*a]).cross(l[*c] - l[*a]).dot(z) > 0.0);
+        }
+        // seen from the other side the polygon is clockwise: no ear, nothing clipped
+        assert!(ear_clip_polygon(&l, -z).is_empty());
+    }
+
+    #[test]
+    fn flood_fill_marks_the_inside_of_a_square_with_a_hole() {
+        let mut cdt = Cdt::new();
+        let ring = |pts: &[(f64, f64)], base: usize, cdt: &mut Cdt| {
+            let hs: Vec<_> = pts
+                .iter()
+                .enumerate()
+                .map(|(i, (x, y))| {
+                    cdt.insert(CdtVertex {
+                        pos: spade::Point2::new(*x, *y),
+                        id: base + i,
+                    })
+                    .unwrap()
+                })
+                .collect();
+            for i in 0..hs.len() {
+                cdt.add_constraint(hs[i], hs[(i + 1) % hs.len()]);
+            }
+        };
+        ring(
+            &[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)],
+            0,
+            &mut cdt,
+        );
+        ring(
+            &[(1.0, 1.0), (3.0, 1.0), (3.0, 3.0), (1.0, 3.0)],
+            4,
+            &mut cdt,
+        );
+        let inside = inside_faces(&cdt);
+        let mut area_in = 0.0;
+        for f in cdt.inner_faces() {
+            if is_inside(&inside, f.fix()) {
+                area_in += f.area();
+            }
+        }
+        assert!((area_in - 12.0).abs() < 1e-12, "{area_in}");
+    }
 }

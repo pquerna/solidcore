@@ -36,9 +36,15 @@
 //!    edge is on the boundary; interior edges off the chord or too long get their
 //!    midpoint. No point goes onto or next to the boundary, which stays the shared
 //!    polyline.
-//! 6. **Fallbacks** (SolidCraft's hard cases). A boundary crossing itself in UV is
+//! 6. **Boundary rounds.** A bad triangle on a boundary segment too long to refine
+//!    from inside asks for that segment to be split; the edge polyline gains its
+//!    midpoint and the faces along it refine again (inserting points only).
+//! 7. **Fallbacks** (SolidCraft's hard cases). A boundary crossing itself in UV is
 //!    split where it crosses ([`Mesh::split_boundary_faces`]); a face with no area in
-//!    UV is ear-clipped from its loop in 3D ([`Mesh::ear_clipped_faces`]).
+//!    UV is ear-clipped from its loop in 3D ([`Mesh::ear_clipped_faces`]). Where the
+//!    B-rep's edge curve lies off its face's surface (an edge/face gap), triangles at
+//!    that boundary may be off the surface by the gap on top of the chord tolerance
+//!    ([`MeshStats::boundary_gap`]).
 //!
 //! # Levels of detail
 //!
@@ -55,11 +61,14 @@
 //!
 //! Deviations: not a port. Bounds (no recursion anywhere): edge segments split at most
 //! [`MAX_EDGE_DEPTH`] times and an edge has at most [`MAX_EDGE_POINTS`] points (more is
-//! an error); at most [`MAX_GRID_LINES`] grid lines per direction; refinement stops at
+//! an error); at most [`MAX_GRID_LINES`] grid lines per direction; refinement points
+//! at most [`MAX_LOCAL_DEPTH`] generations below a boundary or grid point; at most
+//! [`MAX_BOUNDARY_ROUNDS`] rounds of boundary splits; refinement stops at
 //! [`TessellateOptions::max_refine_passes`] passes or
-//! [`TessellateOptions::max_triangles_per_face`] triangles (the face is then listed in
-//! [`Mesh::unconverged_faces`]). Output is deterministic: every collection is visited in
-//! id or insertion order, and the triangulation is deterministic.
+//! [`TessellateOptions::max_triangles_per_face`] triangles (a face that stops at any of
+//! these with work left is listed in [`Mesh::unconverged_faces`]). Output is
+//! deterministic: every collection is visited in id or insertion order, and the
+//! triangulation (with its hierarchy point location) is deterministic.
 
 #![forbid(unsafe_code)]
 

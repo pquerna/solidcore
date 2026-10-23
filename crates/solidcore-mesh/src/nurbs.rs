@@ -386,3 +386,38 @@ fn basis(knots: &[f64], deg: usize, n: usize, t: f64) -> Option<Basis> {
     }
     Some(Basis { first, n: ndu, dn })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basis_is_a_partition_of_unity_with_zero_sum_derivative() {
+        let knots = [0.0, 0.0, 0.0, 0.0, 0.3, 0.5, 0.5, 0.8, 1.0, 1.0, 1.0, 1.0];
+        let n = knots.len() - 4; // degree 3
+        for i in 0..=100 {
+            let t = f64::from(i) / 100.0;
+            let b = basis(&knots, 3, n, t).unwrap();
+            assert!((b.n.iter().sum::<f64>() - 1.0).abs() < 1e-14, "t {t}");
+            assert!(b.dn.iter().sum::<f64>().abs() < 1e-11, "t {t}");
+            assert!(b.first + 3 < n);
+        }
+    }
+
+    #[test]
+    fn spans_hold_their_parameter() {
+        let knots = [0.0, 0.0, 0.0, 0.25, 0.5, 0.5, 1.0, 1.0, 1.0];
+        let n = knots.len() - 3;
+        for (t, s) in [
+            (0.0, 2),
+            (0.1, 2),
+            (0.25, 3),
+            (0.49, 3),
+            (0.5, 5),
+            (0.9, 5),
+            (1.0, 5),
+        ] {
+            assert_eq!(span(&knots, 2, n, t), s, "t {t}");
+        }
+    }
+}

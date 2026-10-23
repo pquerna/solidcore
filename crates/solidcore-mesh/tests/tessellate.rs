@@ -329,9 +329,10 @@ fn edges_only_mode() {
         assert!(m.triangles.is_empty());
         assert_eq!(m.edges.len(), bl::edges(&b, None).unwrap().len(), "{name}");
         let full = tessellate(&k, &b, &TessellateOptions::default()).unwrap();
-        // the same polylines as the full mesh's
+        // the full mesh's polylines are these, with at most points added where faces
+        // asked for them
         for (a, c) in m.edges.iter().zip(&full.edges) {
-            assert_eq!(a.params, c.params, "{name}");
+            assert!(a.params.iter().all(|t| c.params.contains(t)), "{name}");
         }
     }
 }

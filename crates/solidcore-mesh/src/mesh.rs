@@ -65,7 +65,9 @@ pub struct Mesh {
     pub triangles: Vec<[u32; 3]>,
     /// Unit outward surface normal at each triangle's corners (parallel to
     /// [`Mesh::triangles`]; empty when not asked for). A corner takes its own face's
-    /// normal, so a vertex on a sharp edge has one normal per face.
+    /// normal, so a vertex on a sharp edge has one normal per face; where the surface
+    /// has none, or one pointing against the triangle (a singular point), the corner
+    /// takes the triangle's normal.
     pub normals: Vec<[Vec3; 3]>,
     /// The face's (u, v) at each triangle's corners (parallel to [`Mesh::triangles`];
     /// empty when not asked for).

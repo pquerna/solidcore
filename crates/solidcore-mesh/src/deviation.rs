@@ -11,7 +11,7 @@ use solidcore::topology::Brep;
 use solidcore::Result;
 
 use crate::face::FaceMesh;
-use crate::geom::{curve_eval, foot, invalid, segment_distance};
+use crate::geom::{curve_eval, foot, invalid, segment_distance, surface_normal};
 use crate::mesh::{EdgePolyline, Mesh};
 
 /// Barycentric weights of the seven samples: centroid, edge midpoints, and three points
@@ -41,6 +41,9 @@ pub struct DeviationReport {
     pub over: usize,
     /// The triangle with the largest distance.
     pub worst: Option<usize>,
+    /// Triangles wound against their face's outward side: the facet normal opposes the
+    /// outward surface normal at the foot of the triangle's centroid.
+    pub flipped: usize,
 }
 
 /// The largest sample distance of one triangle (UVs `uv`, corners `p`) from surface `s`.
@@ -155,8 +158,21 @@ pub fn deviation(k: &Kernel, b: &Brep, mesh: &Mesh, tolerance: f64) -> Result<De
         let Some(p) = mesh.triangle_points(*t) else {
             continue;
         };
-        let d = triangle_deviation(k, s, &s.natural_uv_domain(), *uv, p);
+        let domain = s.natural_uv_domain();
+        let d = triangle_deviation(k, s, &domain, *uv, p);
         sum += d;
+        let facet = (p[1] - p[0]).cross(p[2] - p[0]);
+        let centroid = (p[0] + p[1] + p[2]) / 3.0;
+        let start = Point2::new(
+            (uv[0].x + uv[1].x + uv[2].x) / 3.0,
+            (uv[0].y + uv[1].y + uv[2].y) / 3.0,
+        );
+        let (at, _) = foot(k, s, start, centroid, &domain);
+        if let Some(n) = surface_normal(k, s, at) {
+            if n.dot(facet) * crate::face::outward_sense(b, *f)? < 0.0 {
+                r.flipped += 1;
+            }
+        }
         if d > tolerance {
             r.over += 1;
         }

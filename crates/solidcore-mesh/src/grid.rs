@@ -130,24 +130,30 @@ pub(crate) fn grid_lines(
     Ok((us, vs))
 }
 
-/// Lines over `[lo, hi]` for sample intervals needing `cells[i]` cells each (a flat
-/// direction, all below one, gets none).
+/// Lines over `[lo, hi]` for sample intervals needing `cells[i]` cells each (a
+/// direction needing less than two cells in all gets none).
 fn lines_from(cells: &[f64], lo: f64, hi: f64) -> Vec<f64> {
-    if cells.iter().all(|c| *c < 1.0) {
+    // the needs add up along the direction: ceil(total) cells, each holding an equal
+    // share of the need, so a direction needing a third of a cell per sample interval
+    // over 40 intervals gets 13 cells, and one needing 1.04 per interval is not doubled
+    let total: f64 = cells.iter().sum();
+    let m = total.ceil().min(MAX_GRID_LINES as f64 + 1.0);
+    if m.is_nan() || m < 2.0 {
         return Vec::new();
     }
+    let share = total / m;
     let n = cells.len() as f64;
     let mut out = Vec::new();
+    let mut acc = 0.0;
+    let mut next = share;
     for (i, c) in cells.iter().enumerate() {
         let a = lo + (hi - lo) * i as f64 / n;
         let b = lo + (hi - lo) * (i + 1) as f64 / n;
-        if i > 0 {
-            out.push(a);
+        while out.len() + 1 < m as usize && *c > 0.0 && acc + c >= next {
+            out.push(a + (b - a) * (next - acc) / c);
+            next += share;
         }
-        let m = c.ceil().clamp(1.0, MAX_GRID_LINES as f64) as usize;
-        for kk in 1..m {
-            out.push(a + (b - a) * kk as f64 / m as f64);
-        }
+        acc += c;
     }
     out
 }
@@ -197,7 +203,8 @@ mod tests {
 
     #[test]
     fn lines_are_sorted_inside_and_bounded() {
-        assert!(lines_from(&[0.2, 0.5, 0.9], 0.0, 3.0).is_empty());
+        assert!(lines_from(&[0.2, 0.3, 0.4], 0.0, 3.0).is_empty());
+        assert_eq!(lines_from(&[0.25; 40], 0.0, 1.0).len(), 9);
         let l = tidy(lines_from(&[2.0, 1.0, 3.0], 0.0, 3.0), 0.0, 3.0);
         assert_eq!(l.len(), 5);
         assert!(l.windows(2).all(|w| w[0] < w[1]) && l.iter().all(|t| *t > 0.0 && *t < 3.0));

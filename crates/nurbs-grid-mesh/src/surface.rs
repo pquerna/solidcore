@@ -1,6 +1,8 @@
 //! The NURBS surface: validation, evaluation with first derivatives, and projection back onto it
 //! (The NURBS Book, A2.1 to A2.3).
 
+use crate::control::{reserve, zeros, Unlimited};
+use crate::MeshControl;
 use crate::MeshError;
 
 /// A NURBS surface. Poles are indexed `i * nv + j`, `i` along u and `j` along v.
@@ -45,6 +47,26 @@ impl NurbsSurface {
         poles: Vec<[f64; 3]>,
         weights: Option<&[f64]>,
     ) -> Result<Self, MeshError> {
+        Self::new_with_control(
+            u_degree, v_degree, u_knots, v_knots, nu, nv, poles, weights, &Unlimited,
+        )
+    }
+
+    /// Constructs the same surface with caller control over validation and new
+    /// homogeneous coefficient storage. Moved input buffers are already owned
+    /// and admitted by the caller; this method does not count them a second time.
+    pub fn new_with_control(
+        u_degree: usize,
+        v_degree: usize,
+        u_knots: Vec<f64>,
+        v_knots: Vec<f64>,
+        nu: usize,
+        nv: usize,
+        poles: Vec<[f64; 3]>,
+        weights: Option<&[f64]>,
+        control: &impl MeshControl,
+    ) -> Result<Self, MeshError> {
+        control.charge(1)?;
         if u_degree == 0 || v_degree == 0 {
             return Err(MeshError::BadSurface("degree 0"));
         }
@@ -60,31 +82,37 @@ impl NurbsSurface {
             return Err(MeshError::BadSurface("pole count is not nu * nv"));
         }
         for k in [&u_knots, &v_knots] {
-            if k.iter().any(|x| !x.is_finite())
-                || k.windows(2).any(|w| matches!(w, [a, b] if b < a))
-            {
-                return Err(MeshError::BadSurface("knots not finite and nondecreasing"));
+            for (i, value) in k.iter().enumerate() {
+                control.charge(1)?;
+                if !value.is_finite() || (i > 0 && *value < k[i - 1]) {
+                    return Err(MeshError::BadSurface("knots not finite and nondecreasing"));
+                }
             }
         }
-        if poles.iter().flatten().any(|x| !x.is_finite()) {
-            return Err(MeshError::BadSurface("pole not finite"));
+        for pole in &poles {
+            control.charge(1)?;
+            if pole.iter().any(|x| !x.is_finite()) {
+                return Err(MeshError::BadSurface("pole not finite"));
+            }
         }
-        let hpoles: Vec<[f64; 4]> = match weights {
-            None => poles.iter().map(|&[x, y, z]| [x, y, z, 1.0]).collect(),
-            Some(w) => {
-                if w.len() != poles.len() {
-                    return Err(MeshError::BadSurface("weight count is not nu * nv"));
-                }
-                if w.iter().any(|&x| !(x.is_finite() && x > 0.0)) {
+        if let Some(w) = weights {
+            if w.len() != poles.len() {
+                return Err(MeshError::BadSurface("weight count is not nu * nv"));
+            }
+            for weight in w {
+                control.charge(1)?;
+                if !(weight.is_finite() && *weight > 0.0) {
                     return Err(MeshError::BadSurface("weight not finite and positive"));
                 }
-                poles
-                    .iter()
-                    .zip(w)
-                    .map(|(&[x, y, z], &w)| [x * w, y * w, z * w, w])
-                    .collect()
             }
-        };
+        }
+        let mut hpoles = Vec::new();
+        reserve(&mut hpoles, poles.len(), control)?;
+        for (i, &[x, y, z]) in poles.iter().enumerate() {
+            control.charge(1)?;
+            let w = weights.map_or(1.0, |weights| weights[i]);
+            hpoles.push([x * w, y * w, z * w, w]);
+        }
         let end = |k: &[f64], i: usize| k.get(i).copied().ok_or(MeshError::Internal);
         let domain = [
             [end(&u_knots, u_degree)?, end(&u_knots, nu)?],
@@ -131,19 +159,35 @@ impl NurbsSurface {
     /// The surface and its first partial derivatives at (u, v). Parameters outside the domain
     /// evaluate the end spans' polynomials.
     pub fn evaluate(&self, u: f64, v: f64) -> Result<SurfacePoint, MeshError> {
+        self.evaluate_with_control(u, v, &Unlimited)
+    }
+
+    /// Evaluates the original basis/derivative algorithm with caller control
+    /// through its recurrences, accumulation and capacity-visible scratch.
+    pub fn evaluate_with_control(
+        &self,
+        u: f64,
+        v: f64,
+        control: &impl MeshControl,
+    ) -> Result<SurfacePoint, MeshError> {
+        control.charge(1)?;
         let (p, q) = (self.u_degree, self.v_degree);
+        // Bisection has a fixed 64-iteration bound in each direction.
+        control.charge(128)?;
         let iu = find_span(self.nu, p, u, &self.u_knots).ok_or(MeshError::Internal)?;
         let iv = find_span(self.nv, q, v, &self.v_knots).ok_or(MeshError::Internal)?;
-        let (bu, du) = basis(iu, u, p, &self.u_knots).ok_or(MeshError::Internal)?;
-        let (bv, dv) = basis(iv, v, q, &self.v_knots).ok_or(MeshError::Internal)?;
+        let (bu, du) = basis_with_control(iu, u, p, &self.u_knots, control)?;
+        let (bv, dv) = basis_with_control(iv, v, q, &self.v_knots, control)?;
         // Homogeneous sums A = sum N h, with their u and v derivatives.
         let mut a = [0.0; 4];
         let mut au = [0.0; 4];
         let mut av = [0.0; 4];
         for (r, (&nu, &nu1)) in bu.iter().zip(&du).enumerate() {
+            control.charge(1)?;
             let row = (iu + r - p) * self.nv + iv - q;
             let poles = self.hpoles.get(row..=row + q).ok_or(MeshError::Internal)?;
             for ((h, &nv), &nv1) in poles.iter().zip(&bv).zip(&dv) {
+                control.charge(1)?;
                 axpy(&mut a, nu * nv, h);
                 axpy(&mut au, nu1 * nv, h);
                 axpy(&mut av, nu * nv1, h);
@@ -166,14 +210,27 @@ impl NurbsSurface {
     /// domain, and the distance from `q` to the surface point there. A local search: the distance
     /// is to a real surface point, so it bounds the distance from `q` to the surface from above.
     pub fn foot_near(&self, q: [f64; 3], seed: [f64; 2]) -> Result<([f64; 2], f64), MeshError> {
+        self.foot_near_with_control(q, seed, &Unlimited)
+    }
+
+    /// Runs the same Gauss-Newton search, checking the caller on each iteration
+    /// and in every derivative evaluation, including the final distance.
+    pub fn foot_near_with_control(
+        &self,
+        q: [f64; 3],
+        seed: [f64; 2],
+        control: &impl MeshControl,
+    ) -> Result<([f64; 2], f64), MeshError> {
+        control.charge(1)?;
         let [[u0, u1], [v0, v1]] = self.domain;
         let [mut u, mut v] = seed;
         for _ in 0..30 {
+            control.charge(1)?;
             let SurfacePoint {
                 point,
                 du: su,
                 dv: sv,
-            } = self.evaluate(u, v)?;
+            } = self.evaluate_with_control(u, v, control)?;
             let r = sub(q, point);
             let (a, b, c) = (dot(su, su), dot(su, sv), dot(sv, sv));
             let (e, f) = (dot(su, r), dot(sv, r));
@@ -201,7 +258,7 @@ impl NurbsSurface {
                 break;
             }
         }
-        let point = self.evaluate(u, v)?.point;
+        let point = self.evaluate_with_control(u, v, control)?.point;
         Ok(([u, v], norm(sub(q, point))))
     }
 
@@ -267,40 +324,64 @@ pub(crate) fn find_span(n: usize, p: usize, t: f64, k: &[f64]) -> Option<usize> 
 
 /// The `p + 1` basis functions that are nonzero on span `i` at `t`, and their first derivatives.
 pub(crate) fn basis(i: usize, t: f64, p: usize, k: &[f64]) -> Option<(Vec<f64>, Vec<f64>)> {
-    let w = p + 1;
+    basis_with_control(i, t, p, k, &Unlimited).ok()
+}
+
+fn basis_with_control(
+    i: usize,
+    t: f64,
+    p: usize,
+    k: &[f64],
+    control: &impl MeshControl,
+) -> Result<(Vec<f64>, Vec<f64>), MeshError> {
+    control.charge(1)?;
+    let w = p
+        .checked_add(1)
+        .ok_or_else(|| control.allocation_failed())?;
+    let count = w
+        .checked_mul(w)
+        .ok_or_else(|| control.allocation_failed())?;
+    let at = |xs: &[f64], index: usize| xs.get(index).copied().ok_or(MeshError::Internal);
     // ndu[r][c] at r * w + c: basis values above the diagonal, knot differences below it.
-    let mut ndu = vec![0.0; w * w];
-    let mut left = vec![0.0; w];
-    let mut right = vec![0.0; w];
-    *ndu.get_mut(0)? = 1.0;
+    let mut ndu = zeros(count, control)?;
+    let mut left = zeros(w, control)?;
+    let mut right = zeros(w, control)?;
+    *ndu.get_mut(0).ok_or(MeshError::Internal)? = 1.0;
     for j in 1..=p {
-        *left.get_mut(j)? = t - k.get((i + 1).checked_sub(j)?)?;
-        *right.get_mut(j)? = k.get(i + j)? - t;
+        control.charge(1)?;
+        *left.get_mut(j).ok_or(MeshError::Internal)? =
+            t - at(k, (i + 1).checked_sub(j).ok_or(MeshError::Internal)?)?;
+        *right.get_mut(j).ok_or(MeshError::Internal)? = at(k, i + j)? - t;
         let mut saved = 0.0;
         for r in 0..j {
-            let lower = right.get(r + 1)? + left.get(j - r)?;
-            *ndu.get_mut(j * w + r)? = lower;
-            let tmp = ndu.get(r * w + j - 1)? / lower;
-            *ndu.get_mut(r * w + j)? = saved + right.get(r + 1)? * tmp;
-            saved = left.get(j - r)? * tmp;
+            control.charge(1)?;
+            let lower = at(&right, r + 1)? + at(&left, j - r)?;
+            *ndu.get_mut(j * w + r).ok_or(MeshError::Internal)? = lower;
+            let tmp = at(&ndu, r * w + j - 1)? / lower;
+            *ndu.get_mut(r * w + j).ok_or(MeshError::Internal)? = saved + at(&right, r + 1)? * tmp;
+            saved = at(&left, j - r)? * tmp;
         }
-        *ndu.get_mut(j * w + j)? = saved;
+        *ndu.get_mut(j * w + j).ok_or(MeshError::Internal)? = saved;
     }
-    let n = (0..w)
-        .map(|r| ndu.get(r * w + p).copied())
-        .collect::<Option<Vec<_>>>()?;
-    let mut d = vec![0.0; w];
+    let mut n = Vec::new();
+    reserve(&mut n, w, control)?;
+    for r in 0..w {
+        control.charge(1)?;
+        n.push(at(&ndu, r * w + p)?);
+    }
+    let mut d = zeros(w, control)?;
     for (r, dr) in d.iter_mut().enumerate() {
+        control.charge(1)?;
         let mut x = 0.0;
         if r >= 1 {
-            x += ndu.get((r - 1) * w + p - 1)? / ndu.get(p * w + r - 1)?;
+            x += at(&ndu, (r - 1) * w + p - 1)? / at(&ndu, p * w + r - 1)?;
         }
         if r < p {
-            x -= ndu.get(r * w + p - 1)? / ndu.get(p * w + r)?;
+            x -= at(&ndu, r * w + p - 1)? / at(&ndu, p * w + r)?;
         }
         *dr = x * p as f64;
     }
-    Some((n, d))
+    Ok((n, d))
 }
 
 fn axpy(acc: &mut [f64; 4], s: f64, h: &[f64; 4]) {

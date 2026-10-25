@@ -10,8 +10,10 @@ use solidcore::surface::surface::Surface;
 use solidcore::topology::Brep;
 use solidcore::Result;
 
+use crate::budget::QueryBudget;
 use crate::face::FaceMesh;
-use crate::geom::{curve_eval, foot, invalid, segment_distance, surface_normal};
+use crate::geom::foot_with_budget;
+use crate::geom::{curve_eval, invalid, segment_distance, surface_normal};
 use crate::mesh::{EdgePolyline, Mesh};
 
 /// Barycentric weights of the seven samples: centroid, edge midpoints, and three points
@@ -49,44 +51,49 @@ pub struct DeviationReport {
 }
 
 /// The largest sample distance of one triangle (UVs `uv`, corners `p`) from surface `s`.
-pub(crate) fn triangle_deviation(
+pub(crate) fn triangle_deviation_with_budget(
     k: &Kernel,
     s: &Surface,
     domain: &Extent2d,
     uv: [Point2; 3],
     p: [Point3; 3],
-) -> f64 {
+    budget: &QueryBudget<'_>,
+) -> Result<f64> {
     let mut worst = 0.0_f64;
     for w in SAMPLES {
+        budget.charge(1)?;
         let q = p[0] * w[0] + p[1] * w[1] + p[2] * w[2];
         let start = Point2::new(
             uv[0].x * w[0] + uv[1].x * w[1] + uv[2].x * w[2],
             uv[0].y * w[0] + uv[1].y * w[1] + uv[2].y * w[2],
         );
-        if let (_, Some(d)) = foot(k, s, start, q, domain) {
+        if let (_, Some(d)) = foot_with_budget(k, s, start, q, domain, budget)? {
             worst = worst.max(d);
         }
     }
-    worst
+    Ok(worst)
 }
 
 /// The largest triangle deviation of a face mesh and how many triangles exceed `chord`
 /// plus their corners' largest gap from the surface.
-pub(crate) fn face_mesh_deviation(
+pub(crate) fn face_mesh_deviation_with_budget(
     k: &Kernel,
     s: &Surface,
     domain: &Extent2d,
     m: &FaceMesh,
     chord: f64,
-) -> (f64, usize) {
+    budget: &QueryBudget<'_>,
+) -> Result<(f64, usize)> {
     let mut max = 0.0_f64;
     let mut over = 0;
     for t in &m.triangles {
+        budget.charge(1)?;
         let get = |i: u32| Some((*m.uvs.get(i as usize)?, *m.positions.get(i as usize)?));
         let (Some(a), Some(b), Some(c)) = (get(t[0]), get(t[1]), get(t[2])) else {
             continue;
         };
-        let d = triangle_deviation(k, s, domain, [a.0, b.0, c.0], [a.1, b.1, c.1]);
+        let d =
+            triangle_deviation_with_budget(k, s, domain, [a.0, b.0, c.0], [a.1, b.1, c.1], budget)?;
         let gap = t
             .iter()
             .filter_map(|i| m.gaps.get(*i as usize))
@@ -96,7 +103,7 @@ pub(crate) fn face_mesh_deviation(
         }
         max = max.max(d);
     }
-    (max, over)
+    Ok((max, over))
 }
 
 /// The largest distance of an edge polyline's segments from the edge curve (sampled
@@ -161,7 +168,7 @@ pub fn deviation(k: &Kernel, b: &Brep, mesh: &Mesh, tolerance: f64) -> Result<De
             continue;
         };
         let domain = s.natural_uv_domain();
-        let d = triangle_deviation(k, s, &domain, *uv, p);
+        let d = triangle_deviation_with_budget(k, s, &domain, *uv, p, &QueryBudget::unbounded())?;
         sum += d;
         let facet = (p[1] - p[0]).cross(p[2] - p[0]);
         let centroid = (p[0] + p[1] + p[2]) / 3.0;
@@ -169,7 +176,7 @@ pub fn deviation(k: &Kernel, b: &Brep, mesh: &Mesh, tolerance: f64) -> Result<De
             (uv[0].x + uv[1].x + uv[2].x) / 3.0,
             (uv[0].y + uv[1].y + uv[2].y) / 3.0,
         );
-        let (at, _) = foot(k, s, start, centroid, &domain);
+        let (at, _) = foot_with_budget(k, s, start, centroid, &domain, &QueryBudget::unbounded())?;
         if let Some(n) = surface_normal(k, s, at) {
             if n.dot(facet) * crate::face::outward_sense(b, *f)? < 0.0 {
                 r.flipped += 1;

@@ -389,19 +389,25 @@ impl backend::FaceBackend for Hostile {
         &self,
         _k: &Kernel,
         face: &backend::BackendFace<'_>,
+        budget: &solidcore_mesh::QueryBudget<'_>,
     ) -> Option<solidcore::Result<(Vec<f64>, Vec<f64>)>> {
         let b = face.bbox;
-        let lines = |lo: f64, hi: f64| -> Vec<f64> {
-            (0..1_000_000)
-                .rev()
-                .map(|i| lo + (hi - lo) * f64::from(i) / 1e6)
-                .chain([f64::NAN, f64::INFINITY, lo - 1.0, hi + 1.0])
-                .collect()
+        let lines = |lo: f64, hi: f64| -> solidcore::Result<Vec<f64>> {
+            let mut values = Vec::new();
+            budget.reserve_vec(&mut values, 1_000_004)?;
+            for i in (0..1_000_000).rev() {
+                budget.charge(1)?;
+                values.push(lo + (hi - lo) * f64::from(i) / 1e6);
+            }
+            for value in [f64::NAN, f64::INFINITY, lo - 1.0, hi + 1.0] {
+                budget.charge(1)?;
+                values.push(value);
+            }
+            Ok(values)
         };
-        Some(Ok((
-            lines(b.u_min(), b.u_max()),
-            lines(b.v_min(), b.v_max()),
-        )))
+        Some((|| {
+            Ok((lines(b.u_min(), b.u_max())?, lines(b.v_min(), b.v_max())?))
+        })())
     }
 }
 

@@ -1,6 +1,8 @@
 //! Grid lines: as many in each knot span as its curvature needs for the tolerance.
 
+use crate::control::{reserve, zeros, Unlimited};
 use crate::surface::{norm, sub, NurbsSurface};
+use crate::MeshControl;
 use crate::MeshError;
 
 /// A parameter direction.
@@ -40,6 +42,19 @@ pub fn grid_lines(
     max_step: f64,
     max_per_span: usize,
 ) -> Result<GridLines, MeshError> {
+    grid_lines_with_control(s, dir, tol, max_step, max_per_span, &Unlimited)
+}
+
+/// The same grid algorithm with caller work/cancellation and byte admission.
+pub fn grid_lines_with_control(
+    s: &NurbsSurface,
+    dir: Dir,
+    tol: f64,
+    max_step: f64,
+    max_per_span: usize,
+    control: &impl MeshControl,
+) -> Result<GridLines, MeshError> {
+    control.charge(1)?;
     let (p, k, n, m) = match dir {
         Dir::U => (s.u_degree, &s.u_knots, s.nu, s.nv),
         Dir::V => (s.v_degree, &s.v_knots, s.nv, s.nu),
@@ -51,9 +66,10 @@ pub fn grid_lines(
     let knot = |i: usize| k.get(i).copied().ok_or(MeshError::Internal);
     let pole = |i: usize| s.poles.get(i).copied().ok_or(MeshError::Internal);
     // r[i]: the largest second-derivative control point i over every row.
-    let mut r = vec![0.0_f64; n.saturating_sub(2)];
+    let mut r = zeros(n.saturating_sub(2), control)?;
     if p >= 2 {
         for (i, ri) in r.iter_mut().enumerate() {
+            control.charge(1)?;
             let d1 = knot(i + p + 1)? - knot(i + 1)?;
             let d2 = knot(i + p + 2)? - knot(i + 2)?;
             let d3 = knot(i + p + 1)? - knot(i + 2)?;
@@ -63,6 +79,7 @@ pub fn grid_lines(
             }
             let pf = p as f64;
             for j in 0..m {
+                control.charge(1)?;
                 let (a, b, c) = (pole(at(i, j))?, pole(at(i + 1, j))?, pole(at(i + 2, j))?);
                 let [x0, y0, z0] = sub(b, a);
                 let [x1, y1, z1] = sub(c, b);
@@ -74,14 +91,21 @@ pub fn grid_lines(
     let mut lines = Vec::new();
     let mut capped_spans = 0;
     for span in p..n {
+        control.charge(1)?;
         let (a, b) = (knot(span)?, knot(span + 1)?);
         if b <= a {
             continue;
         }
         // Span [k[span], k[span + 1]] uses second-derivative control points span - p ..= span - 2.
         let bound = if p >= 2 {
-            r.get(span - p..=span - 2)
-                .map_or(0.0, |w| w.iter().copied().fold(0.0, f64::max))
+            let mut bound = 0.0_f64;
+            if let Some(window) = r.get(span - p..=span - 2) {
+                for value in window {
+                    control.charge(1)?;
+                    bound = bound.max(*value);
+                }
+            }
+            bound
         } else {
             0.0
         };
@@ -94,8 +118,14 @@ pub fn grid_lines(
             capped_spans += 1;
         }
         let count = for_curvature.max(for_step).max(1.0).min(cap) as usize;
-        lines.extend((0..count).map(|q| a + (b - a) * q as f64 / count as f64));
+        reserve(&mut lines, count, control)?;
+        for q in 0..count {
+            control.charge(1)?;
+            lines.push(a + (b - a) * q as f64 / count as f64);
+        }
     }
+    reserve(&mut lines, 1, control)?;
+    control.charge(1)?;
     lines.push(knot(n)?);
     Ok(GridLines {
         lines,

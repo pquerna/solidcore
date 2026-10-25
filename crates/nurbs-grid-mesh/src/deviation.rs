@@ -1,6 +1,8 @@
 //! How far a mesh strays from its surface, measured rather than assumed.
 
+use crate::control::Unlimited;
 use crate::surface::{lerp, NurbsSurface};
+use crate::MeshControl;
 use crate::{MeshError, TrimmedMesh};
 
 /// What [`deviation`] found.
@@ -36,6 +38,17 @@ const SAMPLES: [[f64; 3]; 7] = [
 ///
 /// Edge midpoints on the face's boundary measure the caller's edge polyline, not the grid.
 pub fn deviation(s: &NurbsSurface, mesh: &TrimmedMesh, tol: f64) -> Result<Deviation, MeshError> {
+    deviation_with_control(s, mesh, tol, &Unlimited)
+}
+
+/// The same seven-sample measurement, controlled through every Newton search.
+pub fn deviation_with_control(
+    s: &NurbsSurface,
+    mesh: &TrimmedMesh,
+    tol: f64,
+    control: &impl MeshControl,
+) -> Result<Deviation, MeshError> {
+    control.charge(1)?;
     let mut out = Deviation {
         max: 0.0,
         mean: 0.0,
@@ -45,6 +58,7 @@ pub fn deviation(s: &NurbsSurface, mesh: &TrimmedMesh, tol: f64) -> Result<Devia
     };
     let mut sum = 0.0;
     for (t, ids) in mesh.triangles.iter().enumerate() {
+        control.charge(1)?;
         let corner = |k: usize| -> Result<([f64; 3], [f64; 2]), MeshError> {
             let id = *ids.get(k).ok_or(MeshError::Internal)? as usize;
             Ok((
@@ -55,13 +69,14 @@ pub fn deviation(s: &NurbsSurface, mesh: &TrimmedMesh, tol: f64) -> Result<Devia
         let [(pa, ua), (pb, ub), (pc, uc)] = [corner(0)?, corner(1)?, corner(2)?];
         let mut worst = 0.0_f64;
         for [a, b, c] in SAMPLES {
+            control.charge(1)?;
             // a pa + b pb + c pc, as two lerps.
             let q = lerp(lerp(pa, pb, b / (a + b)), pc, c);
             let seed = [
                 a * ua[0] + b * ub[0] + c * uc[0],
                 a * ua[1] + b * ub[1] + c * uc[1],
             ];
-            let (_, d) = s.foot_near(q, seed)?;
+            let (_, d) = s.foot_near_with_control(q, seed, control)?;
             worst = worst.max(d);
         }
         sum += worst;

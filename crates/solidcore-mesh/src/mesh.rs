@@ -125,6 +125,31 @@ impl EdgeReport {
 }
 
 impl Mesh {
+    /// Bytes of this owner and its retained output backing storage, including
+    /// empty buffers whose capacity has not been released.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        use crate::storage::vector_bytes;
+        let flat = size_of::<Self>()
+            .saturating_add(vector_bytes(&self.positions))
+            .saturating_add(vector_bytes(&self.triangles))
+            .saturating_add(vector_bytes(&self.normals))
+            .saturating_add(vector_bytes(&self.uvs))
+            .saturating_add(vector_bytes(&self.triangle_faces))
+            .saturating_add(vector_bytes(&self.edges))
+            .saturating_add(vector_bytes(&self.failures))
+            .saturating_add(vector_bytes(&self.inverted_edgeuses))
+            .saturating_add(vector_bytes(&self.unconverged_faces))
+            .saturating_add(vector_bytes(&self.split_boundary_faces))
+            .saturating_add(vector_bytes(&self.ear_clipped_faces))
+            .saturating_add(vector_bytes(&self.backend_faces))
+            .saturating_add(vector_bytes(&self.backend_failed_faces));
+        self.edges.iter().fold(flat, |sum, edge| {
+            sum.saturating_add(vector_bytes(&edge.params))
+                .saturating_add(vector_bytes(&edge.vertices))
+        })
+    }
+
     /// The triangle's corner positions, `None` for an index out of range.
     #[must_use]
     pub fn triangle_points(&self, t: [u32; 3]) -> Option<[Point3; 3]> {
@@ -200,5 +225,27 @@ impl Mesh {
             }
         }
         r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_bytes_follow_output_capacity_not_length() {
+        let mut mesh = Mesh::default();
+        let empty = mesh.retained_bytes();
+        mesh.positions.reserve(17);
+        mesh.triangles.reserve(11);
+        mesh.normals.reserve(5);
+        let expected = empty
+            + mesh.positions.capacity() * size_of::<Point3>()
+            + mesh.triangles.capacity() * size_of::<[u32; 3]>()
+            + mesh.normals.capacity() * size_of::<[Vec3; 3]>();
+        assert_eq!(mesh.retained_bytes(), expected);
+        mesh.positions.push(Point3::new(0.0, 0.0, 0.0));
+        mesh.positions.clear();
+        assert_eq!(mesh.retained_bytes(), expected);
     }
 }

@@ -19,6 +19,8 @@ use solidcore::math::{Point2, Point3};
 use solidcore::surface::surface::Surface;
 use solidcore::{FaceId, Result};
 
+use crate::budget::QueryBudget;
+
 /// A face offered to a backend.
 #[derive(Debug, Clone, Copy)]
 pub struct BackendFace<'a> {
@@ -55,6 +57,9 @@ pub trait FaceBackend: Send + Sync {
     /// `face.bbox`; `None` to decline the face (the built-in grid then). Whatever it
     /// returns is bounded like the built-in grid: sorted, clipped to the box and thinned
     /// to [`crate::MAX_GRID_LINES`] per direction and the face's triangle budget.
+    /// Implementations must use the supplied caller budget for real work and
+    /// visible owned buffers; resource/cancellation errors are terminal, not a
+    /// reason to decline. The returned buffers remain admitted by this call.
     ///
     /// # Errors
     ///
@@ -63,16 +68,20 @@ pub trait FaceBackend: Send + Sync {
         &self,
         k: &Kernel,
         face: &BackendFace<'_>,
+        budget: &QueryBudget<'_>,
     ) -> Option<Result<(Vec<f64>, Vec<f64>)>>;
 
     /// The largest distance of the mesh from the face's surface by the backend's own
     /// measure, `None` when it has none for this face.
+    /// A diagnostic error, including caller refusal, is propagated rather than
+    /// silently discarded.
     fn deviation(
         &self,
         _k: &Kernel,
         _face: &BackendFace<'_>,
         _mesh: &FaceMeshView<'_>,
-    ) -> Option<f64> {
+        _budget: &QueryBudget<'_>,
+    ) -> Option<Result<f64>> {
         None
     }
 }
@@ -88,16 +97,79 @@ pub use grid::NurbsGridBackend;
 
 #[cfg(feature = "nurbs-grid-mesh")]
 mod grid {
-    use nurbs_grid_mesh::{deviation, grid_lines, Dir, MeshError, NurbsSurface, TrimmedMesh};
+    use nurbs_grid_mesh::{
+        deviation_with_control, grid_lines_with_control, Dir, MeshControl, MeshError, NurbsSurface,
+        TrimmedMesh,
+    };
     use solidcore::kernel::Kernel;
     use solidcore::math::Point3;
     use solidcore::{Result, SolidError};
 
     use super::{BackendFace, FaceBackend, FaceMeshView};
+    use crate::budget::QueryBudget;
     use crate::grid::MAX_GRID_LINES;
-    use crate::nurbs::canonical_arrays;
+    use crate::nurbs::canonical_arrays_with_budget;
 
     const OP: &str = "solidcore_mesh::NurbsGridBackend";
+
+    /// The dependency executes the real algorithm with the caller's sticky
+    /// budget; `Stopped` is only a transport marker, never a declined face.
+    struct Control<'a, 'b>(&'a QueryBudget<'b>);
+
+    impl MeshControl for Control<'_, '_> {
+        fn charge(&self, work: u64) -> std::result::Result<(), MeshError> {
+            self.0.charge(work).map_err(|_| MeshError::Stopped)
+        }
+
+        fn admit(&self, bytes: usize) -> std::result::Result<(), MeshError> {
+            self.0.admit(bytes).map_err(|_| MeshError::Stopped)
+        }
+
+        fn allocation_failed(&self) -> MeshError {
+            let _ = self.0.allocation_failed();
+            MeshError::Stopped
+        }
+    }
+
+    fn controlled<T>(
+        result: std::result::Result<T, MeshError>,
+        budget: &QueryBudget<'_>,
+    ) -> Result<T> {
+        budget.checkpoint()?;
+        result.map_err(|e| err(&e))
+    }
+
+    /// Snapshot buffers coexist with the source mesh and all extracted surface
+    /// coefficients. Reserve before copying and retain every capacity admission.
+    fn snapshot(mesh: &FaceMeshView<'_>, budget: &QueryBudget<'_>) -> Result<TrimmedMesh> {
+        let mut positions = Vec::new();
+        let mut uvs = Vec::new();
+        let mut triangles = Vec::new();
+        budget.reserve_vec(&mut positions, mesh.positions.len())?;
+        budget.reserve_vec(&mut uvs, mesh.uvs.len())?;
+        budget.reserve_vec(&mut triangles, mesh.triangles.len())?;
+        for p in mesh.positions {
+            budget.charge(1)?;
+            positions.push([p.x, p.y, p.z]);
+        }
+        for uv in mesh.uvs {
+            budget.charge(1)?;
+            uvs.push([uv.x, uv.y]);
+        }
+        for ids in mesh.triangles {
+            budget.charge(1)?;
+            triangles.push(*ids);
+        }
+        Ok(TrimmedMesh {
+            positions,
+            uvs,
+            triangles,
+            grid: [0, 0],
+            capped_spans: 0,
+            refined_lines: 0,
+            dropped_degenerate: 0,
+        })
+    }
 
     /// Grid lines of dense B-spline faces from nurbs-grid-mesh (per knot span, from the
     /// second-derivative control-point bound), and its Newton-foot deviation: faces whose
@@ -134,6 +206,7 @@ mod grid {
             MeshError::OpenCell { .. } => "loop pieces in a grid cell did not close",
             MeshError::TooLarge => "too many vertices",
             MeshError::Internal => "nurbs-grid-mesh internal error",
+            MeshError::Stopped => "nurbs-grid-mesh control stopped",
         };
         SolidError::Unsupported {
             operation: OP,
@@ -149,18 +222,26 @@ mod grid {
             &self,
             k: &Kernel,
             face: &BackendFace<'_>,
-        ) -> Option<(NurbsSurface, [usize; 2])> {
-            let c = canonical_arrays(k, face.surface)?;
-            let spans = |kv: &[f64]| {
-                kv.windows(2)
-                    .filter(|w| matches!(w, [a, b] if b > a))
-                    .count()
+            budget: &QueryBudget<'_>,
+        ) -> Result<Option<(NurbsSurface, [usize; 2])>> {
+            let Some(c) = canonical_arrays_with_budget(k, face.surface, budget)? else {
+                return Ok(None);
             };
-            let spans = [spans(&c.uk), spans(&c.vk)];
+            let spans = |kv: &[f64]| -> Result<usize> {
+                let mut count = 0;
+                for pair in kv.windows(2) {
+                    budget.charge(1)?;
+                    if pair[1] > pair[0] {
+                        count += 1;
+                    }
+                }
+                Ok(count)
+            };
+            let spans = [spans(&c.uk)?, spans(&c.vk)?];
             if c.nu.saturating_mul(c.nv) < self.min_poles {
-                return None;
+                return Ok(None);
             }
-            let ns = NurbsSurface::new(
+            let result = NurbsSurface::new_with_control(
                 c.p,
                 c.q,
                 c.uk,
@@ -169,24 +250,49 @@ mod grid {
                 c.nv,
                 c.poles,
                 c.weights.as_deref(),
-            )
-            .ok()?;
+                &Control(budget),
+            );
+            let ns = match controlled(result, budget) {
+                Ok(ns) => ns,
+                Err(error) => {
+                    budget.checkpoint()?;
+                    let _ = error;
+                    return Ok(None);
+                }
+            };
             let b = face.bbox;
             for j in 0..=2 {
                 for i in 0..=2 {
+                    budget.charge(1)?;
                     let uv = solidcore::math::Point2::new(
                         b.u_min() + (b.u_max() - b.u_min()) * f64::from(i) / 2.0,
                         b.v_min() + (b.v_max() - b.v_min()) * f64::from(j) / 2.0,
                     );
-                    let mine = ns.evaluate(uv.x, uv.y).ok()?.point;
-                    let theirs = face.surface.evaluate_point(k, uv).ok()?;
+                    let result = ns.evaluate_with_control(uv.x, uv.y, &Control(budget));
+                    let evaluated = match controlled(result, budget) {
+                        Ok(point) => point,
+                        Err(error) => {
+                            budget.checkpoint()?;
+                            let _ = error;
+                            return Ok(None);
+                        }
+                    };
+                    let mine = evaluated.point;
+                    let theirs = match face.surface.evaluate_point(k, uv) {
+                        Ok(point) => point,
+                        Err(_) => {
+                            budget.checkpoint()?;
+                            return Ok(None);
+                        }
+                    };
+                    budget.checkpoint()?;
                     let d = Point3::new(mine[0], mine[1], mine[2]).distance(theirs);
                     if d > 1e-9 * (1.0 + theirs.length()) {
-                        return None;
+                        return Ok(None);
                     }
                 }
             }
-            Some((ns, spans))
+            Ok(Some((ns, spans)))
         }
     }
 
@@ -199,8 +305,13 @@ mod grid {
             &self,
             k: &Kernel,
             face: &BackendFace<'_>,
+            budget: &QueryBudget<'_>,
         ) -> Option<Result<(Vec<f64>, Vec<f64>)>> {
-            let (ns, spans) = self.surface(k, face)?;
+            let (ns, spans) = match self.surface(k, face, budget) {
+                Ok(Some(surface)) => surface,
+                Ok(None) => return None,
+                Err(error) => return Some(Err(error)),
+            };
             let tol = self.chord_fraction * face.chord;
             let b = face.bbox;
             let lines = |dir: Dir, spans: usize, lo: f64, hi: f64| -> Result<Vec<f64>> {
@@ -209,8 +320,22 @@ mod grid {
                     .max_lines_per_span
                     .min(MAX_GRID_LINES / spans.max(1))
                     .max(1);
-                let g = grid_lines(&ns, dir, tol, hi - lo, per_span).map_err(|e| err(&e))?;
-                Ok(g.lines.into_iter().filter(|t| *t > lo && *t < hi).collect())
+                let mut g = controlled(
+                    grid_lines_with_control(&ns, dir, tol, hi - lo, per_span, &Control(budget)),
+                    budget,
+                )?;
+                // Filter in place: no second output buffer or hidden collect.
+                let mut write = 0;
+                for read in 0..g.lines.len() {
+                    budget.charge(1)?;
+                    let t = g.lines[read];
+                    if t > lo && t < hi {
+                        g.lines[write] = t;
+                        write += 1;
+                    }
+                }
+                g.lines.truncate(write);
+                Ok(g.lines)
             };
             Some(
                 lines(Dir::U, spans[0], b.u_min(), b.u_max())
@@ -223,18 +348,156 @@ mod grid {
             k: &Kernel,
             face: &BackendFace<'_>,
             mesh: &FaceMeshView<'_>,
-        ) -> Option<f64> {
-            let (ns, _) = self.surface(k, face)?;
-            let m = TrimmedMesh {
-                positions: mesh.positions.iter().map(|p| [p.x, p.y, p.z]).collect(),
-                uvs: mesh.uvs.iter().map(|q| [q.x, q.y]).collect(),
-                triangles: mesh.triangles.to_vec(),
+            budget: &QueryBudget<'_>,
+        ) -> Option<Result<f64>> {
+            let (ns, _) = match self.surface(k, face, budget) {
+                Ok(Some(surface)) => surface,
+                Ok(None) => return None,
+                Err(error) => return Some(Err(error)),
+            };
+            Some(snapshot(mesh, budget).and_then(|mesh| {
+                controlled(
+                    deviation_with_control(&ns, &mesh, face.chord, &Control(budget)),
+                    budget,
+                )
+                .map(|d| d.max)
+            }))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::budget::QueryLimit;
+        use solidcore::math::Point2;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct CancelDuring<'a, 'b> {
+            budget: &'a QueryBudget<'b>,
+            cancel: &'a AtomicBool,
+            after: u64,
+        }
+
+        impl MeshControl for CancelDuring<'_, '_> {
+            fn charge(&self, work: u64) -> std::result::Result<(), MeshError> {
+                self.budget.charge(work).map_err(|_| MeshError::Stopped)?;
+                if self.budget.consumed() >= self.after {
+                    self.cancel.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            fn admit(&self, bytes: usize) -> std::result::Result<(), MeshError> {
+                Control(self.budget).admit(bytes)
+            }
+            fn allocation_failed(&self) -> MeshError {
+                Control(self.budget).allocation_failed()
+            }
+        }
+
+        fn surface() -> NurbsSurface {
+            let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+            let poles = (0..3)
+                .flat_map(|i| (0..3).map(move |j| [i as f64, j as f64, 0.1 * (i * j) as f64]))
+                .collect();
+            NurbsSurface::new(2, 2, knots.clone(), knots, 3, 3, poles, None).unwrap()
+        }
+
+        #[test]
+        fn constructor_admits_new_coefficients_while_inputs_coexist() {
+            let cancel = AtomicBool::new(false);
+            let u = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+            let v = u.clone();
+            let poles = vec![[0.0; 3]; 9];
+            let inputs = crate::storage::vector_bytes(&u)
+                + crate::storage::vector_bytes(&v)
+                + crate::storage::vector_bytes(&poles);
+            let budget = QueryBudget::new(u64::MAX, inputs + 287, &cancel);
+            budget.admit(inputs).unwrap();
+            let result =
+                NurbsSurface::new_with_control(2, 2, u, v, 3, 3, poles, None, &Control(&budget));
+            assert!(controlled(result, &budget).is_err());
+            assert_eq!(budget.failure(), Some(QueryLimit::Bytes));
+            assert!(budget.consumed() > 1);
+        }
+
+        #[test]
+        fn grid_exhaustion_happens_inside_the_real_grid_loop() {
+            let s = surface();
+            let cancel = AtomicBool::new(false);
+            let budget = QueryBudget::new(3, usize::MAX, &cancel);
+            let result = grid_lines_with_control(&s, Dir::U, 0.01, 0.1, 64, &Control(&budget));
+            assert!(controlled(result, &budget).is_err());
+            assert_eq!(budget.failure(), Some(QueryLimit::Work));
+            assert_eq!(budget.consumed(), 3);
+            assert!(budget.admitted_bytes() > 0);
+        }
+
+        #[test]
+        fn deviation_stops_inside_newton_basis_work_and_keeps_refusal() {
+            let s = surface();
+            let mesh = TrimmedMesh {
+                positions: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+                uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                triangles: vec![[0, 1, 2]],
                 grid: [0, 0],
                 capped_spans: 0,
                 refined_lines: 0,
                 dropped_degenerate: 0,
             };
-            deviation(&ns, &m, face.chord).ok().map(|d| d.max)
+            let cancel = AtomicBool::new(false);
+            let budget = QueryBudget::new(150, usize::MAX, &cancel);
+            let result = deviation_with_control(&s, &mesh, 0.01, &Control(&budget));
+            assert!(controlled(result, &budget).is_err());
+            assert_eq!(budget.failure(), Some(QueryLimit::Work));
+            assert_eq!(budget.consumed(), 150);
+            assert!(budget.admitted_bytes() > 0);
+            assert!(budget.checkpoint().is_err());
+
+            let bytes = QueryBudget::new(u64::MAX, 0, &cancel);
+            let result = deviation_with_control(&s, &mesh, 0.01, &Control(&bytes));
+            assert!(controlled(result, &bytes).is_err());
+            assert_eq!(bytes.failure(), Some(QueryLimit::Bytes));
+            // Cancellation is checked in Newton, not only backend dispatch.
+            let cancelled = QueryBudget::new(u64::MAX, usize::MAX, &cancel);
+            let control = CancelDuring {
+                budget: &cancelled,
+                cancel: &cancel,
+                after: 145,
+            };
+            let result = deviation_with_control(&s, &mesh, 0.01, &control);
+            assert!(controlled(result, &cancelled).is_err());
+            assert_eq!(cancelled.consumed(), 145);
+            assert!(cancelled.admitted_bytes() > 0);
+            assert_eq!(cancelled.failure(), Some(QueryLimit::Cancelled));
+        }
+
+        #[test]
+        fn snapshot_admission_coexists_with_all_source_capacities() {
+            let positions = vec![Point3::new(0.0, 0.0, 0.0); 3];
+            let uvs = vec![Point2::new(0.0, 0.0); 3];
+            let triangles = vec![[0, 1, 2]];
+            let view = FaceMeshView {
+                positions: &positions,
+                uvs: &uvs,
+                triangles: &triangles,
+            };
+            let source = crate::storage::vector_bytes(&positions)
+                + crate::storage::vector_bytes(&uvs)
+                + crate::storage::vector_bytes(&triangles);
+            let cancel = AtomicBool::new(false);
+            let unlimited = QueryBudget::new(u64::MAX, usize::MAX, &cancel);
+            unlimited.admit(source).unwrap();
+            let copied = snapshot(&view, &unlimited).unwrap();
+            let copy_bytes = crate::storage::vector_bytes(&copied.positions)
+                + crate::storage::vector_bytes(&copied.uvs)
+                + crate::storage::vector_bytes(&copied.triangles);
+            assert_eq!(unlimited.admitted_bytes(), source + copy_bytes);
+            let bounded = QueryBudget::new(u64::MAX, source + copy_bytes - 1, &cancel);
+            bounded.admit(source).unwrap();
+            assert!(snapshot(&view, &bounded).is_err());
+            assert_eq!(bounded.failure(), Some(QueryLimit::Bytes));
+            assert_eq!(positions.len(), 3);
+            assert_eq!(triangles, vec![[0, 1, 2]]);
         }
     }
 }

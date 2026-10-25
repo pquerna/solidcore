@@ -1,8 +1,17 @@
 //! One face: its boundary loops in UV from the shared edge polylines, a constrained
 //! Delaunay triangulation in scaled UV, grid points and refinement, kept between levels
 //! of detail so each level only inserts points.
+//!
+//! Bounded queries admit adapter-owned Vec/flat-index backing storage before growth.
+//! Spade 2.15.1 keeps private DCEL Vecs and transient legalization/constraint buffers
+//! (`delaunay_core/{dcel,triangulation_ext,dcel_operations}.rs`, `cdt.rs`), and the
+//! SolidCore kernel may allocate during topology traversal, canonical extraction and
+//! evaluation. Those opaque dependency allocations remain host-bounded, not measured
+//! by the adapter byte limit. Cancellation/work are checked at every native loop and
+//! dependency call boundary; a dependency operation itself is not interruptible.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use crate::budget::QueryBudget;
+use crate::storage::{FlatIndex, FlatSet};
 
 use spade::handles::{FixedFaceHandle, FixedUndirectedEdgeHandle, FixedVertexHandle, InnerTag};
 use spade::{
@@ -23,10 +32,10 @@ use solidcore::{FaceId, Result};
 use crate::backend::{BackendFace, FaceBackend, FaceMeshView};
 use crate::edges::{EdgeSet, SegmentSplit, MAX_SPLIT_PIECES};
 use crate::geom::{
-    angle, closes, foot, invalid, invert_point, power_of_two, segment_distance, surface_normal,
-    surface_point, surface_scales,
+    angle, closes_with_budget, foot_with_budget, invalid, invert_point_with_budget, power_of_two,
+    segment_distance, surface_normal, surface_point, surface_scales_with_budget,
 };
-use crate::grid::{bounded, grid_lines, MAX_CELL_ASPECT, SAMPLE_GRID};
+use crate::grid::{bounded_with_budget, grid_lines_with_budget, MAX_CELL_ASPECT, SAMPLE_GRID};
 use crate::mesh::EdgePolyline;
 use crate::nurbs::Nurbs;
 use crate::options::FaceParams;
@@ -113,10 +122,10 @@ impl HasPosition for CdtVertex {
     }
 }
 
-/// The triangulation, located through a hierarchy (logarithmic point location,
-/// deterministic: a vertex's levels follow from its index).
+/// The native constrained triangulation. Last-used hints avoid hidden hierarchy copies.
+/// Spade owns opaque DCEL and scratch buffers: host-bounded, not adapter-byte-accounted.
 type Cdt =
-    ConstrainedDelaunayTriangulation<CdtVertex, (), (), (), spade::HierarchyHintGenerator<f64>>;
+    ConstrainedDelaunayTriangulation<CdtVertex, (), (), (), spade::LastUsedVertexHintGenerator>;
 
 /// The mesh of one face, ready to join a [`crate::Mesh`] ([`crate::assemble`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +168,22 @@ pub struct FaceMesh {
     pub backend_deviation: Option<f64>,
 }
 
+impl FaceMesh {
+    /// Bytes of this owner and all output buffers, using actual capacities.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        use crate::storage::vector_bytes;
+        size_of::<Self>()
+            .saturating_add(vector_bytes(&self.uvs))
+            .saturating_add(vector_bytes(&self.positions))
+            .saturating_add(vector_bytes(&self.normals))
+            .saturating_add(vector_bytes(&self.shared))
+            .saturating_add(vector_bytes(&self.triangles))
+            .saturating_add(vector_bytes(&self.gaps))
+            .saturating_add(vector_bytes(&self.inverted_edgeuses))
+    }
+}
+
 /// A face being meshed, kept between levels.
 #[allow(clippy::struct_excessive_bools)] // independent state flags
 pub(crate) struct FaceState {
@@ -189,16 +214,16 @@ pub(crate) struct FaceState {
     /// The boundary loops as inserted (pole runs expanded).
     boundary: Vec<Vec<(Point2, u32)>>,
     /// Samples of each pole run, by its first point (vertex, u bits, v bits).
-    pole_segments: BTreeMap<(u32, u64, u64), u32>,
+    pole_segments: FlatIndex<(u32, u64, u64), u32>,
     inverted: Vec<EdgeuseId>,
     unconverged: bool,
     split_boundary: bool,
     /// Ear-clipped triangles of a face with no area in UV.
     ears: Vec<[usize; 3]>,
     /// Triangles found within the tolerances at the current level, by sorted vertex ids.
-    good: BTreeSet<[usize; 3]>,
+    good: FlatSet<[usize; 3]>,
     /// Interior edges found within the tolerances at the current level.
-    good_edges: BTreeSet<[usize; 2]>,
+    good_edges: FlatSet<[usize; 2]>,
     /// The tolerances [`FaceState::good`] and [`FaceState::good_edges`] were found
     /// for (a vertex id keeps its position, so they hold until those change).
     good_for: Option<FaceParams>,
@@ -208,7 +233,7 @@ pub(crate) struct FaceState {
     /// The grid lines `(us, vs)` of the current level.
     lines: (Vec<f64>, Vec<f64>),
     /// The edges of the face's loops.
-    edges_used: BTreeSet<solidcore::EdgeId>,
+    edges_used: FlatSet<solidcore::EdgeId>,
     /// A refinement point was refused at [`MAX_LOCAL_DEPTH`] this level.
     depth_capped: bool,
     /// Cells of the last grid inserted.
@@ -270,6 +295,38 @@ fn same_uv(a: Point2, b: Point2) -> bool {
 impl FaceState {
     /// A face not meshed yet.
     pub(crate) fn new(k: &Kernel, b: &Brep, f: FaceId, model_size: f64) -> Result<Self> {
+        Self::new_with_budget(k, b, f, model_size, &QueryBudget::unbounded())
+    }
+
+    pub(crate) fn refine(
+        &mut self,
+        k: &Kernel,
+        b: &Brep,
+        edges: &EdgeSet,
+        p: &FaceParams,
+        backend: Option<&dyn FaceBackend>,
+    ) -> Result<()> {
+        self.refine_with_budget(k, b, edges, p, backend, &QueryBudget::unbounded())
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+        k: &Kernel,
+        b: &Brep,
+        chord: Option<f64>,
+        backend: Option<&dyn FaceBackend>,
+    ) -> Result<FaceMesh> {
+        self.snapshot_with_budget(k, b, chord, backend, &QueryBudget::unbounded())
+    }
+
+    pub(crate) fn new_with_budget(
+        k: &Kernel,
+        b: &Brep,
+        f: FaceId,
+        model_size: f64,
+        budget: &QueryBudget<'_>,
+    ) -> Result<Self> {
+        budget.checkpoint()?;
         let surface = surface_of(b, f)?;
         let sense = outward_sense(b, f)?;
         let natural = surface.natural_uv_domain();
@@ -277,11 +334,13 @@ impl FaceState {
         if !(domain.u_min() < domain.u_max() && domain.v_min() < domain.v_max()) {
             domain = natural;
         }
-        let scale = surface_scales(k, surface, &domain);
+        let scale = surface_scales_with_budget(k, surface, &domain, budget)?;
         let tol = 1e-9 * model_size.max(1e-300);
         let period = (
-            closes(k, surface, &natural, true, tol).then(|| natural.u_max() - natural.u_min()),
-            closes(k, surface, &natural, false, tol).then(|| natural.v_max() - natural.v_min()),
+            closes_with_budget(k, surface, &natural, true, tol, budget)?
+                .then(|| natural.u_max() - natural.u_min()),
+            closes_with_budget(k, surface, &natural, false, tol, budget)?
+                .then(|| natural.v_max() - natural.v_min()),
         );
         Ok(Self {
             face: f,
@@ -292,29 +351,52 @@ impl FaceState {
             flip: false,
             domain: natural,
             period,
-            nurbs: Nurbs::from_surface(k, surface),
+            nurbs: Nurbs::from_surface_with_budget(k, surface, budget)?,
             size: model_size,
             fast: None,
             cdt: Cdt::new(),
             vertices: Vec::new(),
             boundary: Vec::new(),
-            pole_segments: BTreeMap::new(),
+            pole_segments: FlatIndex::new(),
             inverted: Vec::new(),
             unconverged: false,
             split_boundary: false,
             ears: Vec::new(),
-            good: BTreeSet::new(),
-            good_edges: BTreeSet::new(),
+            good: FlatSet::new(),
+            good_edges: FlatSet::new(),
             good_for: None,
             requests: Vec::new(),
             lines: (Vec::new(), Vec::new()),
-            edges_used: BTreeSet::new(),
+            edges_used: FlatSet::new(),
             depth_capped: false,
             grid_cells: 0,
             backend: None,
             backend_failed: false,
             bbox: Extent2d::new(),
         })
+    }
+
+    fn admit_retained(&self, budget: &QueryBudget<'_>) -> Result<()> {
+        use crate::storage::vector_bytes;
+        let mut bytes = vector_bytes(&self.vertices)
+            .saturating_add(vector_bytes(&self.boundary))
+            .saturating_add(vector_bytes(&self.inverted))
+            .saturating_add(vector_bytes(&self.ears))
+            .saturating_add(vector_bytes(&self.requests))
+            .saturating_add(vector_bytes(&self.lines.0))
+            .saturating_add(vector_bytes(&self.lines.1))
+            .saturating_add(self.pole_segments.retained_buffer_bytes())
+            .saturating_add(self.good.retained_buffer_bytes())
+            .saturating_add(self.good_edges.retained_buffer_bytes())
+            .saturating_add(self.edges_used.retained_buffer_bytes());
+        for lp in &self.boundary {
+            budget.charge(1)?;
+            bytes = bytes.saturating_add(vector_bytes(lp));
+        }
+        if let Some(nb) = &self.nurbs {
+            bytes = bytes.saturating_add(nb.retained_buffer_bytes());
+        }
+        budget.admit(bytes)
     }
 
     fn scaled(&self, uv: Point2) -> spade::Point2<f64> {
@@ -332,9 +414,19 @@ impl FaceState {
     }
 
     /// The surface point at `uv` (from the B-spline directly when checked).
-    fn point(&self, k: &Kernel, s: &Surface, uv: Point2) -> Result<Point3> {
+    fn point(
+        &self,
+        k: &Kernel,
+        s: &Surface,
+        uv: Point2,
+        budget: &QueryBudget<'_>,
+    ) -> Result<Point3> {
+        budget.charge(1)?;
         if let (Some(nb), Some(_)) = (&self.nurbs, self.fast) {
-            if let Some((p, _, _)) = nb.eval(uv.x, uv.y).filter(|e| crate::geom::finite3(e.0)) {
+            if let Some((p, _, _)) = nb
+                .eval_with_budget(uv.x, uv.y, budget)?
+                .filter(|e| crate::geom::finite3(e.0))
+            {
                 return Ok(p);
             }
         }
@@ -344,39 +436,58 @@ impl FaceState {
     /// Checks the B-spline fast path against the surface's own evaluation at a sample
     /// grid of `bbox` and turns it on when they agree (and `Su x Sv` gives the normal's
     /// side).
-    fn check_fast_path(&mut self, k: &Kernel, s: &Surface, bbox: &Extent2d, size: f64) {
+    fn check_fast_path(
+        &mut self,
+        k: &Kernel,
+        s: &Surface,
+        bbox: &Extent2d,
+        size: f64,
+        budget: &QueryBudget<'_>,
+    ) -> Result<()> {
         self.fast = None;
         let Some(nb) = &self.nurbs else {
-            return;
+            return Ok(());
         };
         for j in 0..=4 {
+            budget.charge(1)?;
             for i in 0..=4 {
+                budget.charge(1)?;
                 let uv = Point2::new(
                     bbox.u_min() + (bbox.u_max() - bbox.u_min()) * f64::from(i) / 4.0,
                     bbox.v_min() + (bbox.v_max() - bbox.v_min()) * f64::from(j) / 4.0,
                 );
-                let (Some((p, _, _)), Ok(q)) = (nb.eval(uv.x, uv.y), s.evaluate_point(k, uv))
-                else {
-                    return;
+                let (Some((p, _, _)), Ok(q)) = (
+                    nb.eval_with_budget(uv.x, uv.y, budget)?,
+                    s.evaluate_point(k, uv),
+                ) else {
+                    return Ok(());
                 };
                 let d = p.distance(q);
                 if d > FAST_PATH_AGREEMENT * size || d.is_nan() {
-                    return;
+                    return Ok(());
                 }
             }
         }
-        self.fast = self.cross_sign(k, s).map(|c| c * self.sense);
+        self.fast = self.cross_sign(k, s, budget)?.map(|c| c * self.sense);
+        Ok(())
     }
 
-    fn outward(&self, k: &Kernel, s: &Surface, uv: Point2) -> Option<Vec3> {
+    fn outward(
+        &self,
+        k: &Kernel,
+        s: &Surface,
+        uv: Point2,
+        budget: &QueryBudget<'_>,
+    ) -> Result<Option<Vec3>> {
+        budget.charge(1)?;
         if let (Some(nb), Some(sign)) = (&self.nurbs, self.fast) {
-            if let Some((_, su, sv)) = nb.eval(uv.x, uv.y) {
+            if let Some((_, su, sv)) = nb.eval_with_budget(uv.x, uv.y, budget)? {
                 if let Some(n) = unit_cross(su, sv) {
-                    return Some(n * sign);
+                    return Ok(Some(n * sign));
                 }
             }
         }
-        surface_normal(k, s, uv).map(|n| n * self.sense)
+        Ok(surface_normal(k, s, uv).map(|n| n * self.sense))
     }
 
     fn vertex(&self, h: FixedVertexHandle) -> Result<&FaceVertex> {
@@ -391,14 +502,19 @@ impl FaceState {
     }
 
     /// Adds `v` to the vertex table and the triangulation (its position must be free).
-    fn insert(&mut self, v: FaceVertex) -> Result<FixedVertexHandle> {
+    fn insert(&mut self, v: FaceVertex, budget: &QueryBudget<'_>) -> Result<FixedVertexHandle> {
         let id = self.vertices.len();
-        self.vertices.push(v);
-        self.insert_existing(id)
+        budget.push(&mut self.vertices, v)?;
+        self.insert_existing(id, budget)
     }
 
     /// Puts vertex `id` of the table into the triangulation.
-    fn insert_existing(&mut self, id: usize) -> Result<FixedVertexHandle> {
+    fn insert_existing(
+        &mut self,
+        id: usize,
+        budget: &QueryBudget<'_>,
+    ) -> Result<FixedVertexHandle> {
+        budget.charge(1)?;
         let uv = self
             .vertices
             .get(id)
@@ -423,21 +539,28 @@ impl FaceState {
         uv: Point2,
         xyz: Option<(Point3, Option<Vec3>)>,
         depth: u8,
+        budget: &QueryBudget<'_>,
     ) -> Result<FixedVertexHandle> {
         let (xyz, normal) = match xyz {
             Some(x) => x,
-            None => (self.point(k, s, uv)?, self.outward(k, s, uv)),
+            None => (
+                self.point(k, s, uv, budget)?,
+                self.outward(k, s, uv, budget)?,
+            ),
         };
-        self.insert(FaceVertex {
-            uv,
-            xyz,
-            vertex: None,
-            normal,
-            boundary: false,
-            alive: true,
-            gap: 0.0,
-            depth,
-        })
+        self.insert(
+            FaceVertex {
+                uv,
+                xyz,
+                vertex: None,
+                normal,
+                boundary: false,
+                alive: true,
+                gap: 0.0,
+                depth,
+            },
+            budget,
+        )
     }
 
     /// The handle of the boundary point at `uv` on mesh vertex `vertex`, inserting it
@@ -449,6 +572,7 @@ impl FaceState {
         uv: Point2,
         xyz: Point3,
         vertex: u32,
+        budget: &QueryBudget<'_>,
     ) -> Result<FixedVertexHandle> {
         if let PositionInTriangulation::OnVertex(h) = self.cdt.locate(self.scaled(uv)) {
             let v = self.vertex(h)?;
@@ -458,18 +582,21 @@ impl FaceState {
                 Err(invalid("two boundary points at one UV position"))
             };
         }
-        let normal = self.outward(k, s, uv);
-        let gap = surface_gap(k, s, uv, xyz);
-        self.insert(FaceVertex {
-            uv,
-            xyz,
-            vertex: Some(vertex),
-            normal,
-            boundary: true,
-            alive: true,
-            gap,
-            depth: 0,
-        })
+        let normal = self.outward(k, s, uv, budget)?;
+        let gap = surface_gap(k, s, uv, xyz, budget)?;
+        self.insert(
+            FaceVertex {
+                uv,
+                xyz,
+                vertex: Some(vertex),
+                normal,
+                boundary: true,
+                alive: true,
+                gap,
+                depth: 0,
+            },
+            budget,
+        )
     }
 
     /// Joins two boundary vertices by a constraint; where it would cross a constraint
@@ -481,40 +608,52 @@ impl FaceState {
         s: &Surface,
         a: FixedVertexHandle,
         c: FixedVertexHandle,
+        budget: &QueryBudget<'_>,
     ) -> Result<()> {
+        budget.charge(1)?;
         if a == c || self.cdt.exists_constraint(a, c) {
             return Ok(());
         }
-        if !self.cdt.try_add_constraint(a, c).is_empty() || self.cdt.exists_constraint(a, c) {
+        let added = constraint_edges_with_budget(&mut self.cdt, budget, |cdt| {
+            cdt.try_add_constraint(a, c)
+        })?;
+        if !added.is_empty() || self.cdt.exists_constraint(a, c) {
             return Ok(());
         }
-        let edges = self.cdt.add_constraint_and_split(a, c, |pos| CdtVertex {
-            pos,
-            id: usize::MAX,
-        });
+        drop(added);
+        let edges = constraint_edges_with_budget(&mut self.cdt, budget, |cdt| {
+            cdt.add_constraint_and_split(a, c, |pos| CdtVertex {
+                pos,
+                id: usize::MAX,
+            })
+        })?;
         if edges.is_empty() {
             return Err(invalid("boundary constraint cannot be added"));
         }
         self.split_boundary = true;
         // the split points become boundary vertices on the surface
         for e in edges {
+            budget.charge(1)?;
             let to = self.cdt.directed_edge(e).to().fix();
             if self.cdt.vertex(to).data().id == usize::MAX {
                 let pos = self.cdt.vertex(to).position();
                 let uv = self.unscaled(pos);
                 let xyz = surface_point(k, s, uv)?;
-                let normal = self.outward(k, s, uv);
+                let normal = self.outward(k, s, uv, budget)?;
                 let id = self.vertices.len();
-                self.vertices.push(FaceVertex {
-                    uv,
-                    xyz,
-                    vertex: None,
-                    normal,
-                    boundary: true,
-                    alive: true,
-                    gap: 0.0,
-                    depth: 0,
-                });
+                budget.push(
+                    &mut self.vertices,
+                    FaceVertex {
+                        uv,
+                        xyz,
+                        vertex: None,
+                        normal,
+                        boundary: true,
+                        alive: true,
+                        gap: 0.0,
+                        depth: 0,
+                    },
+                )?;
                 self.cdt.vertex_data_mut(to).id = id;
             }
         }
@@ -524,14 +663,16 @@ impl FaceState {
     /// Meshes (or, after an earlier level, refines) the face to `p` against the edge
     /// polylines of `edges`. Only inserts points into what an earlier level made, except
     /// interior points the refined boundary leaves outside or against it.
-    pub(crate) fn refine(
+    pub(crate) fn refine_with_budget(
         &mut self,
         k: &Kernel,
         b: &Brep,
         edges: &EdgeSet,
         p: &FaceParams,
         backend: Option<&dyn FaceBackend>,
+        budget: &QueryBudget<'_>,
     ) -> Result<()> {
+        self.admit_retained(budget)?;
         let s = surface_of(b, self.face)?;
         if self.good_for != Some(*p) {
             self.good.clear();
@@ -542,12 +683,14 @@ impl FaceState {
         self.depth_capped = false;
         self.backend_failed = false;
         self.requests.clear();
-        let loops = self.face_loops(k, b, s, edges, p)?;
+        budget.checkpoint()?;
+        let loops = self.face_loops(k, b, s, edges, p, budget)?;
         if loops.is_empty() {
             return Err(invalid("face without boundary loops"));
         }
         let mut bbox = Extent2d::new();
         for q in loops.iter().flatten() {
+            budget.charge(1)?;
             bbox.add_point(q.uv);
         }
         if !(bbox.u_min() <= bbox.u_max() && bbox.v_min() <= bbox.v_max()) {
@@ -557,9 +700,10 @@ impl FaceState {
         let (mut us, mut vs) = if bbox.u_min() < bbox.u_max() && bbox.v_min() < bbox.v_max() {
             if first {
                 // the B-spline fast path, before anything is evaluated
-                self.check_fast_path(k, s, &bbox, self.size);
+                self.check_fast_path(k, s, &bbox, self.size, budget)?;
             }
             // a B-spline (on the fast path) is sampled once per knot span at least
+            budget.charge(self.nurbs.as_ref().map_or(0, |nb| nb.knot_count()) as u64)?;
             let samples =
                 self.nurbs
                     .as_ref()
@@ -568,8 +712,13 @@ impl FaceState {
                         nb.spans_in(true, bbox.u_min(), bbox.u_max())
                             .max(nb.spans_in(false, bbox.v_min(), bbox.v_max()))
                     });
-            let eval = |uv: Point2| Ok((self.point(k, s, uv)?, self.outward(k, s, uv)));
-            grid_lines(&eval, &bbox, self.speed, p, samples)?
+            let eval = |uv: Point2| {
+                Ok((
+                    self.point(k, s, uv, budget)?,
+                    self.outward(k, s, uv, budget)?,
+                ))
+            };
+            grid_lines_with_budget(&eval, &bbox, self.speed, p, samples, budget)?
         } else {
             (Vec::new(), Vec::new())
         };
@@ -587,8 +736,10 @@ impl FaceState {
                 chord: p.chord,
                 angle: p.angle,
             };
-            match be.grid_lines(k, &face) {
+            budget.charge(1)?;
+            match be.grid_lines(k, &face, budget) {
                 Some(Ok((bu, bv))) => {
+                    budget.checkpoint()?;
                     self.backend = Some(be.name());
                     if bu.len() > us.len() {
                         us = bu;
@@ -598,12 +749,15 @@ impl FaceState {
                     }
                 }
                 // the sampled grid for a face the backend failed on
-                Some(Err(_)) => self.backend_failed = true,
+                Some(Err(_)) => {
+                    budget.checkpoint()?;
+                    self.backend_failed = true;
+                }
                 None => {}
             }
         }
         // whichever source they came from, the lines are bounded like the built-in ones
-        let (us, vs) = bounded(us, vs, &bbox, p.max_triangles);
+        let (us, vs) = bounded_with_budget(us, vs, &bbox, p.max_triangles, budget)?;
         let step =
             |lines: &[f64], lo: f64, hi: f64, sc: f64| (hi - lo) * sc / (lines.len() + 1) as f64;
         let has_pole = loops.iter().flatten().any(|q| q.pole_next);
@@ -643,18 +797,23 @@ impl FaceState {
         ));
 
         // the boundary, pole runs expanded
-        let expanded = self.expand_poles(&loops, scaled_step);
+        let expanded = self.expand_poles(&loops, scaled_step, budget)?;
 
-        if first || remetric || !self.update_boundary(k, s, &loops, &expanded)? {
-            self.rebuild(k, s, &loops, &expanded)?;
+        if first || remetric || !self.update_boundary(k, s, &loops, &expanded, budget)? {
+            self.rebuild(k, s, &loops, &expanded, budget)?;
         }
-        self.boundary = expanded
-            .iter()
-            .map(|l| l.iter().map(|q| (q.0, q.2)).collect())
-            .collect();
-        self.flip = self.uv_ccw_faces_inward(k, s, &bbox)?;
+        let mut boundary = Vec::new();
+        budget.reserve_vec(&mut boundary, expanded.len())?;
+        for lp in &expanded {
+            budget.push(
+                &mut boundary,
+                collect_with_budget(lp.iter().map(|q| (q.0, q.2)), budget)?,
+            )?;
+        }
+        self.boundary = boundary;
+        self.flip = self.uv_ccw_faces_inward(k, s, &bbox, budget)?;
         if !first {
-            self.remove_stale_interior();
+            self.remove_stale_interior(budget)?;
         }
 
         // grid points, away from the boundary and the points already there; a finer
@@ -663,7 +822,7 @@ impl FaceState {
         // only crowd it)
         let cells = (us.len() + 1) * (vs.len() + 1);
         if first || cells >= REGRID_FACTOR * self.grid_cells {
-            self.insert_grid(k, s, &us, &vs, scaled_step, p.max_triangles)?;
+            self.insert_grid(k, s, &us, &vs, scaled_step, p.max_triangles, budget)?;
             self.grid_cells = cells;
         }
         self.lines = (us, vs);
@@ -672,39 +831,46 @@ impl FaceState {
         let mut converged = false;
         let mut changed: Option<Vec<FixedVertexHandle>> = None;
         for _ in 0..p.max_passes {
+            budget.charge(1)?;
             if self.cdt.num_inner_faces() >= p.max_triangles {
                 break;
             }
-            let candidates = self.refine_candidates(k, s, p, changed.as_deref())?;
+            let candidates = self.refine_candidates(k, s, p, changed.as_deref(), budget)?;
             if candidates.is_empty() {
                 converged = true;
                 break;
             }
             let mut inserted = Vec::new();
+            budget.reserve_vec(&mut inserted, candidates.len())?;
             for (uv, depth) in candidates {
+                budget.charge(1)?;
                 if self.cdt.num_inner_faces() >= p.max_triangles {
                     break;
                 }
                 let pos = self.scaled(uv);
                 let near = match self.cdt.locate(pos) {
-                    PositionInTriangulation::OnFace(f) => self.cdt.face(f).vertices().to_vec(),
+                    PositionInTriangulation::OnFace(f) => self.cdt.face(f).vertices().map(Some),
                     PositionInTriangulation::OnEdge(e)
                         if !self.cdt.is_constraint_edge(e.as_undirected()) =>
                     {
-                        self.cdt.directed_edge(e).vertices().to_vec()
+                        let [a, b] = self.cdt.directed_edge(e).vertices();
+                        [Some(a), Some(b), None]
                     }
                     _ => continue,
                 };
                 // a point (all but) on one already there (two candidates of one pass
                 // can meet) would make a sliver
                 let gap = MIN_POINT_GAP * scaled_step;
-                if near.iter().any(|v| {
+                if near.iter().flatten().any(|v| {
                     let q = v.position();
                     (q.x - pos.x).abs() <= gap && (q.y - pos.y).abs() <= gap
                 }) {
                     continue;
                 }
-                inserted.push(self.insert_interior(k, s, uv, None, depth)?);
+                budget.push(
+                    &mut inserted,
+                    self.insert_interior(k, s, uv, None, depth, budget)?,
+                )?;
             }
             let added = inserted.len();
             changed = Some(inserted);
@@ -717,9 +883,10 @@ impl FaceState {
 
         // a face with no area in UV: clip ears off its one loop in 3D
         self.ears.clear();
-        let inside = inside_faces(&self.cdt);
+        let inside = inside_faces(&self.cdt, budget)?;
+        budget.charge(self.cdt.num_inner_faces() as u64)?;
         if !self.cdt.inner_faces().any(|f| is_inside(&inside, f.fix())) {
-            self.ear_clip(k, s)?;
+            self.ear_clip(k, s, budget)?;
         }
         Ok(())
     }
@@ -732,6 +899,7 @@ impl FaceState {
         s: &Surface,
         edges: &EdgeSet,
         p: &FaceParams,
+        budget: &QueryBudget<'_>,
     ) -> Result<Vec<Vec<LoopPoint>>> {
         let domain = self.domain;
         let scale = self.scale;
@@ -744,30 +912,38 @@ impl FaceState {
             .ok_or_else(|| invalid("face without face use"))?;
         let mut loops = Vec::new();
         let mut inverted = Vec::new();
-        for lu in eu1::faceuse_loopuses(b, fu, false, None)? {
+        let loopuses = eu1::faceuse_loopuses(b, fu, false, None)?;
+        budget.admit(crate::storage::vector_bytes(&loopuses))?;
+        budget.reserve_vec(&mut loops, loopuses.len())?;
+        for lu in loopuses {
+            budget.charge(1)?;
             let mut pts: Vec<LoopPoint> = Vec::new();
             let eus = eu1::loopuse_edgeuses(b, lu)?;
+            budget.admit(crate::storage::vector_bytes(&eus))?;
             // start at an edge use with a UV trim curve, so edge uses mapped by point
             // inversion continue from a known side of any seam
             let mut start = 0;
             for (i, eu) in eus.iter().enumerate() {
+                budget.charge(1)?;
                 if eu1::uv_trim_curve(b, *eu)?.0.is_some() {
                     start = i;
                     break;
                 }
             }
             for eu in eus.iter().cycle().skip(start).take(eus.len()) {
+                budget.charge(1)?;
                 let eu = *eu;
                 let e = eu1::edge(b, eu)?.ok_or_else(|| invalid("edge use without edge"))?;
-                self.edges_used.insert(e);
+                self.edges_used.insert_with_budget(e, budget)?;
                 let poly = edges
-                    .polyline(e)
+                    .polyline_with_budget(e, budget)?
                     .ok_or_else(|| invalid("face uses an edge that failed"))?;
                 let ivl = b.edge(e)?.interval;
                 let trim = eu1::uv_trim_curve(b, eu)?.0;
                 let reverse = eu1::orientation(b, eu)? == OrientType::Opposite;
                 let seed = pts.last().map(|q| q.uv);
                 let ctx = MapContext {
+                    budget,
                     k,
                     s,
                     domain: &domain,
@@ -779,13 +955,14 @@ impl FaceState {
                     Some(c) => ctx.edgeuse_points(poly, &ivl, Some(c), reverse, seed).ok(),
                     None => None,
                 };
+                budget.checkpoint()?;
                 let seq = if let Some(seq) = mapped {
                     seq
                 } else {
-                    inverted.push(eu);
+                    budget.push(&mut inverted, eu)?;
                     ctx.edgeuse_points(poly, &ivl, None, reverse, seed)?
                 };
-                join(&mut pts, seq, k, s, p.chord, span, scale)?;
+                join(&mut pts, seq, k, s, p.chord, span, scale, budget)?;
             }
             // close the loop
             if pts.len() > 1 {
@@ -793,7 +970,7 @@ impl FaceState {
                     if first.vertex != last.vertex {
                         return Err(invalid("loop does not close"));
                     }
-                    if junction_is_pole(k, s, p.chord, last, first, span, scale)? {
+                    if junction_is_pole(k, s, p.chord, last, first, span, scale, budget)? {
                         if let Some(l) = pts.last_mut() {
                             l.pole_next = true;
                         }
@@ -803,12 +980,14 @@ impl FaceState {
                 }
             }
             if pts.len() >= 2 {
-                loops.push(pts);
+                budget.push(&mut loops, pts)?;
             }
         }
         for eu in inverted {
+            budget.charge(1)?;
+            budget.charge(self.inverted.len() as u64)?;
             if !self.inverted.contains(&eu) {
-                self.inverted.push(eu);
+                budget.push(&mut self.inverted, eu)?;
             }
         }
         Ok(loops)
@@ -821,13 +1000,18 @@ impl FaceState {
         &mut self,
         loops: &[Vec<LoopPoint>],
         scaled_step: f64,
-    ) -> Vec<Vec<(Point2, Point3, u32)>> {
-        let mut out = Vec::with_capacity(loops.len());
+        budget: &QueryBudget<'_>,
+    ) -> Result<Vec<Vec<(Point2, Point3, u32)>>> {
+        let mut out = Vec::new();
+        budget.reserve_vec(&mut out, loops.len())?;
         for lp in loops {
+            budget.charge(1)?;
             let count = lp.len();
-            let mut run = Vec::with_capacity(count);
+            let mut run = Vec::new();
+            budget.reserve_vec(&mut run, count)?;
             for (i, q) in lp.iter().enumerate() {
-                run.push((q.uv, q.xyz, q.vertex));
+                budget.charge(1)?;
+                budget.push(&mut run, (q.uv, q.xyz, q.vertex))?;
                 if !q.pole_next {
                     continue;
                 }
@@ -842,25 +1026,32 @@ impl FaceState {
                     1
                 };
                 let key = (q.vertex, q.uv.x.to_bits(), q.uv.y.to_bits());
-                let segs = need
-                    .next_power_of_two()
-                    .max(self.pole_segments.get(&key).copied().unwrap_or(1));
-                self.pole_segments.insert(key, segs);
+                let segs = need.next_power_of_two().max(
+                    self.pole_segments
+                        .get_with_budget(&key, budget)?
+                        .copied()
+                        .unwrap_or(1),
+                );
+                self.pole_segments.insert_with_budget(key, segs, budget)?;
                 for j in 1..segs {
+                    budget.charge(1)?;
                     let w = f64::from(j) / f64::from(segs);
-                    run.push((
-                        Point2::new(
-                            q.uv.x + (next.uv.x - q.uv.x) * w,
-                            q.uv.y + (next.uv.y - q.uv.y) * w,
+                    budget.push(
+                        &mut run,
+                        (
+                            Point2::new(
+                                q.uv.x + (next.uv.x - q.uv.x) * w,
+                                q.uv.y + (next.uv.y - q.uv.y) * w,
+                            ),
+                            q.xyz,
+                            q.vertex,
                         ),
-                        q.xyz,
-                        q.vertex,
-                    ));
+                    )?;
                 }
             }
-            out.push(run);
+            budget.push(&mut out, run)?;
         }
-        out
+        Ok(out)
     }
 
     /// A new triangulation of the boundary; interior points of earlier levels that are
@@ -871,56 +1062,65 @@ impl FaceState {
         s: &Surface,
         _loops: &[Vec<LoopPoint>],
         expanded: &[Vec<(Point2, Point3, u32)>],
+        budget: &QueryBudget<'_>,
     ) -> Result<()> {
-        let old: Vec<usize> = (0..self.vertices.len())
-            .filter(|i| {
+        let old: Vec<usize> = collect_with_budget(
+            (0..self.vertices.len()).filter(|i| {
                 self.vertices
                     .get(*i)
                     .is_some_and(|v| v.alive && !v.boundary)
-            })
-            .collect();
+            }),
+            budget,
+        )?;
         self.cdt = Cdt::new();
         for v in &mut self.vertices {
+            budget.charge(1)?;
             v.alive = false;
         }
         self.split_boundary = false;
         // every boundary point once (one UV position holds one mesh vertex), and the
         // loop segments between them; bulk loading is fast and stable
-        let mut index: BTreeMap<(u64, u64), usize> = BTreeMap::new();
+        let mut index: FlatIndex<(u64, u64), usize> = FlatIndex::new();
         let mut points: Vec<CdtVertex> = Vec::new();
         let mut segments: Vec<[usize; 2]> = Vec::new();
         for lp in expanded {
-            let mut ids: Vec<usize> = Vec::with_capacity(lp.len());
+            budget.charge(1)?;
+            let mut ids: Vec<usize> = Vec::new();
+            budget.reserve_vec(&mut ids, lp.len())?;
             for (uv, xyz, vertex) in lp {
+                budget.charge(1)?;
                 let key = (uv.x.to_bits(), uv.y.to_bits());
-                let i = if let Some(i) = index.get(&key) {
+                let i = if let Some(i) = index.get_with_budget(&key, budget)? {
                     let id = points.get(*i).map_or(usize::MAX, |p| p.id);
                     if self.vertices.get(id).and_then(|v| v.vertex) != Some(*vertex) {
                         return Err(invalid("two boundary points at one UV position"));
                     }
                     *i
                 } else {
-                    let normal = self.outward(k, s, *uv);
+                    let normal = self.outward(k, s, *uv, budget)?;
                     let id = self.vertices.len();
-                    self.vertices.push(FaceVertex {
-                        uv: *uv,
-                        xyz: *xyz,
-                        vertex: Some(*vertex),
-                        normal,
-                        boundary: true,
-                        alive: true,
-                        gap: surface_gap(k, s, *uv, *xyz),
-                        depth: 0,
-                    });
+                    budget.push(
+                        &mut self.vertices,
+                        FaceVertex {
+                            uv: *uv,
+                            xyz: *xyz,
+                            vertex: Some(*vertex),
+                            normal,
+                            boundary: true,
+                            alive: true,
+                            gap: surface_gap(k, s, *uv, *xyz, budget)?,
+                            depth: 0,
+                        },
+                    )?;
                     let pos = self.scaled(*uv);
                     spade::validate_vertex(&CdtVertex { pos, id })
                         .map_err(|_| invalid("UV point cannot be triangulated"))?;
-                    index.insert(key, points.len());
-                    points.push(CdtVertex { pos, id });
+                    index.insert_with_budget(key, points.len(), budget)?;
+                    budget.push(&mut points, CdtVertex { pos, id })?;
                     points.len() - 1
                 };
                 if ids.last() != Some(&i) {
-                    ids.push(i);
+                    budget.push(&mut ids, i)?;
                 }
             }
             if ids.len() > 1 && ids.first() == ids.last() {
@@ -928,41 +1128,49 @@ impl FaceState {
             }
             let n = ids.len();
             for i in 0..n {
+                budget.charge(1)?;
                 if let (Some(a), Some(c)) = (ids.get(i), ids.get((i + 1) % n)) {
                     if a != c {
-                        segments.push([*a, *c]);
+                        budget.push(&mut segments, [*a, *c])?;
                     }
                 }
             }
         }
-        let ids: Vec<usize> = points.iter().map(|p| p.id).collect();
+        let ids: Vec<usize> = collect_with_budget(points.iter().map(|p| p.id), budget)?;
         let mut conflicts = Vec::new();
+        // Spade 2.15.1 bulk_load.rs:261-275 pops each notified input segment;
+        // skipped segments are deduplicated and visited once at 364-368.
+        // Thus the callback cannot append more than the input segment count.
+        budget.reserve_vec(&mut conflicts, segments.len())?;
+        budget.charge(segments.len() as u64)?;
         self.cdt = Cdt::try_bulk_load_cdt(points, segments, |e| conflicts.push(e))
             .map_err(|_| invalid("UV boundary cannot be triangulated"))?;
         // a segment crossing another is added with splits
         for [a, c] in conflicts {
+            budget.charge(1)?;
             let (Some(ia), Some(ic)) = (ids.get(a), ids.get(c)) else {
                 continue;
             };
             let (Some(ha), Some(hc)) = (self.handle_of(*ia), self.handle_of(*ic)) else {
                 continue;
             };
-            self.constrain(k, s, ha, hc)?;
+            self.constrain(k, s, ha, hc, budget)?;
         }
         if !old.is_empty() {
             // which points are inside, all decided on the boundary's triangulation (an
             // insertion makes faces the flood fill has not seen)
-            let inside = inside_faces(&self.cdt);
-            let keep: Vec<usize> = old
-                .into_iter()
-                .filter(|id| {
+            let inside = inside_faces(&self.cdt, budget)?;
+            let keep: Vec<usize> = collect_with_budget(
+                old.into_iter().filter(|id| {
                     self.vertices
                         .get(*id)
                         .is_some_and(|v| self.clear_of_boundary(&inside, v.uv, 0.0))
-                })
-                .collect();
+                }),
+                budget,
+            )?;
             for id in keep {
-                self.insert_existing(id)?;
+                budget.charge(1)?;
+                self.insert_existing(id, budget)?;
             }
         }
         Ok(())
@@ -977,6 +1185,7 @@ impl FaceState {
         s: &Surface,
         _loops: &[Vec<LoopPoint>],
         expanded: &[Vec<(Point2, Point3, u32)>],
+        budget: &QueryBudget<'_>,
     ) -> Result<bool> {
         if expanded.len() != self.boundary.len() {
             return Ok(false);
@@ -984,11 +1193,14 @@ impl FaceState {
         // per loop: for every old segment, the new points inside it
         let mut plans: Vec<Vec<(usize, Vec<BoundaryPoint>)>> = Vec::new();
         for (old, new) in self.boundary.iter().zip(expanded) {
+            budget.charge(1)?;
             let mut plan = Vec::new();
             let mut j = 0;
             let mut pending: Vec<BoundaryPoint> = Vec::new();
             for (i, (ouv, ov)) in old.iter().enumerate() {
+                budget.charge(1)?;
                 loop {
+                    budget.charge(1)?;
                     let Some(q) = new.get(j) else {
                         return Ok(false);
                     };
@@ -999,21 +1211,24 @@ impl FaceState {
                     if i == 0 {
                         return Ok(false);
                     }
-                    pending.push(*q);
+                    budget.push(&mut pending, *q)?;
                 }
                 if i > 0 && !pending.is_empty() {
-                    plan.push((i - 1, std::mem::take(&mut pending)));
+                    budget.push(&mut plan, (i - 1, std::mem::take(&mut pending)))?;
                 }
             }
             // after the last old point: inside the closing segment
+            budget.reserve_vec(&mut pending, new.len().saturating_sub(j))?;
             pending.extend(new.iter().skip(j).copied());
             if !pending.is_empty() {
-                plan.push((old.len().saturating_sub(1), pending));
+                budget.push(&mut plan, (old.len().saturating_sub(1), pending))?;
             }
-            plans.push(plan);
+            budget.push(&mut plans, plan)?;
         }
         for (li, plan) in plans.into_iter().enumerate() {
+            budget.charge(1)?;
             for (si, points) in plan {
+                budget.charge(1)?;
                 let Some(old) = self.boundary.get(li) else {
                     return Ok(false);
                 };
@@ -1038,13 +1253,17 @@ impl FaceState {
                     return Ok(false);
                 }
                 self.cdt.remove_constraint_edge(e);
-                let mut chain = vec![(auv, av)];
+                let mut chain = Vec::new();
+                budget.reserve_vec(&mut chain, points.len().saturating_add(2))?;
+                chain.push((auv, av));
                 for (uv, xyz, v) in &points {
-                    self.boundary_handle(k, s, *uv, *xyz, *v)?;
-                    chain.push((*uv, *v));
+                    budget.charge(1)?;
+                    self.boundary_handle(k, s, *uv, *xyz, *v, budget)?;
+                    budget.push(&mut chain, (*uv, *v))?;
                 }
-                chain.push((cuv, cv));
+                budget.push(&mut chain, (cuv, cv))?;
                 for w in chain.windows(2) {
+                    budget.charge(1)?;
                     let [(xa, va), (xc, vc)] = w else {
                         continue;
                     };
@@ -1053,7 +1272,7 @@ impl FaceState {
                     else {
                         return Ok(false);
                     };
-                    self.constrain(k, s, h0, h1)?;
+                    self.constrain(k, s, h0, h1, budget)?;
                 }
             }
         }
@@ -1080,10 +1299,12 @@ impl FaceState {
 
     /// Removes interior points the refined boundary leaves outside, or closer to it
     /// than a tenth of their shortest edge.
-    fn remove_stale_interior(&mut self) {
-        let inside = inside_faces(&self.cdt);
+    fn remove_stale_interior(&mut self, budget: &QueryBudget<'_>) -> Result<()> {
+        let inside = inside_faces(&self.cdt, budget)?;
         let mut stale = Vec::new();
+        budget.reserve_vec(&mut stale, self.cdt.num_vertices())?;
         for v in self.cdt.vertices() {
+            budget.charge(1)?;
             let id = v.data().id;
             if self.vertices.get(id).is_none_or(|x| x.boundary) {
                 continue;
@@ -1093,6 +1314,7 @@ impl FaceState {
             let mut near = f64::INFINITY;
             let pos = v.position();
             for e in v.out_edges() {
+                budget.charge(1)?;
                 match e.face().as_inner() {
                     Some(f) if is_inside(&inside, f.fix()) => {
                         near = near.min(constraint_clearance(&self.cdt, f.fix(), pos));
@@ -1103,10 +1325,11 @@ impl FaceState {
                 shortest = shortest.min(((q.x - pos.x).powi(2) + (q.y - pos.y).powi(2)).sqrt());
             }
             if out || near < CLEARANCE_FRACTION * shortest {
-                stale.push(pos);
+                budget.push(&mut stale, pos)?;
             }
         }
         for pos in stale {
+            budget.charge(1)?;
             if let PositionInTriangulation::OnVertex(h) = self.cdt.locate(pos) {
                 let id = self.id(h);
                 self.cdt.remove(h);
@@ -1115,6 +1338,7 @@ impl FaceState {
                 }
             }
         }
+        Ok(())
     }
 
     /// Inserts the grid points inside the loops that are clear of the boundary (0.3 of
@@ -1128,16 +1352,20 @@ impl FaceState {
         vs: &[f64],
         scaled_step: f64,
         max_triangles: usize,
+        budget: &QueryBudget<'_>,
     ) -> Result<()> {
         if us.is_empty() && vs.is_empty() {
             return Ok(());
         }
-        let inside = inside_faces(&self.cdt);
+        let inside = inside_faces(&self.cdt, budget)?;
         let clearance = 0.3 * scaled_step;
         let spacing = 0.5 * scaled_step;
         let mut wanted = Vec::new();
+        budget.reserve_vec(&mut wanted, us.len().saturating_mul(vs.len()))?;
         for (j, v) in vs.iter().enumerate() {
+            budget.charge(1)?;
             for (i, u) in us.iter().enumerate() {
+                budget.charge(1)?;
                 let uv = Point2::new(*u, *v);
                 let pos = self.scaled(uv);
                 let PositionInTriangulation::OnFace(fh) = self.cdt.locate(pos) else {
@@ -1151,11 +1379,12 @@ impl FaceState {
                     ((q.x - pos.x).powi(2) + (q.y - pos.y).powi(2)).sqrt() < spacing
                 });
                 if !near {
-                    wanted.push((i, j));
+                    budget.push(&mut wanted, (i, j))?;
                 }
             }
         }
         for (i, j) in wanted {
+            budget.charge(1)?;
             // the face's triangle budget holds whatever the lines asked for
             if self.cdt.num_inner_faces() >= max_triangles {
                 break;
@@ -1163,27 +1392,40 @@ impl FaceState {
             let (Some(u), Some(v)) = (us.get(i), vs.get(j)) else {
                 continue;
             };
-            self.insert_interior(k, s, Point2::new(*u, *v), None, 0)?;
+            self.insert_interior(k, s, Point2::new(*u, *v), None, 0, budget)?;
         }
         Ok(())
     }
 
     /// The sign of `(Su x Sv) . EvaluateNormal` at the face's origin, so a fast-path
     /// normal `Su x Sv` can be turned like the surface normal.
-    fn cross_sign(&self, k: &Kernel, s: &Surface) -> Option<f64> {
+    fn cross_sign(&self, k: &Kernel, s: &Surface, budget: &QueryBudget<'_>) -> Result<Option<f64>> {
+        budget.charge(1)?;
         let uv = self.origin;
-        let (_, su, sv) = s.evaluate_1st_derivatives(k, uv, false, false).ok()?;
-        let n = surface_normal(k, s, uv)?;
+        let Ok((_, su, sv)) = s.evaluate_1st_derivatives(k, uv, false, false) else {
+            return Ok(None);
+        };
+        let Some(n) = surface_normal(k, s, uv) else {
+            return Ok(None);
+        };
         let d = su.cross(sv).dot(n);
-        (d != 0.0 && d.is_finite()).then(|| d.signum())
+        Ok((d != 0.0 && d.is_finite()).then(|| d.signum()))
     }
 
     /// Whether a triangle counter-clockwise in UV faces inward: the sign of
     /// `(Su x Sv) . outward` where `Su x Sv` is largest on a sample grid of `bbox`.
-    fn uv_ccw_faces_inward(&self, k: &Kernel, s: &Surface, bbox: &Extent2d) -> Result<bool> {
+    fn uv_ccw_faces_inward(
+        &self,
+        k: &Kernel,
+        s: &Surface,
+        bbox: &Extent2d,
+        budget: &QueryBudget<'_>,
+    ) -> Result<bool> {
         let mut best: Option<(f64, f64)> = None;
         for j in 0..=4 {
+            budget.charge(1)?;
             for i in 0..=4 {
+                budget.charge(1)?;
                 let uv = Point2::new(
                     bbox.u_min() + (bbox.u_max() - bbox.u_min()) * (0.1 + 0.8 * f64::from(i) / 4.0),
                     bbox.v_min() + (bbox.v_max() - bbox.v_min()) * (0.1 + 0.8 * f64::from(j) / 4.0),
@@ -1212,31 +1454,33 @@ impl FaceState {
     fn clear_of_boundary(&self, inside: &[bool], uv: Point2, need: f64) -> bool {
         let pos = self.scaled(uv);
         let faces = match self.cdt.locate(pos) {
-            PositionInTriangulation::OnFace(f) => vec![f],
+            PositionInTriangulation::OnFace(f) => [Some(f), None],
             PositionInTriangulation::OnEdge(e)
                 if !self.cdt.is_constraint_edge(e.as_undirected()) =>
             {
                 let d = self.cdt.directed_edge(e);
-                [d.face().as_inner(), d.rev().face().as_inner()]
-                    .into_iter()
-                    .flatten()
-                    .map(|f| f.fix())
-                    .collect()
+                [
+                    d.face().as_inner().map(|f| f.fix()),
+                    d.rev().face().as_inner().map(|f| f.fix()),
+                ]
             }
             _ => return false,
         };
-        !faces.is_empty()
+        faces.iter().any(Option::is_some)
             && faces
                 .into_iter()
+                .flatten()
                 .all(|f| is_inside(inside, f) && constraint_clearance(&self.cdt, f, pos) >= need)
     }
 
     /// Asks for boundary segment `r.segment` to be split (into the most pieces asked).
-    fn request(&mut self, r: SegmentSplit) {
+    fn request(&mut self, r: SegmentSplit, budget: &QueryBudget<'_>) -> Result<()> {
+        budget.charge(self.requests.len() as u64)?;
         match self.requests.iter_mut().find(|q| q.segment == r.segment) {
             Some(q) => q.pieces = q.pieces.max(r.pieces),
-            None => self.requests.push(r),
+            None => budget.push(&mut self.requests, r)?,
         }
+        Ok(())
     }
 
     /// The request to split boundary segment `e` (between two mesh vertices) into one
@@ -1330,8 +1574,9 @@ impl FaceState {
         s: &Surface,
         p: &FaceParams,
         changed: Option<&[FixedVertexHandle]>,
+        budget: &QueryBudget<'_>,
     ) -> Result<Vec<(Point2, u8)>> {
-        let inside = inside_faces(&self.cdt);
+        let inside = inside_faces(&self.cdt, budget)?;
         // every triangle and edge, or (after a pass that only inserted points) those
         // around the new points: every other one was checked with the same neighbours
         let (faces, edges): (
@@ -1339,29 +1584,46 @@ impl FaceState {
             Vec<FixedUndirectedEdgeHandle>,
         ) = match changed {
             None => (
-                self.cdt.inner_faces().map(|f| f.fix()).collect(),
-                self.cdt.undirected_edges().map(|e| e.fix()).collect(),
+                collect_with_budget(self.cdt.inner_faces().map(|f| f.fix()), budget)?,
+                collect_with_budget(self.cdt.undirected_edges().map(|e| e.fix()), budget)?,
             ),
             Some(vs) => {
-                let mut fs = BTreeSet::new();
-                let mut es = BTreeSet::new();
+                let mut fs = FlatSet::new();
+                let mut es = FlatSet::new();
                 for v in vs {
+                    budget.charge(1)?;
                     for e in self.cdt.vertex(*v).out_edges() {
-                        es.insert(e.fix().as_undirected());
+                        budget.charge(1)?;
+                        es.insert_with_budget(e.fix().as_undirected(), budget)?;
                         if let Some(f) = e.face().as_inner() {
-                            fs.insert(f.fix());
+                            fs.insert_with_budget(f.fix(), budget)?;
                         }
                     }
                 }
-                (fs.into_iter().collect(), es.into_iter().collect())
+                let mut faces = Vec::new();
+                let mut face_iter = fs.into_iter();
+                while let Some(face) = face_iter.next_with_budget(budget)? {
+                    budget.push(&mut faces, face)?;
+                }
+                let mut edges = Vec::new();
+                let mut edge_iter = es.into_iter();
+                while let Some(edge) = edge_iter.next_with_budget(budget)? {
+                    budget.push(&mut edges, edge)?;
+                }
+                (faces, edges)
             }
         };
         let tol = p.chord;
         let mut split_edges: Vec<FixedUndirectedEdgeHandle> = Vec::new();
-        let mut marked: BTreeSet<usize> = BTreeSet::new();
+        budget.reserve_vec(&mut split_edges, self.cdt.num_undirected_edges())?;
+        let mut marked: FlatSet<usize> = FlatSet::new();
         let mut centroids: Vec<(Point2, f64, Option<SegmentSplit>, u8)> = Vec::new();
+        budget.reserve_vec(&mut centroids, faces.len())?;
         let mut newly_good = Vec::new();
+        budget.reserve_vec(&mut newly_good, faces.len())?;
         for fh in faces {
+            budget.charge(self.lines.0.len().saturating_add(self.lines.1.len()) as u64)?;
+            budget.charge(1)?;
             if !is_inside(&inside, fh) {
                 continue;
             }
@@ -1372,7 +1634,7 @@ impl FaceState {
                 x.sort_unstable();
                 x
             };
-            if self.good.contains(&ids) {
+            if self.good.contains_with_budget(&ids, budget)? {
                 continue;
             }
             let a = self.vertex(va.fix())?;
@@ -1411,7 +1673,7 @@ impl FaceState {
                         a.uv.x * w[0] + b.uv.x * w[1] + c.uv.x * w[2],
                         a.uv.y * w[0] + b.uv.y * w[1] + c.uv.y * w[2],
                     );
-                    let pt = self.point(k, s, q)?;
+                    let pt = self.point(k, s, q, budget)?;
                     if ((pt - a.xyz).dot(n) / nl).abs() > tol + a.gap.max(b.gap).max(c.gap) {
                         bad = true;
                         break;
@@ -1420,17 +1682,20 @@ impl FaceState {
                 // the surface folds over inside the triangle (its normal reverses
                 // between corners): no triangle there can follow it, so no flip or
                 // angle test
-                let normals: Vec<Vec3> = [a, b, c].iter().filter_map(|x| x.normal).collect();
-                let folded = normals
-                    .iter()
-                    .enumerate()
-                    .any(|(i, x)| normals.iter().skip(i + 1).any(|y| x.dot(*y) < 0.0));
+                let normals = [a.normal, b.normal, c.normal];
+                let folded = normals.iter().flatten().enumerate().any(|(i, x)| {
+                    normals
+                        .iter()
+                        .flatten()
+                        .skip(i + 1)
+                        .any(|y| x.dot(*y) < 0.0)
+                });
                 if folded {
                     // ... and its size: a fold is resolved down to a band of small
                     // triangles along it
                     bad = bad || size > FOLD_SIZE * tol;
                 } else if bad {
-                } else if let Some(o) = self.outward(k, s, uv) {
+                } else if let Some(o) = self.outward(k, s, uv, budget)? {
                     // flipped, or turned from the surface by more than the angle
                     // tolerance at the centroid or an interior corner (a boundary
                     // corner's normal may be a singular point's)
@@ -1452,13 +1717,14 @@ impl FaceState {
             // a triangle far below the tolerance or the length floor is left alone
             if !bad || size < MIN_SPLIT_FRACTION * tol || size < 2.0 * p.min_len {
                 if !bad {
-                    newly_good.push(ids);
+                    budget.push(&mut newly_good, ids)?;
                 }
                 continue;
             }
             let mut longest = None;
             let mut longest_len = -1.0;
             for e in face.adjacent_edges() {
+                budget.charge(1)?;
                 let [x, y] = e.positions();
                 let l = (y.x - x.x).powi(2) + (y.y - x.y).powi(2);
                 if l > longest_len {
@@ -1474,22 +1740,29 @@ impl FaceState {
             if self.cdt.is_constraint_edge(ue) {
                 // too close to that boundary segment, the segment itself is split
                 let request = self.split_request(ue);
-                centroids.push((uv, CLEARANCE_FRACTION * longest_len.sqrt(), request, depth));
+                budget.push(
+                    &mut centroids,
+                    (uv, CLEARANCE_FRACTION * longest_len.sqrt(), request, depth),
+                )?;
             } else if [a, b, c].iter().all(|x| x.boundary) {
                 // all corners on the boundary (an ear between boundary points):
                 // splitting the chord would put a point next to the boundary, so a
                 // point goes beyond it, into the face across it
                 if let Some(q) = self.beyond_chord(&inside, e) {
-                    centroids.push((q, 0.0, None, depth));
+                    budget.push(&mut centroids, (q, 0.0, None, depth))?;
                 }
-            } else if marked.insert(ue.index()) {
-                split_edges.push(ue);
+            } else if marked.insert_with_budget(ue.index(), budget)? {
+                budget.push(&mut split_edges, ue)?;
             }
         }
         let mut good_edges = Vec::new();
+        budget.reserve_vec(&mut good_edges, edges.len())?;
         for eh in edges {
+            budget.charge(1)?;
             let edge = self.cdt.undirected_edge(eh);
-            if self.cdt.is_constraint_edge(eh) || marked.contains(&eh.index()) {
+            if self.cdt.is_constraint_edge(eh)
+                || marked.contains_with_budget(&eh.index(), budget)?
+            {
                 continue;
             }
             let [va, vb] = edge.vertices();
@@ -1501,7 +1774,7 @@ impl FaceState {
                     [y, x]
                 }
             };
-            if self.good_edges.contains(&key) {
+            if self.good_edges.contains_with_budget(&key, budget)? {
                 continue;
             }
             let d = edge.as_directed();
@@ -1524,19 +1797,25 @@ impl FaceState {
             let uv = Point2::new((a.uv.x + b.uv.x) / 2.0, (a.uv.y + b.uv.y) / 2.0);
             let mut split = p.max_len.is_some_and(|l| len > l);
             if !split {
-                let pt = self.point(k, s, uv)?;
+                let pt = self.point(k, s, uv, budget)?;
                 split = segment_distance(pt, a.xyz, b.xyz) > tol + a.gap.max(b.gap);
             }
-            if split && marked.insert(edge.fix().index()) {
-                split_edges.push(edge.fix());
+            if split && marked.insert_with_budget(edge.fix().index(), budget)? {
+                budget.push(&mut split_edges, edge.fix())?;
             } else if !split {
-                good_edges.push(key);
+                budget.push(&mut good_edges, key)?;
             }
         }
-        self.good.extend(newly_good);
-        self.good_edges.extend(good_edges);
-        let mut out = Vec::with_capacity(split_edges.len() + centroids.len());
+        for ids in newly_good {
+            self.good.insert_with_budget(ids, budget)?;
+        }
+        for key in good_edges {
+            self.good_edges.insert_with_budget(key, budget)?;
+        }
+        let mut out = Vec::new();
+        budget.reserve_vec(&mut out, split_edges.len() + centroids.len())?;
         for e in split_edges {
+            budget.charge(1)?;
             let edge = self.cdt.undirected_edge(e);
             let [x, y] = edge.positions();
             let len = ((y.x - x.x).powi(2) + (y.y - x.y).powi(2)).sqrt();
@@ -1548,20 +1827,21 @@ impl FaceState {
             if depth > MAX_LOCAL_DEPTH {
                 self.depth_capped = true;
             } else if self.clear_of_boundary(&inside, uv, CLEARANCE_FRACTION * len) {
-                out.push((uv, depth));
+                budget.push(&mut out, (uv, depth))?;
             } else if let Some(r) = self.blocking_segment(&inside, uv, len) {
                 // a boundary segment longer than the edge keeps the split off it (a fan
                 // from a long segment's ends): that segment is split
-                self.request(r);
+                self.request(r, budget)?;
             }
         }
         for (uv, need, request, depth) in centroids {
+            budget.charge(1)?;
             if depth > MAX_LOCAL_DEPTH {
                 self.depth_capped = true;
             } else if self.clear_of_boundary(&inside, uv, need) {
-                out.push((uv, depth));
+                budget.push(&mut out, (uv, depth))?;
             } else if let Some(r) = request {
-                self.request(r);
+                self.request(r, budget)?;
             }
         }
         Ok(out)
@@ -1569,30 +1849,34 @@ impl FaceState {
 
     /// Fills a face with no triangle in UV from its one loop, by clipping ears in the
     /// loop's best-fit plane (no point added, so its neighbours still meet it).
-    fn ear_clip(&mut self, k: &Kernel, s: &Surface) -> Result<()> {
+    fn ear_clip(&mut self, k: &Kernel, s: &Surface, budget: &QueryBudget<'_>) -> Result<()> {
         let [lp] = self.boundary.as_slice() else {
             return Ok(());
         };
         if lp.len() < 3 || lp.len() > MAX_EAR_LOOP {
             return Ok(());
         }
-        let mut ids = Vec::with_capacity(lp.len());
+        let mut ids = Vec::new();
+        budget.reserve_vec(&mut ids, lp.len())?;
         for (uv, v) in lp {
+            budget.charge(1)?;
             let Some(h) = self.find_boundary(*uv, *v)? else {
                 return Ok(());
             };
             let id = self.id(h);
             if ids.last() != Some(&id) {
-                ids.push(id);
+                budget.push(&mut ids, id)?;
             }
         }
-        let pts: Vec<Point3> = ids
-            .iter()
-            .filter_map(|i| self.vertices.get(*i).map(|v| v.xyz))
-            .collect();
+        let pts: Vec<Point3> = collect_with_budget(
+            ids.iter()
+                .filter_map(|i| self.vertices.get(*i).map(|v| v.xyz)),
+            budget,
+        )?;
         // Newell normal of the loop
         let mut nrm = Vec3::new(0.0, 0.0, 0.0);
         for (i, a) in pts.iter().enumerate() {
+            budget.charge(1)?;
             let Some(b) = pts.get((i + 1) % pts.len()) else {
                 continue;
             };
@@ -1605,35 +1889,40 @@ impl FaceState {
         let Ok(nrm) = nrm.unitize() else {
             return Ok(());
         };
-        let tris = ear_clip_polygon(&pts, nrm);
+        let tris = ear_clip_polygon(&pts, nrm, budget)?;
         if tris.is_empty() {
             return Ok(());
         }
         // wind the triangles outward
-        let outward = ids
-            .first()
-            .and_then(|i| self.vertices.get(*i))
-            .and_then(|v| self.outward(k, s, v.uv));
+        let outward = match ids.first().and_then(|i| self.vertices.get(*i)) {
+            Some(v) => self.outward(k, s, v.uv, budget)?,
+            None => None,
+        };
         let reverse = outward.is_some_and(|o| o.dot(nrm) < 0.0);
-        self.ears = tris
-            .into_iter()
-            .filter_map(|[a, b, c]| {
+        self.ears = collect_with_budget(
+            tris.into_iter().filter_map(|[a, b, c]| {
                 let (a, b, c) = (*ids.get(a)?, *ids.get(b)?, *ids.get(c)?);
                 Some(if reverse { [a, c, b] } else { [a, b, c] })
-            })
-            .collect();
+            }),
+            budget,
+        )?;
         Ok(())
     }
 
     /// The face's current triangles over its vertex table, wound outward (corners on
     /// one pole vertex dropped).
-    fn triangles(&self) -> Vec<[usize; 3]> {
+    fn triangles(&self, budget: &QueryBudget<'_>) -> Result<Vec<[usize; 3]>> {
         if !self.ears.is_empty() {
-            return self.ears.clone();
+            let mut out = Vec::new();
+            budget.reserve_vec(&mut out, self.ears.len())?;
+            out.extend_from_slice(&self.ears);
+            return Ok(out);
         }
-        let inside = inside_faces(&self.cdt);
+        let inside = inside_faces(&self.cdt, budget)?;
         let mut out = Vec::new();
+        budget.reserve_vec(&mut out, self.cdt.num_inner_faces())?;
         for face in self.cdt.inner_faces() {
+            budget.charge(1)?;
             if !is_inside(&inside, face.fix()) {
                 continue;
             }
@@ -1643,24 +1932,26 @@ impl FaceState {
             if same(a, b) || same(b, c) || same(c, a) {
                 continue;
             }
-            out.push(if self.flip { [a, c, b] } else { [a, b, c] });
+            budget.push(&mut out, if self.flip { [a, c, b] } else { [a, b, c] })?;
         }
-        out
+        Ok(out)
     }
 
     /// The face's mesh now, over the vertices its triangles use.
-    pub(crate) fn snapshot(
+    pub(crate) fn snapshot_with_budget(
         &self,
         k: &Kernel,
         b: &Brep,
         chord: Option<f64>,
         backend: Option<&dyn FaceBackend>,
+        budget: &QueryBudget<'_>,
     ) -> Result<FaceMesh> {
-        let tris = self.triangles();
-        let mut local: BTreeMap<usize, u32> = BTreeMap::new();
+        self.admit_retained(budget)?;
+        let tris = self.triangles(budget)?;
+        let mut local: FlatIndex<usize, u32> = FlatIndex::new();
         let mut m = FaceMesh {
             face: self.face,
-            inverted_edgeuses: self.inverted.clone(),
+            inverted_edgeuses: collect_with_budget(self.inverted.iter().copied(), budget)?,
             unconverged: self.unconverged,
             split_boundary: self.split_boundary,
             ear_clipped: !self.ears.is_empty(),
@@ -1677,9 +1968,11 @@ impl FaceState {
             backend_deviation: None,
         };
         for t in &tris {
+            budget.charge(1)?;
             let mut corners = [0u32; 3];
             for (slot, id) in corners.iter_mut().zip(t) {
-                if let Some(l) = local.get(id) {
+                budget.charge(1)?;
+                if let Some(l) = local.get_with_budget(id, budget)? {
                     *slot = *l;
                     continue;
                 }
@@ -1689,19 +1982,26 @@ impl FaceState {
                     .ok_or_else(|| invalid("vertex out of range"))?;
                 let l = u32::try_from(m.uvs.len())
                     .map_err(|_| invalid("face has too many vertices"))?;
-                m.uvs.push(v.uv);
-                m.positions.push(v.xyz);
-                m.normals.push(v.normal.unwrap_or(Vec3::new(0.0, 0.0, 0.0)));
-                m.shared.push(v.vertex);
-                m.gaps.push(v.gap);
-                local.insert(*id, l);
+                budget.push(&mut m.uvs, v.uv)?;
+                budget.push(&mut m.positions, v.xyz)?;
+                budget.push(&mut m.normals, v.normal.unwrap_or(Vec3::new(0.0, 0.0, 0.0)))?;
+                budget.push(&mut m.shared, v.vertex)?;
+                budget.push(&mut m.gaps, v.gap)?;
+                local.insert_with_budget(*id, l, budget)?;
                 *slot = l;
             }
-            m.triangles.push(corners);
+            budget.push(&mut m.triangles, corners)?;
         }
         if let Some(chord) = chord {
             let s = surface_of(b, self.face)?;
-            let (dev, over) = crate::deviation::face_mesh_deviation(k, s, &self.domain, &m, chord);
+            let (dev, over) = crate::deviation::face_mesh_deviation_with_budget(
+                k,
+                s,
+                &self.domain,
+                &m,
+                chord,
+                budget,
+            )?;
             m.deviation = Some(dev);
             m.triangles_over = over;
             // the backend's own measure of a face whose grid it placed
@@ -1718,7 +2018,9 @@ impl FaceState {
                     positions: &m.positions,
                     triangles: &m.triangles,
                 };
-                m.backend_deviation = be.deviation(k, &face, &view);
+                budget.charge(1)?;
+                m.backend_deviation = be.deviation(k, &face, &view, budget).transpose()?;
+                budget.checkpoint()?;
             }
         }
         Ok(m)
@@ -1744,7 +2046,7 @@ impl FaceState {
     /// Records the shared mesh vertices an assembly gave the snapshot's interior
     /// vertices (matched by UV), so later levels keep them.
     pub(crate) fn adopt(&mut self, m: &FaceMesh) {
-        let mut by_uv: BTreeMap<(u64, u64), u32> = BTreeMap::new();
+        let mut by_uv: FlatIndex<(u64, u64), u32> = FlatIndex::new();
         for (uv, sh) in m.uvs.iter().zip(&m.shared) {
             if let Some(v) = sh {
                 by_uv.insert((uv.x.to_bits(), uv.y.to_bits()), *v);
@@ -1760,8 +2062,24 @@ impl FaceState {
     }
 }
 
+/// Fallible adapter collection; no inferred capacity from an opaque owner.
+fn collect_with_budget<T>(
+    items: impl IntoIterator<Item = T>,
+    budget: &QueryBudget<'_>,
+) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    let iter = items.into_iter();
+    budget.reserve_vec(&mut out, iter.size_hint().0)?;
+    for item in iter {
+        budget.charge(1)?;
+        budget.push(&mut out, item)?;
+    }
+    Ok(out)
+}
+
 /// What mapping an edge use into UV needs.
-struct MapContext<'a> {
+struct MapContext<'a, 'q> {
+    budget: &'a QueryBudget<'q>,
     k: &'a Kernel,
     s: &'a Surface,
     domain: &'a Extent2d,
@@ -1770,7 +2088,7 @@ struct MapContext<'a> {
     period: (Option<f64>, Option<f64>),
 }
 
-impl MapContext<'_> {
+impl MapContext<'_, '_> {
     /// `uv` moved by whole periods to within half a period of `near`.
     fn unwrap(&self, uv: Point2, near: Point2) -> Point2 {
         let shift = |x: f64, c: f64, p: Option<f64>| match p {
@@ -1796,13 +2114,16 @@ impl MapContext<'_> {
         reverse: bool,
         seed: Option<Point2>,
     ) -> Result<Vec<LoopPoint>> {
+        let budget = self.budget;
         let (k, s) = (self.k, self.s);
         let (t0, t1) = (ivl.min(), ivl.max());
         let len = t1 - t0;
         let n = poly.params.len();
-        let mut out = Vec::with_capacity(n);
+        let mut out = Vec::new();
+        budget.reserve_vec(&mut out, n)?;
         let mut prev = seed;
         for pos in 0..n {
+            budget.charge(1)?;
             let i = if reverse { n - 1 - pos } else { pos };
             let (Some(t), Some(v)) = (poly.params.get(i), poly.vertices.get(i)) else {
                 continue;
@@ -1828,24 +2149,27 @@ impl MapContext<'_> {
                     {
                         uv
                     } else {
-                        foot(k, s, uv, xyz, self.domain).0
+                        foot_with_budget(k, s, uv, xyz, self.domain, budget)?.0
                     }
                 }
                 None => match prev {
                     Some(seed) => {
-                        let uv = foot(k, s, seed, xyz, self.domain).0;
+                        let uv = foot_with_budget(k, s, seed, xyz, self.domain, budget)?.0;
                         self.unwrap(uv, seed)
                     }
-                    None => invert_point(k, s, xyz, self.domain)?,
+                    None => invert_point_with_budget(k, s, xyz, self.domain, budget)?,
                 },
             };
             prev = Some(uv);
-            out.push(LoopPoint {
-                uv,
-                xyz,
-                vertex: *v,
-                pole_next: poly.degenerate && pos == 0,
-            });
+            budget.push(
+                &mut out,
+                LoopPoint {
+                    uv,
+                    xyz,
+                    vertex: *v,
+                    pole_next: poly.degenerate && pos == 0,
+                },
+            )?;
         }
         Ok(out)
     }
@@ -1861,8 +2185,15 @@ fn unit_cross(su: Vec3, sv: Vec3) -> Option<Vec3> {
 }
 
 /// How far `xyz` is from the surface point at `uv` (`0` when it does not evaluate).
-fn surface_gap(k: &Kernel, s: &Surface, uv: Point2, xyz: Point3) -> f64 {
-    s.evaluate_point(k, uv).map_or(0.0, |p| p.distance(xyz))
+fn surface_gap(
+    k: &Kernel,
+    s: &Surface,
+    uv: Point2,
+    xyz: Point3,
+    budget: &QueryBudget<'_>,
+) -> Result<f64> {
+    budget.charge(1)?;
+    Ok(s.evaluate_point(k, uv).map_or(0.0, |p| p.distance(xyz)))
 }
 
 /// Distance in scaled UV between `a` and `c`.
@@ -1882,12 +2213,14 @@ fn junction_is_pole(
     b: LoopPoint,
     span: f64,
     scale: (f64, f64),
+    budget: &QueryBudget<'_>,
 ) -> Result<bool> {
     let gap = scaled_gap(a.uv, b.uv, scale);
     if gap <= chord.max(1e-9 * span) {
         return Ok(false);
     }
     let mid = Point2::new((a.uv.x + b.uv.x) / 2.0, (a.uv.y + b.uv.y) / 2.0);
+    budget.charge(1)?;
     if surface_point(k, s, mid)?.distance(a.xyz) <= chord {
         return Ok(true);
     }
@@ -1908,12 +2241,13 @@ fn join(
     chord: f64,
     span: f64,
     scale: (f64, f64),
+    budget: &QueryBudget<'_>,
 ) -> Result<()> {
     if let (Some(last), Some(first)) = (pts.last().copied(), seq.first().copied()) {
         if last.vertex != first.vertex {
             return Err(invalid("loop edge uses do not connect"));
         }
-        if junction_is_pole(k, s, chord, last, first, span, scale)? {
+        if junction_is_pole(k, s, chord, last, first, span, scale, budget)? {
             if let Some(l) = pts.last_mut() {
                 l.pole_next = true;
             }
@@ -1924,34 +2258,43 @@ fn join(
             }
         }
     }
+    budget.reserve_vec(pts, seq.len())?;
     pts.extend(seq);
     Ok(())
 }
 
 /// Flood fill from the outer face, flipping at every constraint edge: `true` for faces
 /// inside the loops, indexed by face handle.
-fn inside_faces(cdt: &Cdt) -> Vec<bool> {
+fn inside_faces(cdt: &Cdt, budget: &QueryBudget<'_>) -> Result<Vec<bool>> {
     let n = cdt.num_all_faces();
-    let mut label: Vec<Option<bool>> = vec![None; n];
+    let mut label = Vec::new();
+    budget.reserve_vec(&mut label, n)?;
+    label.resize(n, None);
     let outer = cdt.outer_face().fix();
     if let Some(l) = label.get_mut(outer.index()) {
         *l = Some(false);
     }
-    let mut queue = VecDeque::from([outer]);
+    let mut queue = Vec::new();
+    budget.reserve_vec(&mut queue, n)?;
+    queue.push(outer);
+    let mut cursor = 0;
     let limit = cdt.num_directed_edges();
-    while let Some(fh) = queue.pop_front() {
+    while let Some(&fh) = queue.get(cursor) {
+        budget.charge(1)?;
+        cursor += 1;
         let inside = label.get(fh.index()).copied().flatten().unwrap_or(false);
         let Some(start) = cdt.face(fh).adjacent_edge() else {
             continue;
         };
         let mut e = start;
         for _ in 0..limit {
+            budget.charge(1)?;
             let across = e.rev().face().fix();
             let constraint = cdt.is_constraint_edge(e.fix().as_undirected());
             if let Some(slot) = label.get_mut(across.index()) {
                 if slot.is_none() {
                     *slot = Some(inside ^ constraint);
-                    queue.push_back(across);
+                    budget.push(&mut queue, across)?;
                 }
             }
             e = e.next();
@@ -1960,7 +2303,7 @@ fn inside_faces(cdt: &Cdt) -> Vec<bool> {
             }
         }
     }
-    label.into_iter().map(|l| l.unwrap_or(false)).collect()
+    collect_with_budget(label.into_iter().map(|l| l.unwrap_or(false)), budget)
 }
 
 fn is_inside(inside: &[bool], f: FixedFaceHandle<InnerTag>) -> bool {
@@ -2018,30 +2361,34 @@ fn nearest_constraint(
 
 /// Ear clipping of the polygon `pts` (no repeated closing point) projected on the plane
 /// of unit normal `n`: triangles counter-clockwise about `n`, empty when it fails.
-fn ear_clip_polygon(pts: &[Point3], n: Vec3) -> Vec<[usize; 3]> {
+fn ear_clip_polygon(pts: &[Point3], n: Vec3, budget: &QueryBudget<'_>) -> Result<Vec<[usize; 3]>> {
     // a frame of the plane
     // (`n` itself is the first axis it returns)
     let Ok([_, x, y]) = n.make_unit_ortho_vectors(None) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let (x, y) = if x.cross(y).dot(n) < 0.0 {
         (y, x)
     } else {
         (x, y)
     };
-    let p2: Vec<(f64, f64)> = pts.iter().map(|p| (p.dot(x), p.dot(y))).collect();
+    let p2: Vec<(f64, f64)> =
+        collect_with_budget(pts.iter().map(|p| (p.dot(x), p.dot(y))), budget)?;
     let at = |i: usize| p2.get(i).copied().unwrap_or((0.0, 0.0));
     let cross = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
         (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
     };
-    let mut idx: Vec<usize> = (0..pts.len()).collect();
+    let mut idx: Vec<usize> = collect_with_budget(0..pts.len(), budget)?;
     let mut out = Vec::new();
+    budget.reserve_vec(&mut out, pts.len().saturating_sub(2))?;
     let mut guard = 0;
     while idx.len() > 3 && guard < pts.len() * pts.len() {
+        budget.charge(1)?;
         guard += 1;
         let m = idx.len();
         let mut clipped = false;
         for i in 0..m {
+            budget.charge(1)?;
             let (Some(&ia), Some(&ib), Some(&ic)) =
                 (idx.get((i + m - 1) % m), idx.get(i), idx.get((i + 1) % m))
             else {
@@ -2051,6 +2398,7 @@ fn ear_clip_polygon(pts: &[Point3], n: Vec3) -> Vec<[usize; 3]> {
             if cross(a, b, c) <= 0.0 {
                 continue;
             }
+            budget.charge(idx.len() as u64)?;
             let blocked = idx.iter().any(|&j| {
                 j != ia && j != ib && j != ic && {
                     let q = at(j);
@@ -2060,26 +2408,131 @@ fn ear_clip_polygon(pts: &[Point3], n: Vec3) -> Vec<[usize; 3]> {
             if blocked {
                 continue;
             }
-            out.push([ia, ib, ic]);
+            budget.push(&mut out, [ia, ib, ic])?;
             idx.remove(i);
             clipped = true;
             break;
         }
         if !clipped {
-            return Vec::new();
+            return Ok(Vec::new());
         }
     }
     if let [a, b, c] = idx.as_slice() {
         if cross(at(*a), at(*b), at(*c)) > 0.0 {
-            out.push([*a, *b, *c]);
+            budget.push(&mut out, [*a, *b, *c])?;
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependency_constraint_outputs_are_admitted_before_adapter_growth() {
+        use crate::budget::QueryLimit;
+        use std::sync::atomic::AtomicBool;
+        let make = || {
+            let mut cdt = Cdt::new();
+            for x in 0..8 {
+                let bottom = cdt
+                    .insert(CdtVertex {
+                        pos: spade::Point2::new(f64::from(x), -1.0),
+                        id: usize::MAX,
+                    })
+                    .unwrap();
+                let top = cdt
+                    .insert(CdtVertex {
+                        pos: spade::Point2::new(f64::from(x), 1.0),
+                        id: usize::MAX,
+                    })
+                    .unwrap();
+                cdt.add_constraint(bottom, top);
+            }
+            let from = cdt
+                .insert(CdtVertex {
+                    pos: spade::Point2::new(-1.0, 0.0),
+                    id: usize::MAX,
+                })
+                .unwrap();
+            let to = cdt
+                .insert(CdtVertex {
+                    pos: spade::Point2::new(8.0, 0.0),
+                    id: usize::MAX,
+                })
+                .unwrap();
+            (cdt, from, to)
+        };
+        let cancel = AtomicBool::new(false);
+        let (mut cdt, from, to) = make();
+        let count = cdt.num_vertices();
+        let denied = QueryBudget::new(u64::MAX, 0, &cancel);
+        assert!(constraint_edges_with_budget(&mut cdt, &denied, |cdt| {
+            cdt.try_add_constraint(from, to)
+        })
+        .is_err());
+        assert_eq!(denied.failure(), Some(QueryLimit::Bytes));
+        assert_eq!(cdt.num_vertices(), count);
+
+        let limited = QueryBudget::new(
+            u64::MAX,
+            4 * size_of::<spade::handles::FixedDirectedEdgeHandle>(),
+            &cancel,
+        );
+        assert!(constraint_edges_with_budget(&mut cdt, &limited, |cdt| {
+            cdt.add_constraint_and_split(from, to, |pos| CdtVertex {
+                pos,
+                id: usize::MAX,
+            })
+        })
+        .is_err());
+        assert_eq!(limited.failure(), Some(QueryLimit::Bytes));
+
+        let (mut cdt, from, to) = make();
+        let budget = QueryBudget::new(u64::MAX, usize::MAX, &cancel);
+        let returned = constraint_edges_with_budget(&mut cdt, &budget, |cdt| {
+            cdt.add_constraint_and_split(from, to, |pos| CdtVertex {
+                pos,
+                id: usize::MAX,
+            })
+        })
+        .unwrap();
+        assert!(returned.len() >= 9);
+        let returned_bytes = crate::storage::vector_bytes(&returned);
+        assert_eq!(budget.admitted_bytes(), returned_bytes);
+        let mut vertices = Vec::<FaceVertex>::new();
+        budget
+            .reserve_vec(&mut vertices, cdt.num_vertices() - count)
+            .unwrap();
+        assert!(
+            budget.admitted_bytes() >= returned_bytes + crate::storage::vector_bytes(&vertices)
+        );
+    }
+
+    #[test]
+    fn flood_fill_and_ear_clipping_obey_query_limits() {
+        use crate::budget::QueryLimit;
+        use std::sync::atomic::AtomicBool;
+        let cancel = AtomicBool::new(false);
+        let cdt = Cdt::new();
+        let bytes = QueryBudget::new(u64::MAX, 0, &cancel);
+        assert!(inside_faces(&cdt, &bytes).is_err());
+        assert_eq!(bytes.failure(), Some(QueryLimit::Bytes));
+
+        let pts = [
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        ];
+        let work = QueryBudget::new(0, usize::MAX, &cancel);
+        assert!(ear_clip_polygon(&pts, Vec3::new(0.0, 0.0, 1.0), &work).is_err());
+        assert_eq!(work.failure(), Some(QueryLimit::Work));
+        let cancelled = AtomicBool::new(true);
+        let budget = QueryBudget::new(u64::MAX, usize::MAX, &cancelled);
+        assert!(inside_faces(&cdt, &budget).is_err());
+        assert_eq!(budget.failure(), Some(QueryLimit::Cancelled));
+    }
 
     fn area(pts: &[Point3], tris: &[[usize; 3]]) -> f64 {
         tris.iter()
@@ -2104,7 +2557,7 @@ mod tests {
             Point3::new(1.0, 2.0, 0.0),
             Point3::new(0.0, 2.0, 0.0),
         ];
-        let t = ear_clip_polygon(&l, z);
+        let t = ear_clip_polygon(&l, z, &QueryBudget::unbounded()).unwrap();
         assert_eq!(t.len(), 4);
         assert!((area(&l, &t) - 3.0).abs() < 1e-12);
         // every triangle counter-clockwise about the normal
@@ -2112,7 +2565,9 @@ mod tests {
             assert!((l[*b] - l[*a]).cross(l[*c] - l[*a]).dot(z) > 0.0);
         }
         // seen from the other side the polygon is clockwise: no ear, nothing clipped
-        assert!(ear_clip_polygon(&l, -z).is_empty());
+        assert!(ear_clip_polygon(&l, -z, &QueryBudget::unbounded())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2144,7 +2599,7 @@ mod tests {
             4,
             &mut cdt,
         );
-        let inside = inside_faces(&cdt);
+        let inside = inside_faces(&cdt, &QueryBudget::unbounded()).unwrap();
         let mut area_in = 0.0;
         for f in cdt.inner_faces() {
             if is_inside(&inside, f.fix()) {
@@ -2153,4 +2608,37 @@ mod tests {
         }
         assert!((area_in - 12.0).abs() < 1e-12, "{area_in}");
     }
+}
+
+/// Spade owns the allocation while the operation runs. Its splitting path may
+/// restart on an offset segment (cdt.rs:938-987), so source vertex/edge counts do
+/// not establish an output-capacity upper bound. Admit the pinned Rust Vec
+/// minimum provisionally before entering, then account its actual returned
+/// capacity before processing any handles or adding face vertices.
+///
+/// Internal DCEL/scratch/growth peaks remain the explicit opaque host boundary;
+/// this reservation is not represented as an upper bound on those allocations.
+fn constraint_edges_with_budget(
+    cdt: &mut Cdt,
+    budget: &QueryBudget<'_>,
+    operation: impl FnOnce(&mut Cdt) -> Vec<spade::handles::FixedDirectedEdgeHandle>,
+) -> Result<Vec<spade::handles::FixedDirectedEdgeHandle>> {
+    use std::mem::size_of;
+    type Handle = spade::handles::FixedDirectedEdgeHandle;
+    // Rust 1.98 alloc/raw_vec/mod.rs::min_non_zero_cap: elements of this size
+    // start with four slots. Actual allocator-returned capacity is checked below.
+    let element = size_of::<Handle>();
+    let slots = if element == 1 {
+        8
+    } else if element <= 1024 {
+        4
+    } else {
+        1
+    };
+    let reserved = slots * element;
+    budget.charge(1)?;
+    let reservation = budget.reserve_dependency_output(reserved)?;
+    let edges = operation(cdt);
+    reservation.reconcile(crate::storage::vector_bytes(&edges))?;
+    Ok(edges)
 }

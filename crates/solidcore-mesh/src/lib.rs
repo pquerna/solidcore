@@ -73,6 +73,7 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+mod budget;
 mod deviation;
 mod edges;
 mod face;
@@ -81,7 +82,9 @@ mod grid;
 mod mesh;
 mod nurbs;
 mod options;
+mod storage;
 
+pub use budget::{QueryBudget, QueryError, QueryLimit};
 pub use deviation::{deviation, DeviationReport};
 pub use edges::{EdgeSet, SegmentSplit, MAX_EDGE_DEPTH, MAX_EDGE_POINTS, MAX_SPLIT_PIECES};
 pub use face::{FaceMesh, MAX_LOCAL_DEPTH};
@@ -161,6 +164,37 @@ pub fn tessellate_edge_set(k: &Kernel, b: &Brep, opts: &TessellateOptions) -> Re
     Ok(edges)
 }
 
+/// Divides the native edges with cumulative caller work/cancellation controls
+/// and fallible admission of capacity-visible mesh buffers.
+///
+/// Set the budget's byte limit excluding retained caller/source owners. Native
+/// geometry evaluator/cache allocations are opaque and are not included in this
+/// logical buffer allowance or claimed as an exact process-memory bound.
+///
+/// # Errors
+///
+/// A typed caller limit, or the geometry errors of [`tessellate_edge_set`].
+pub fn tessellate_edge_set_with_budget(
+    k: &Kernel,
+    b: &Brep,
+    opts: &TessellateOptions,
+    budget: &QueryBudget<'_>,
+) -> Result<EdgeSet, QueryError> {
+    let result = (|| {
+        budget.begin_query()?;
+        check_options(opts)?;
+        budget.admit(size_of::<EdgeSet>())?;
+        let mut edges = EdgeSet {
+            model_size: model_size_with_budget(k, b, budget)?,
+            ..EdgeSet::default()
+        };
+        edges.refine_with_budget(k, b, opts, budget)?;
+        budget.checkpoint()?;
+        Ok(edges)
+    })();
+    budget.finish(result)
+}
+
 /// The mesh of face `f` against the edge polylines `edges` (made with the same
 /// options), in one call: [`FaceTessellation::new`], one [`FaceTessellation::refine`]
 /// and [`FaceTessellation::mesh`], without the boundary rounds of [`tessellate`].
@@ -178,6 +212,47 @@ pub fn tessellate_face(
     let mut t = FaceTessellation::new(k, b, f, edges)?;
     t.refine(k, b, edges, opts)?;
     t.mesh(k, b, edges, opts)
+}
+
+/// Meshes one original native face using the shared edge candidates and a
+/// cumulative caller work/cancellation budget.
+///
+/// Capacity-visible mesh buffers are admitted fallibly. Spade triangulation and
+/// native geometry caches remain opaque allocations under their own hard
+/// candidate limits; this is not an exact heap/RSS bound.
+/// Constraint-result vectors are opaque while Spade runs. A provisional minimum
+/// reservation is not an upper bound; actual returned capacities are reconciled
+/// before processing or coexisting adapter growth and are fully charged thereafter.
+///
+/// # Errors
+///
+/// A typed caller limit, or the geometry errors of [`tessellate_face`]. A limit
+/// never returns a partial face or becomes a geometric fallback.
+pub fn tessellate_face_with_budget(
+    k: &Kernel,
+    b: &Brep,
+    f: FaceId,
+    edges: &EdgeSet,
+    opts: &TessellateOptions,
+    budget: &QueryBudget<'_>,
+) -> Result<FaceMesh, QueryError> {
+    let result = (|| {
+        budget.begin_query()?;
+        check_options(opts)?;
+        let mut state = FaceState::new_with_budget(k, b, f, edges.model_size, budget)?;
+        let params = opts.face_params(f, edges.model_size);
+        state.refine_with_budget(k, b, edges, &params, opts.backend.as_deref(), budget)?;
+        let mesh = state.snapshot_with_budget(
+            k,
+            b,
+            opts.measure_deviation.then_some(params.chord),
+            opts.backend.as_deref(),
+            budget,
+        )?;
+        budget.checkpoint()?;
+        Ok(mesh)
+    })();
+    budget.finish(result)
 }
 
 /// Most rounds of splitting boundary segments faces ask for
@@ -325,6 +400,10 @@ fn check_options(opts: &TessellateOptions) -> Result<()> {
 /// bounding-box diagonal (low for a face that bulges past its edges, such as a whole
 /// sphere's) that is cheap where the tight box query is not; 1 when it is empty.
 fn model_size(k: &Kernel, b: &Brep) -> Result<f64> {
+    model_size_with_budget(k, b, &QueryBudget::unbounded())
+}
+
+fn model_size_with_budget(k: &Kernel, b: &Brep, budget: &QueryBudget<'_>) -> Result<f64> {
     let mut lo = [f64::INFINITY; 3];
     let mut hi = [f64::NEG_INFINITY; 3];
     let mut add = |p: solidcore::math::Point3| {
@@ -336,13 +415,16 @@ fn model_size(k: &Kernel, b: &Brep) -> Result<f64> {
             *h = h.max(x);
         }
     };
-    for v in bl::vertices(b, None)? {
+    for &v in b.vertex_list() {
+        budget.charge(1)?;
         add(b.vertex(v)?.point);
     }
-    for e in bl::edges(b, None)? {
+    for &e in b.edge_list() {
+        budget.charge(1)?;
         let rec = b.edge(e)?;
         if let Some(c) = rec.curve.as_ref() {
             for i in 0..=16 {
+                budget.charge(1)?;
                 if let Ok(p) = c.evaluate_point(k, rec.interval.evaluate(f64::from(i) / 16.0)) {
                     add(p);
                 }

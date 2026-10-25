@@ -404,6 +404,18 @@ impl StepSurface {
         }
     }
 
+    /// An independently owned carrier copy retaining the exact STEP chart.
+    /// The enclosing Surface validates the complete owned geometry depth.
+    pub(crate) fn copy_owned(&self, k: &Kernel) -> Result<Self> {
+        let source = self.surface().ok_or_else(|| {
+            SolidError::null_pointer("surface::surface::p1::StepSurface::copy_owned")
+        })?;
+        Ok(Self {
+            surface: Some(Box::new(source.copy(k)?)),
+            owns_surface: true,
+        })
+    }
+
     /// `GetTypeString()`.
     pub const TYPE_STRING: &'static str = "SmSTEPSurface_TYPE";
     /// `GetClassString()`.

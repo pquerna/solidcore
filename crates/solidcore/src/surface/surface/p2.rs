@@ -1312,13 +1312,14 @@ impl Surface {
     /// # Errors
     ///
     /// Those of [`OffsetSurface::copy`]; an owned geometry chain deeper than
-    /// [`MAX_GEOMETRY_NESTING`]; none
-    /// for the other ported kinds (the base default is `SM_ERR`).
+    /// [`MAX_GEOMETRY_NESTING`]; a STEP wrapper without its base carrier. The
+    /// base default for unported kinds is `SM_ERR`.
     pub fn copy(&self, k: &Kernel) -> Result<Self> {
         self.check_evaluation_copy_depth(0)?;
         match &self.kind {
             SurfaceKind::BSpline(s) => Ok(Self::from(s.copy())),
-            SurfaceKind::CurveBounded(_) | SurfaceKind::Step(_) => base_copy(),
+            SurfaceKind::CurveBounded(_) => base_copy(),
+            SurfaceKind::Step(s) => s.copy_owned(k).map(Self::from),
             SurfaceKind::SrfInVolume(s) => Ok(Self::from(s.copy(k)?)),
             SurfaceKind::Plane(s) => Ok(Self::from(s.copy())),
             SurfaceKind::Cone(s) => Ok(Self::from(s.as_ref().clone())),
@@ -1339,9 +1340,12 @@ impl Surface {
         self.check_evaluation_copy_depth(0)?;
         match &self.kind {
             SurfaceKind::BSpline(s) => s.copy_and_add_analytics(k),
-            SurfaceKind::CurveBounded(_) | SurfaceKind::Step(_) | SurfaceKind::SrfInVolume(_) => {
+            SurfaceKind::CurveBounded(_) | SurfaceKind::SrfInVolume(_) => {
                 base_copy_and_add_analytics()
             }
+            // Retain the STEP chart; replacing its base with a fitted analytic
+            // carrier could change the wrapper's parameterization.
+            SurfaceKind::Step(s) => s.copy_owned(k).map(Self::from),
             // SmBSplineSurface::CopyAndAddAnalytics: not SmBSplineSurface_TYPE, so Copy
             SurfaceKind::Plane(s) => Ok(Self::from(s.copy())),
             SurfaceKind::Cone(s) => Ok(Self::from(s.as_ref().clone())),

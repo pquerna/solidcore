@@ -592,7 +592,7 @@ const MODELS: [&str; 14] = [
 fn corpus_models_watertight_within_tolerance() {
     for rel in MODELS {
         let mut k = Kernel::default();
-        let Some(b) = read(&mut k, rel) else {
+        let Some(mut b) = read(&mut k, rel) else {
             continue;
         };
         let store = AttributeStore::new();
@@ -601,8 +601,8 @@ fn corpus_models_watertight_within_tolerance() {
             store: &store,
             key_of: &key,
         };
-        let volume = brep_volume(&k, &b, 1e-6, &attrs).unwrap();
-        let area = brep_area(&k, &b, 1e-6).unwrap();
+        let volume = brep_volume(&k, &mut b, 1e-6, &attrs).unwrap();
+        let area = brep_area(&k, &mut b, 1e-6).unwrap();
         let mut errors = Vec::new();
         for r in [1e-2, 1e-3, 1e-4] {
             let mut o = TessellateOptions::default().with_relative_chord(r);

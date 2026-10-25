@@ -54,6 +54,27 @@ PASS|PARTIAL|FAIL <unit> cases=… passed=… failed=… deferred=… max_rel_er
 ```
 
 then the first few failing cases and `reports/difftest/<unit>.json`.
+
+**Native reference restrictions ([#448](https://github.com/tangency-labs/solidcore/issues/448)).**
+`geom.hash_table`, `heal.heal_data_p1`, `heal.heal_data_p2`, `heal.heal_data_p3`
+and `surface.twist_volume` require an x86-64 C++ reference. Their out-of-range
+floating-point-to-integer conversions are undefined upstream; ARM64 saturates
+where the pinned x86-64 reference wraps. Rust deliberately reproduces the latter
+on every target. On other architectures these units print `SKIP ...
+skipped(platform)` (or `FUZZ-SKIP`), before building fixtures or calling C++.
+The twist unit is included because its period reduction has the same dependency,
+even though the current committed cases do not expose it.
+
+Skipped units are counted separately from passes, partials and failures. Their
+JSON reports have `status: "skipped(platform)"`, `pass: false`, a reason in
+`skipped_platform`, and no compared cases. `--status-of` prints `skipped(platform)`;
+ordinary comparison and fuzz runs exit successfully when they contain only passes,
+partials and platform skips. `--baseline` fails if any selected reference is
+unsupported, and skipped reports are invalid baselines: this cannot waive the CI
+coverage ratchet. Plan statuses and tolerances are unchanged. Rust-only
+`--digest-dir` runs remain enabled on every target. On Apple Silicon, an x86-64
+harness and difftest binary under Rosetta can compare these units; this does not
+address independent libc++ reader or libm differences.
 `with_values` / `no_values` split the passing cases into those that compared
 at least one float, integer or topology entry and those that compared nothing
 (both sides returned the same error, or empty outputs). `vacuous` counts the
@@ -357,7 +378,7 @@ ratchet waivers once the PR has merged.
 * **Absolute floor** only where the runner documents one via
   `abs_floors()` (key + value + reason, written into the report). Do not add a
   floor to make a case pass; if the C++ and Rust genuinely disagree, record it in
-  `plan/findings.md` and leave the unit non-green.
+  a new `plan/findings/<slug>.md` and leave the unit non-green.
 * Key sets and array lengths must match. A case with a harness error (bad
   input, panic) fails. A unit with zero cases fails.
 
@@ -668,6 +689,9 @@ nice -n 10 cargo run -p difftest -- --solidcraft-cases '3526-*'        # ids (<f
   glob): per case its source links, verdict, deferral, measured values and checks.
 * `cargo test -p difftest --lib solidcraft` checks that every case file loads, every
   case runs to a verdict, and every deferral names a plan unit.
+* **Adding cases:** add a new `fixtures/solidcraft/<issue>-<slug>.json`. Files load in
+  sorted order and nothing counts them, so no Rust file changes unless the case needs
+  a new step kind.
 
 ### Sheet flange corner overlap (SolidCraft #3170, PR #3472)
 

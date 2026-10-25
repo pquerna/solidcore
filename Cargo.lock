@@ -40,6 +40,7 @@ dependencies = [
  "serde_json",
  "solidcore",
  "solidcore-ffi",
+ "solidcore-ssi",
  "ssi",
  "toml",
 ]
@@ -269,6 +270,14 @@ dependencies = [
  "num-traits",
  "robust",
  "smallvec",
+]
+
+[[package]]
+name = "solidcore-ssi"
+version = "0.1.0"
+dependencies = [
+ "solidcore",
+ "ssi",
 ]
 
 [[package]]

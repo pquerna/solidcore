@@ -100,22 +100,25 @@ pub(crate) fn clamp_uv(uv: Point2, d: &Extent2d) -> Point2 {
     }
 }
 
-/// `uv` moved by Gauss-Newton steps towards the surface point nearest `target`, kept
-/// inside `domain`; each step must bring the surface point closer. Returns the UV and
-/// the distance of its surface point from `target` (`None` when nothing evaluates).
-pub(crate) fn foot(
+/// A damped Newton proposal with caller checks before each native evaluation.
+/// Kernel-owned evaluation scratch remains an opaque host allocation.
+
+pub(crate) fn foot_with_budget(
     k: &Kernel,
     s: &Surface,
     uv: Point2,
     target: Point3,
     domain: &Extent2d,
-) -> (Point2, Option<f64>) {
+    budget: &crate::budget::QueryBudget<'_>,
+) -> Result<(Point2, Option<f64>)> {
+    budget.charge(1)?;
     let Ok(p0) = s.evaluate_point(k, uv) else {
-        return (uv, None);
+        return Ok((uv, None));
     };
     let mut best = p0.distance(target);
     let mut uv = uv;
     for _ in 0..POLISH_STEPS {
+        budget.charge(1)?;
         if best == 0.0 {
             break;
         }
@@ -136,6 +139,7 @@ pub(crate) fn foot(
         let mut improved = None;
         let mut f = 1.0;
         for _ in 0..DAMPING_HALVINGS {
+            budget.charge(1)?;
             let next = clamp_uv(Point2::new(uv.x + du * f, uv.y + dv * f), domain);
             if let Ok(q) = s.evaluate_point(k, next) {
                 let d = q.distance(target);
@@ -152,19 +156,21 @@ pub(crate) fn foot(
         best = d;
         uv = next;
     }
-    (uv, Some(best))
+    Ok((uv, Some(best)))
 }
 
 /// The UV of `target` by a coarse search over `domain` and a Newton polish.
-pub(crate) fn invert_point(
+pub(crate) fn invert_point_with_budget(
     k: &Kernel,
     s: &Surface,
     target: Point3,
     domain: &Extent2d,
+    budget: &crate::budget::QueryBudget<'_>,
 ) -> Result<Point2> {
     let mut best: Option<(f64, Point2)> = None;
     for j in 0..=INVERT_GRID {
         for i in 0..=INVERT_GRID {
+            budget.charge(1)?;
             let uv = Point2::new(
                 domain.u_min() + (domain.u_max() - domain.u_min()) * i as f64 / INVERT_GRID as f64,
                 domain.v_min() + (domain.v_max() - domain.v_min()) * j as f64 / INVERT_GRID as f64,
@@ -178,7 +184,7 @@ pub(crate) fn invert_point(
         }
     }
     let (_, uv) = best.ok_or_else(|| invalid("surface does not evaluate"))?;
-    Ok(foot(k, s, uv, target, domain).0)
+    Ok(foot_with_budget(k, s, uv, target, domain, budget)?.0)
 }
 
 /// The power of two nearest `x` (`x` positive and finite), so scaling by it is exact.
@@ -192,10 +198,16 @@ pub(crate) fn power_of_two(x: f64) -> f64 {
 
 /// Mean `|Su|` and `|Sv|` over a sample grid of `d`, each rounded to a power of two (so
 /// scaling is exact both ways), so `(u * su, v * sv)` is roughly arc length.
-pub(crate) fn surface_scales(k: &Kernel, s: &Surface, d: &Extent2d) -> (f64, f64) {
+pub(crate) fn surface_scales_with_budget(
+    k: &Kernel,
+    s: &Surface,
+    d: &Extent2d,
+    budget: &crate::budget::QueryBudget<'_>,
+) -> Result<(f64, f64)> {
     let (mut su_sum, mut sv_sum, mut n) = (0.0, 0.0, 0.0);
     for j in 0..=4 {
         for i in 0..=4 {
+            budget.charge(1)?;
             let uv = Point2::new(
                 d.u_min() + (d.u_max() - d.u_min()) * f64::from(i) / 4.0,
                 d.v_min() + (d.v_max() - d.v_min()) * f64::from(j) / 4.0,
@@ -221,13 +233,21 @@ pub(crate) fn surface_scales(k: &Kernel, s: &Surface, d: &Extent2d) -> (f64, f64
     if sv <= 1e-300 || sv.is_nan() {
         sv = su;
     }
-    (power_of_two(su), power_of_two(sv))
+    Ok((power_of_two(su), power_of_two(sv)))
 }
 
 /// Whether the surface closes on itself across `domain` in u (`along_u`) or v: its
 /// points on the two opposite domain sides agree within `tol` at five places.
-pub(crate) fn closes(k: &Kernel, s: &Surface, domain: &Extent2d, along_u: bool, tol: f64) -> bool {
+pub(crate) fn closes_with_budget(
+    k: &Kernel,
+    s: &Surface,
+    domain: &Extent2d,
+    along_u: bool,
+    tol: f64,
+    budget: &crate::budget::QueryBudget<'_>,
+) -> Result<bool> {
     for i in 0..=4 {
+        budget.charge(2)?;
         let w = f64::from(i) / 4.0;
         let (a, b) = if along_u {
             let v = domain.v_min() + (domain.v_max() - domain.v_min()) * w;
@@ -244,8 +264,8 @@ pub(crate) fn closes(k: &Kernel, s: &Surface, domain: &Extent2d, along_u: bool, 
         };
         match (s.evaluate_point(k, a), s.evaluate_point(k, b)) {
             (Ok(p), Ok(q)) if p.distance(q) <= tol => {}
-            _ => return false,
+            _ => return Ok(false),
         }
     }
-    true
+    Ok(true)
 }

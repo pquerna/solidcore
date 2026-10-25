@@ -28,6 +28,9 @@ pub enum MeshError {
     TooLarge,
     /// An index fell outside an array. A bug in this crate, reported instead of panicking.
     Internal,
+    /// The caller's control refused work, cancellation or buffer admission.
+    /// The caller retains the typed cause; this refusal is always terminal.
+    Stopped,
 }
 
 impl fmt::Display for MeshError {
@@ -40,6 +43,7 @@ impl fmt::Display for MeshError {
             Self::OpenCell { i, j } => write!(f, "boundary pieces in cell ({i}, {j}) do not close"),
             Self::TooLarge => write!(f, "more vertices than a u32 index can name"),
             Self::Internal => write!(f, "internal index error"),
+            Self::Stopped => write!(f, "caller control stopped the operation"),
         }
     }
 }

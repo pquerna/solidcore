@@ -37,14 +37,16 @@
 //! Library code never panics, unwraps or indexes: bad input comes back as a [`MeshError`].
 #![forbid(unsafe_code)]
 
+mod control;
 mod deviation;
 mod error;
 mod grid;
 mod surface;
 mod trim;
 
-pub use deviation::{deviation, Deviation};
+pub use control::MeshControl;
+pub use deviation::{deviation, deviation_with_control, Deviation};
 pub use error::MeshError;
-pub use grid::{grid_lines, Dir, GridLines};
+pub use grid::{grid_lines, grid_lines_with_control, Dir, GridLines};
 pub use surface::{NurbsSurface, SurfacePoint};
 pub use trim::{mesh_trimmed, LoopPoint, MeshOptions, TrimmedMesh};

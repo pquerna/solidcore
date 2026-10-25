@@ -3,10 +3,12 @@
 //! through its B-spline. It does no meshing: dense NURBS faces can go to the
 //! nurbs-grid-mesh backend ([`crate::backend`]).
 
+use crate::budget::QueryBudget;
 use solidcore::kernel::Kernel;
 use solidcore::math::{Point3, Vec3};
 use solidcore::nurbs::b_spline_surface::BSplineSurface;
 use solidcore::surface::surface::{Surface, SurfaceKind};
+use solidcore::Result;
 
 /// A B-spline surface as plain arrays: degrees, full knot vectors and homogeneous poles.
 #[derive(Debug, Clone)]
@@ -21,14 +23,17 @@ pub(crate) struct Nurbs {
     pw: Vec<[f64; 4]>,
 }
 
-fn expand(knots: &[f64], mult: &[usize]) -> Vec<f64> {
+fn expand(knots: &[f64], mult: &[usize], budget: &QueryBudget<'_>) -> Result<Vec<f64>> {
     let mut out = Vec::new();
     for (k, m) in knots.iter().zip(mult) {
+        budget.charge(1)?;
+        budget.reserve_vec(&mut out, *m)?;
         for _ in 0..*m {
+            budget.charge(1)?;
             out.push(*k);
         }
     }
-    out
+    Ok(out)
 }
 
 /// The B-spline a surface evaluates through, for the kinds whose point evaluation is
@@ -63,66 +68,125 @@ pub(crate) struct Canonical {
 /// The B-spline arrays of `s`, `None` for a surface evaluated otherwise or with
 /// inconsistent arrays. A surface of extrusion without its B-spline yet (a lazy
 /// generator, whose every evaluation makes one) gets it made once here.
-pub(crate) fn canonical_arrays(k: &Kernel, s: &Surface) -> Option<Canonical> {
-    let b = b_spline(s)?;
-    arrays(b).or_else(|| match s.kind() {
+pub(crate) fn canonical_arrays_with_budget(
+    k: &Kernel,
+    s: &Surface,
+    budget: &QueryBudget<'_>,
+) -> Result<Option<Canonical>> {
+    let Some(b) = b_spline(s) else {
+        return Ok(None);
+    };
+    if let Some(c) = arrays(b, budget)? {
+        return Ok(Some(c));
+    }
+    match s.kind() {
         SurfaceKind::SurfOfExtrusion(e) => {
+            // Kernel-owned cloning/generation is opaque and host-bounded. Do not
+            // represent it as an exact adapter allocation or a cancellable inner loop.
+            budget.charge(1)?;
             let mut e = (**e).clone();
-            e.make_nurb(k).ok()?;
-            arrays(e.base())
+            if e.make_nurb(k).is_err() {
+                budget.checkpoint()?;
+                return Ok(None);
+            }
+            budget.checkpoint()?;
+            arrays(e.base(), budget)
         }
-        _ => None,
-    })
+        _ => Ok(None),
+    }
 }
 
-/// The arrays of B-spline `b`, `None` when they are inconsistent.
-fn arrays(b: &BSplineSurface) -> Option<Canonical> {
-    let c = b.canonical().ok()?;
-    let uk = expand(&c.u_knots, &c.u_multiplicities);
-    let vk = expand(&c.v_knots, &c.v_multiplicities);
+/// Kernel canonical extraction owns opaque temporary allocations. Admit the known
+/// output cardinalities before crossing that boundary, then reconcile visible
+/// returned capacities before any adapter copying (with both owners coexisting).
+fn arrays(b: &BSplineSurface, budget: &QueryBudget<'_>) -> Result<Option<Canonical>> {
+    use crate::storage::vector_bytes;
+    use solidcore::nurbs::b_spline_surface::SurfParamType;
+    let knots = b
+        .number_natural_knots(SurfParamType::U)
+        .saturating_add(b.number_natural_knots(SurfParamType::V));
+    let poles = b
+        .number_control_points(SurfParamType::U)
+        .saturating_mul(b.number_control_points(SurfParamType::V));
+    budget.charge(
+        (knots as u64)
+            .saturating_add(poles as u64)
+            .saturating_add(1),
+    )?;
+    let expected = knots
+        .saturating_mul(size_of::<f64>() + size_of::<usize>())
+        .saturating_add(poles.saturating_mul(size_of::<Point3>() + size_of::<f64>()));
+    budget.admit(expected)?;
+    let Ok(c) = b.canonical() else {
+        budget.checkpoint()?;
+        return Ok(None);
+    };
+    budget.checkpoint()?;
+    let actual = vector_bytes(&c.u_knots)
+        .saturating_add(vector_bytes(&c.v_knots))
+        .saturating_add(vector_bytes(&c.u_multiplicities))
+        .saturating_add(vector_bytes(&c.v_multiplicities))
+        .saturating_add(vector_bytes(&c.control_points))
+        .saturating_add(vector_bytes(&c.weights));
+    if actual > expected {
+        budget.admit(actual - expected)?;
+    }
+    let uk = expand(&c.u_knots, &c.u_multiplicities, budget)?;
+    let vk = expand(&c.v_knots, &c.v_multiplicities, budget)?;
     let (p, q) = (c.u_degree, c.v_degree);
-    let nu = uk.len().checked_sub(p + 1)?;
-    let nv = vk.len().checked_sub(q + 1)?;
-    if nu == 0 || nv == 0 || c.control_points.len() != nu.checked_mul(nv)? {
-        return None;
+    let Some(nu) = p.checked_add(1).and_then(|n| uk.len().checked_sub(n)) else {
+        return Ok(None);
+    };
+    let Some(nv) = q.checked_add(1).and_then(|n| vk.len().checked_sub(n)) else {
+        return Ok(None);
+    };
+    if nu == 0 || nv == 0 || Some(c.control_points.len()) != nu.checked_mul(nv) {
+        return Ok(None);
     }
     let rational = c.weights.len() == c.control_points.len();
-    Some(Canonical {
+    let mut poles = Vec::new();
+    budget.reserve_vec(&mut poles, c.control_points.len())?;
+    for pt in &c.control_points {
+        budget.charge(1)?;
+        poles.push([pt.x, pt.y, pt.z]);
+    }
+    // Transfer the existing buffer, rather than allocating a second weights copy.
+    Ok(Some(Canonical {
         p,
         q,
         uk,
         vk,
         nu,
         nv,
-        poles: c
-            .control_points
-            .iter()
-            .map(|pt| [pt.x, pt.y, pt.z])
-            .collect(),
-        weights: rational.then(|| c.weights.clone()),
-    })
+        poles,
+        weights: rational.then_some(c.weights),
+    }))
 }
 
 impl Nurbs {
     /// The B-spline data of `s`, `None` for a surface evaluated otherwise or with
     /// inconsistent arrays.
-    pub(crate) fn from_surface(k: &Kernel, s: &Surface) -> Option<Self> {
-        let c = canonical_arrays(k, s)?;
-        let pw = c
-            .poles
-            .iter()
-            .enumerate()
-            .map(|(i, [x, y, z])| {
-                let w = c
-                    .weights
-                    .as_ref()
-                    .and_then(|w| w.get(i))
-                    .copied()
-                    .unwrap_or(1.0);
-                [x * w, y * w, z * w, w]
-            })
-            .collect();
-        Some(Self {
+    pub(crate) fn from_surface_with_budget(
+        k: &Kernel,
+        s: &Surface,
+        budget: &QueryBudget<'_>,
+    ) -> Result<Option<Self>> {
+        let Some(c) = canonical_arrays_with_budget(k, s, budget)? else {
+            return Ok(None);
+        };
+        let mut pw = Vec::new();
+        budget.reserve_vec(&mut pw, c.poles.len())?;
+        for (i, [x, y, z]) in c.poles.iter().enumerate() {
+            budget.charge(1)?;
+            let w = c
+                .weights
+                .as_ref()
+                .and_then(|w| w.get(i))
+                .copied()
+                .unwrap_or(1.0);
+            pw.push([x * w, y * w, z * w, w]);
+        }
+        Ok(Some(Self {
             p: c.p,
             q: c.q,
             uk: c.uk,
@@ -130,7 +194,37 @@ impl Nurbs {
             nu: c.nu,
             nv: c.nv,
             pw,
-        })
+        }))
+    }
+
+    pub(crate) fn retained_buffer_bytes(&self) -> usize {
+        crate::storage::vector_bytes(&self.uk)
+            .saturating_add(crate::storage::vector_bytes(&self.vk))
+            .saturating_add(crate::storage::vector_bytes(&self.pw))
+    }
+
+    pub(crate) fn knot_count(&self) -> usize {
+        self.uk.len().saturating_add(self.vk.len())
+    }
+
+    /// Basis evaluation is stack-only. Charge its source cardinalities before the
+    /// degree-limited recurrences and the (p+1)*(q+1) pole accumulation.
+    pub(crate) fn eval_with_budget(
+        &self,
+        u: f64,
+        v: f64,
+        budget: &QueryBudget<'_>,
+    ) -> Result<Option<(Point3, Vec3, Vec3)>> {
+        let p = self.p.min(MAX_BASIS) as u64;
+        let q = self.q.min(MAX_BASIS) as u64;
+        let work = p
+            .saturating_mul(p + 1)
+            .saturating_add(q.saturating_mul(q + 1))
+            .saturating_add((p + 1).saturating_mul(q + 1))
+            .saturating_add(u64::from(usize::BITS - self.uk.len().leading_zeros()))
+            .saturating_add(u64::from(usize::BITS - self.vk.len().leading_zeros()));
+        budget.charge(work)?;
+        Ok(self.eval(u, v))
     }
 
     /// Knot spans (of nonzero length) meeting `[lo, hi]` in u (`along_u`) or v.
@@ -305,6 +399,41 @@ fn basis(knots: &[f64], deg: usize, n: usize, t: f64) -> Option<Basis> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn coefficient_fixture() -> BSplineSurface {
+        use solidcore::nurbs::math::{CPoint, NOW};
+        let poles = vec![
+            vec![
+                CPoint::new(0.0, 0.0, 0.0, NOW),
+                CPoint::new(0.0, 1.0, 0.0, NOW),
+            ],
+            vec![
+                CPoint::new(1.0, 0.0, 0.0, NOW),
+                CPoint::new(1.0, 1.0, 0.0, NOW),
+            ],
+        ];
+        let knots = [0.0, 0.0, 1.0, 1.0];
+        BSplineSurface::from_data(1, 1, 1, 1, 3, 3, &poles, &knots, &knots).unwrap()
+    }
+
+    #[test]
+    fn extraction_limits_are_terminal_inside_knot_expansion() {
+        use crate::budget::QueryLimit;
+        use std::sync::atomic::AtomicBool;
+        let surface = coefficient_fixture();
+        let cancel = AtomicBool::new(false);
+        // The boundary charge is 13; this permits it and the first expansion
+        // charge, but refuses before the first expanded knot is copied.
+        let budget = QueryBudget::new(14, usize::MAX, &cancel);
+        assert!(arrays(&surface, &budget).is_err());
+        assert_eq!(budget.failure(), Some(QueryLimit::Work));
+        assert_eq!(budget.consumed(), 14);
+        assert!(budget.admitted_bytes() > 0);
+        let no_bytes = QueryBudget::new(u64::MAX, 0, &cancel);
+        assert!(arrays(&surface, &no_bytes).is_err());
+        assert_eq!(no_bytes.failure(), Some(QueryLimit::Bytes));
+        assert_eq!(no_bytes.admitted_bytes(), 0);
+    }
 
     #[test]
     fn basis_is_a_partition_of_unity_with_zero_sum_derivative() {

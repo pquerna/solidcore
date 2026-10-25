@@ -221,7 +221,7 @@ fn parse() -> Result<Args, String> {
 }
 
 /// Integrated B-rep volume (solids) and area, for comparison.
-fn reference(k: &Kernel, b: &Brep) -> (Option<f64>, Option<f64>) {
+fn reference(k: &Kernel, b: &mut Brep) -> (Option<f64>, Option<f64>) {
     let store = AttributeStore::new();
     let key = |_| ObjectKey(0);
     let attrs = PropertyAttributes {
@@ -329,7 +329,7 @@ fn main() -> Result<(), String> {
     let mut last: Option<(String, Mesh)> = None;
     for model in &a.models {
         let mut k = Kernel::default();
-        let b = match load(&mut k, model) {
+        let mut b = match load(&mut k, model) {
             Ok(b) => b,
             Err(e) => {
                 println!("{model}: not read: {e}");
@@ -340,7 +340,7 @@ fn main() -> Result<(), String> {
             let (vol, area) = if a.no_ref {
                 (None, None)
             } else {
-                reference(&k, &b)
+                reference(&k, &mut b)
             };
             for r in [1e-2, 1e-3, 1e-4] {
                 let mut o = a.opts.clone();
@@ -396,7 +396,7 @@ fn main() -> Result<(), String> {
             let (vol, area) = if a.no_ref {
                 (None, None)
             } else {
-                reference(&k, &b)
+                reference(&k, &mut b)
             };
             let mut nested = solidcore_mesh::Tessellator::new(&k, &b).map_err(|e| e.to_string())?;
             let mut ms = Vec::new();

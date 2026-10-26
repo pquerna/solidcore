@@ -89,6 +89,10 @@ pub struct Case {
     /// What this variant is.
     #[serde(default)]
     pub note: Option<String>,
+    /// Opt-in `Kernel::fixes` fields (`UpstreamFixes`) the case runs with, by field name
+    /// (none: pinned SMLib behaviour).
+    #[serde(default)]
+    pub fixes: Vec<String>,
     /// Run in order; each writes the body `id`.
     pub steps: Vec<Step>,
     /// Checked on the body `result`.
@@ -132,6 +136,20 @@ pub enum Step {
         radius: f64,
         /// Length along the axis.
         height: f64,
+    },
+    /// A copy (`SmApiBrepCopy`) of `body` turned about the line through `point` along `axis`, with
+    /// `SmApiRotate`.
+    Rotate {
+        /// Body written.
+        id: String,
+        /// Body turned (left as it is).
+        body: String,
+        /// A point on the axis.
+        point: P3,
+        /// Axis direction.
+        axis: P3,
+        /// Angle in degrees.
+        degrees: f64,
     },
     /// `SmApiBooleanUnion(a, b)`.
     Union {
@@ -530,6 +548,7 @@ impl Step {
             Self::Box { id, .. }
             | Self::Sphere { id, .. }
             | Self::Cylinder { id, .. }
+            | Self::Rotate { id, .. }
             | Self::Union { id, .. }
             | Self::Difference { id, .. }
             | Self::Intersection { id, .. }
@@ -562,6 +581,7 @@ impl Step {
             | Self::Intersection { a, b, .. } => vec![a, b],
             Self::Fillet { body, .. }
             | Self::OffsetFaces { body, .. }
+            | Self::Rotate { body, .. }
             | Self::Mirror { body, .. } => vec![body],
         }
     }
@@ -621,6 +641,12 @@ pub fn validate(case: &Case) -> Result<(), String> {
                     && radius.is_finite()
                     && height.is_finite()
             }
+            Step::Rotate {
+                point,
+                axis,
+                degrees,
+                ..
+            } => point.iter().chain(axis).all(|x| x.is_finite()) && degrees.is_finite(),
             Step::Difference {
                 pattern: Some(p), ..
             } => p.pitch.iter().flatten().all(|x| x.is_finite()),
@@ -803,11 +829,16 @@ fn solid(e: &SolidError) -> Run {
     }
 }
 
+/// The operand `id` for the next step. A plain [`Clone`] resets every geometry owner, and
+/// a B-rep cache made from the clone then holds no edge or face, so the boolean's ray
+/// fires found nothing and classified a nested operand's faces as outside (a void was
+/// lost). `clone_standing_for_self` keeps the owners, as upstream's move does.
 fn take(bodies: &BTreeMap<String, Brep>, id: &str) -> Result<Brep, Run> {
     bodies
         .get(id)
-        .cloned()
-        .ok_or_else(|| Run::Error(format!("no body `{id}`")))
+        .ok_or_else(|| Run::Error(format!("no body `{id}`")))?
+        .clone_standing_for_self()
+        .map_err(|e| solid(&e))
 }
 
 /// `SmApiBrepCopy(b)`: a copy that owns its geometry, so a later `SmApiTranslate`
@@ -935,6 +966,26 @@ fn step_rust(k: &mut Kernel, bodies: &mut BTreeMap<String, Brep>, step: &Step) -
             height,
             ..
         } => cylinder(k, *origin, *axis, *radius, *height)?,
+        Step::Rotate {
+            body,
+            point,
+            axis,
+            degrees,
+            ..
+        } => {
+            // A real copy (see `copy`): a plain clone would stay put when turned.
+            let source = take(bodies, body)?;
+            let mut turned = copy(k, &source, 1000 + bodies.len() as u64)?;
+            api_rotate(
+                k,
+                Some(TransformObject::Brep(&mut turned)),
+                p3(*point),
+                Vec3::new(axis[0], axis[1], axis[2]),
+                *degrees,
+            )
+            .map_err(|e| solid(&e))?;
+            turned
+        }
         Step::Union { a, b, .. } => {
             boolean::boolean_union(k, take(bodies, a)?, take(bodies, b)?).map_err(|e| solid(&e))?
         }
@@ -1226,9 +1277,26 @@ fn measure(k: &Kernel, b: &mut Brep) -> Result<Measured, SolidError> {
     })
 }
 
+/// Turns on the `UpstreamFixes` field `name` a case asks for.
+fn enable_fix(k: &mut Kernel, name: &str) -> Result<(), String> {
+    let field = match name {
+        "sweep_frame_on_planar_path_normal" => &mut k.fixes.sweep_frame_on_planar_path_normal,
+        "cover_refuses_folded_continuation" => &mut k.fixes.cover_refuses_folded_continuation,
+        "cone_parallel_line_midpoint" => &mut k.fixes.cone_parallel_line_midpoint,
+        _ => return Err(format!("unknown `fixes` entry `{name}`")),
+    };
+    *field = true;
+    Ok(())
+}
+
 /// Runs `case` on solidcore.
 pub fn run_rust(case: &Case) -> Run {
     let mut k = Kernel::default();
+    for fix in &case.fixes {
+        if let Err(msg) = enable_fix(&mut k, fix) {
+            return Run::Error(msg);
+        }
+    }
     let mut bodies = BTreeMap::new();
     for (n, step) in case.steps.iter().enumerate() {
         match step_rust(&mut k, &mut bodies, step) {
@@ -1506,6 +1574,7 @@ mod tests {
         for l in &cases {
             assert!(
                 l.id.starts_with("a52-")
+                    || l.id.starts_with("catics-")
                     || (l.file.issue.contains("/issues/") && l.file.pr.contains("/pull/")),
                 "{}",
                 l.id
@@ -1531,6 +1600,16 @@ mod tests {
             let (v, _) = verdict(&l.case.expect, &run);
             assert!(VERDICTS.contains(&v), "{}", l.id);
         }
+    }
+
+    #[test]
+    fn fixes_are_enabled_by_name() {
+        let mut k = Kernel::default();
+        enable_fix(&mut k, "sweep_frame_on_planar_path_normal").unwrap();
+        enable_fix(&mut k, "cover_refuses_folded_continuation").unwrap();
+        assert!(k.fixes.sweep_frame_on_planar_path_normal);
+        assert!(k.fixes.cover_refuses_folded_continuation);
+        assert!(enable_fix(&mut k, "no_such_fix").is_err());
     }
 
     #[test]
@@ -1724,6 +1803,7 @@ mod tests {
         let case = |steps: Vec<Step>| Case {
             name: "c".into(),
             note: None,
+            fixes: Vec::new(),
             steps,
             expect: Expect::default(),
         };

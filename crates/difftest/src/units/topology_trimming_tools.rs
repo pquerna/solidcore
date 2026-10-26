@@ -347,6 +347,12 @@ enum OpIn {
         list: bool,
         #[serde(default)]
         mirror: Option<(i64, u8)>,
+        /// Displace one UV trim's start in U (edge use selector, displacement).
+        #[serde(default)]
+        gap: Option<(i64, f64)>,
+        /// Explicit model tolerances (edge, vertex) for gap regressions.
+        #[serde(default)]
+        tolerances: Option<(f64, f64)>,
         /// Remove the selected edge use pair's exact UV trim before checking.
         #[serde(default)]
         project: Option<i64>,
@@ -718,11 +724,21 @@ fn encode(op: &OpIn) -> Result<(Op, String, Vec<f64>), HarnessError> {
             tol,
             list,
             mirror,
+            gap,
+            tolerances,
             project,
         } => {
             v = brep_block(brep)?;
             v.extend([*l as f64, *tol, flag(*list)]);
             push_mirror(&mut v, *mirror);
+            v.push(flag(gap.is_some()));
+            if let Some((eu, displacement)) = gap {
+                v.extend([*eu as f64, *displacement]);
+            }
+            v.push(flag(tolerances.is_some()));
+            if let Some((edge, vertex)) = tolerances {
+                v.extend([*edge, *vertex]);
+            }
             v.push(flag(project.is_some()));
             if let Some(eu) = project {
                 v.push(*eu as f64);
@@ -1664,6 +1680,61 @@ fn mirror_pre(
     Ok(())
 }
 
+// Endpoint edit used only to construct a small, measured trim gap on both sides.
+fn gap_pre(
+    k: &Kernel,
+    b: &mut Brep,
+    l: LoopId,
+    selector: i64,
+    displacement: f64,
+    o: &mut Vec<f64>,
+) -> Result<(), Fail> {
+    let eus = loop_eus(b, l)?;
+    if eus.is_empty() || selector < 0 {
+        o.push(-1.0);
+        return Ok(());
+    }
+    let eu = *eus
+        .get(selector as usize % eus.len())
+        .ok_or_else(|| harness("gap eu"))?;
+    let (curve, slot) = eu1::uv_trim_curve(b, eu).map_err(|e| fail(&e))?;
+    let (Some(curve), Some(slot)) = (curve, slot) else {
+        o.push(-1.0);
+        return Ok(());
+    };
+    if !matches!(curve.kind(), CurveKind::BSpline(_) | CurveKind::Line(_)) {
+        o.push(-1.0);
+        return Ok(());
+    }
+    let point = curve.evaluate_point(k, curve.natural_interval().min());
+    let result = match point {
+        Err(e) => Err(e),
+        Ok(mut point) => {
+            point.x += displacement;
+            let curve = b
+                .edgeuse_mut(slot)
+                .map_err(|e| fail(&e))?
+                .uv_trim_curve
+                .as_mut()
+                .ok_or_else(|| harness("gap curve"))?;
+            match curve.kind_mut() {
+                CurveKind::BSpline(c) => c.edit_end_point(point, true, None),
+                CurveKind::Line(c) => (|| {
+                    let mut base = c.base_with_nurb()?.into_owned();
+                    let r = base.edit_end_point(point, true, None);
+                    *c = Line::from_parts(base, c.line_point(), c.line_vector(),
+                        c.step_interval(), c.line_scale(), c.inside_out());
+                    r?;
+                    c.refresh_analytics()
+                })(),
+                _ => return Err(harness("gap curve changed kind").into()),
+            }
+        }
+    };
+    o.push(status(&result)?);
+    Ok(())
+}
+
 /// The shim's `tt_put_reports`.
 fn put_reports(o: &mut Vec<f64>, a: &AssertArray) {
     o.push(a.len() as f64);
@@ -1745,11 +1816,28 @@ fn run_rust_brep(k: &mut Kernel, b: &mut Brep, op: &OpIn) -> Result<Vec<f64>, Fa
             tol,
             list,
             mirror,
+            gap,
+            tolerances,
             project,
             ..
         } => {
             let l = lid(*l);
             mirror_pre(k, b, Some(l), *mirror, &mut o)?;
+            if let Some((eu, displacement)) = gap {
+                gap_pre(k, b, l, *eu, *displacement, &mut o)?;
+            }
+            if let Some((edge, vertex)) = tolerances {
+                for i in 0..b.edges().len() {
+                    b.edge_mut(solidcore::topology::EdgeId::from_index(i as u32))
+                        .map_err(|e| fail(&e))?
+                        .tolerance = *edge;
+                }
+                for i in 0..b.vertices().len() {
+                    b.vertex_mut(solidcore::topology::VertexId::from_index(i as u32))
+                        .map_err(|e| fail(&e))?
+                        .tolerance = *vertex;
+                }
+            }
             if let Some(selector) = project.filter(|_| ok_loop(b, l).unwrap_or(false)) {
                 let eus = loop_eus(b, l)?;
                 if let Some(&eu) = eus.get(selector as usize % eus.len().max(1)) {
@@ -2655,6 +2743,8 @@ fn gen_op(rng: &mut Rng) -> OpIn {
             eu: gen_sel(rng),
         },
         31 | 32 => OpIn::BCheckLoop {
+            gap: None,
+            tolerances: None,
             brep: gen_brep(rng),
             l: gen_sel(rng),
             tol: gen_tol(rng),

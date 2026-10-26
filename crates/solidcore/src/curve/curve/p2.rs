@@ -97,6 +97,10 @@
 //!   (`SM_NO_CONSTRUCTION`, `SM_NO_DESTRUCTION`) and the debug cache counter are
 //!   not modelled; [`notify`] is the `Notify` override for callers that keep the
 //!   curve's [`AObject`] state.
+//! - **Cache memo.** A [`Curve`] carries a memo of its curve cache (`CurveMemo`, see
+//!   `curve.curve_p5`), which upstream keeps in `SmCacheMgr`. `Clone` and the
+//!   evaluation copies share it; every `&mut` edit of the geometry (`kind_mut` and the
+//!   editing methods) starts an empty one.
 //! - **Arguments.** Out-params become return values; `SmContext` arguments only
 //!   choose where upstream allocates and are dropped, as are arguments upstream
 //!   marks `NotUsed` (`EvaluateSTEP`'s zone tolerance, `sm_TestStep`'s current
@@ -163,6 +167,7 @@ use crate::curve::composite_curve::CompositeCurve;
 use crate::curve::conic::Conic;
 use crate::curve::crv_in_volume::CrvInVolume;
 use crate::curve::crv_on_surf::CrvOnSurf;
+use crate::curve::curve::p5::CurveMemo;
 use crate::curve::ellipse::Ellipse;
 use crate::curve::hermite_curve::HermiteCurve;
 use crate::curve::hyperbola::Hyperbola;
@@ -183,7 +188,8 @@ use crate::geom::geom_utility::p1::{
     line_line_closest_point, point_project_to_plane, segment_point_angle_deg_to_perp,
 };
 use crate::geom::geom_utility::p2::{
-    evaluate_curve_continuity, frenet_from_derivatives, ContinuityType, CurveEval,
+    evaluate_curve_continuity_with, frenet_from_derivatives, ContinuityOptions, ContinuityType,
+    CurveEval,
 };
 use crate::geom::global_solver::{
     resolve_object_zone_tol_3d, Branch, GlobalSolve, GlobalSolver, ObjectZoneTol,
@@ -578,16 +584,20 @@ pub struct Curve {
     /// the object itself), issued by the context of the first notification that names
     /// it ([`IdentitySlot`]).
     notify_identity: IdentitySlot,
+    /// Not upstream: the memo of the curve's cache ([`CurveMemo`]), shared by clones
+    /// and emptied by every edit of the geometry.
+    memo: CurveMemo,
 }
 
 /// The copy constructor: copies the geometry, resets the owner (and the identity: a
-/// copy is another object).
+/// copy is another object). The copy shares the curve cache memo (same geometry).
 impl Clone for Curve {
     fn clone(&self) -> Self {
         Self {
             kind: self.kind.clone(),
             owner: None,
             notify_identity: IdentitySlot::new(),
+            memo: self.memo.share(),
         }
     }
 }
@@ -621,6 +631,7 @@ impl Curve {
             owner: self.owner,
             // an evaluation snapshot is never notified under the original's identity
             notify_identity: IdentitySlot::new(),
+            memo: self.memo.share(),
         }
     }
 }
@@ -768,6 +779,7 @@ impl Curve {
             kind,
             owner: self.owner,
             notify_identity: IdentitySlot::new(),
+            memo: self.memo.share(),
         })
     }
 
@@ -779,7 +791,25 @@ impl Curve {
             kind,
             owner: None,
             notify_identity: IdentitySlot::new(),
+            memo: CurveMemo::new(),
         }
+    }
+
+    /// A copy (as `Clone`) with an empty curve cache memo of its own: the curve a
+    /// cache keeps of its own, so a memo never holds itself.
+    #[must_use]
+    pub(crate) fn clone_detached(&self) -> Self {
+        Self {
+            kind: self.kind.clone(),
+            owner: None,
+            notify_identity: IdentitySlot::new(),
+            memo: CurveMemo::new(),
+        }
+    }
+
+    /// The curve cache memo (see [`CurveMemo`]).
+    pub(crate) const fn memo(&self) -> &CurveMemo {
+        &self.memo
     }
 
     /// The key this curve object is notified under, once a context has issued it one
@@ -803,6 +833,8 @@ impl Curve {
 
     /// The concrete kind, mutable.
     pub fn kind_mut(&mut self) -> &mut CurveKind {
+        // an edit makes another curve value: start an empty memo
+        self.memo = CurveMemo::new();
         &mut self.kind
     }
 
@@ -1243,6 +1275,51 @@ impl Curve {
         }
     }
 
+    /// [`Curve::evaluate`] into the caller's slice (`num_derivs = out.len() - 1`):
+    /// the entries the evaluation returns are written, the others are set to
+    /// [`Vec3::UNDEF`] (what [`at`] reads for a missing entry). The B-spline kinds
+    /// evaluate without a heap allocation ([`BSplineCurve::evaluate_into`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Curve::evaluate`]; `SM_ERR` for an empty `out`.
+    pub fn evaluate_into(
+        &self,
+        k: &Kernel,
+        t: f64,
+        from_left: bool,
+        non_zero_tangents: bool,
+        out: &mut [Vec3],
+    ) -> Result<()> {
+        let base = match &self.kind {
+            CurveKind::BSpline(c) => Some(c),
+            CurveKind::Hyperbola(c) => Some(c.base()),
+            CurveKind::Ellipse(c) => Some(c.base()),
+            CurveKind::Parabola(c) => Some(c.base()),
+            CurveKind::Composite(_)
+            | CurveKind::Hermite(_)
+            | CurveKind::Conic(_)
+            | CurveKind::Projected(_)
+            | CurveKind::Iso(_)
+            | CurveKind::Offset(_)
+            | CurveKind::CrvInVolume(_)
+            | CurveKind::CrvOnSurf(_)
+            | CurveKind::Line(_) => None,
+        };
+        if let Some(b) = base {
+            return b.evaluate_into(t, from_left, non_zero_tangents, out);
+        }
+        let num_derivs = out
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| SolidError::sm_err(OP_EVAL))?;
+        let pv = self.evaluate(k, t, num_derivs, from_left, non_zero_tangents)?;
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = at(&pv, i);
+        }
+        Ok(())
+    }
+
     /// The point at `t` (`EvaluatePoint`).
     ///
     /// # Errors
@@ -1523,6 +1600,7 @@ impl Curve {
     /// `SM_ERR` for kinds without the conversion; those of
     /// [`BSplineCurve::convert_to_2d`].
     pub fn convert_to_2d(&mut self, k: &Kernel) -> Result<()> {
+        self.memo = CurveMemo::new();
         match &mut self.kind {
             CurveKind::BSpline(c) => c.convert_to_2d(),
             CurveKind::Hyperbola(c) => c.base.convert_to_2d(),
@@ -1547,6 +1625,7 @@ impl Curve {
     /// `SM_ERR` for kinds without the edit; those of
     /// [`BSplineCurve::edit_parameterization`].
     pub fn edit_parameterization(&mut self, k: &Kernel, new_param: &Extent1d) -> Result<()> {
+        self.memo = CurveMemo::new();
         match &mut self.kind {
             CurveKind::BSpline(c) => c.edit_parameterization(new_param),
             CurveKind::Hyperbola(c) => c.base.edit_parameterization(new_param),
@@ -1576,6 +1655,7 @@ impl Curve {
         old_interval: &Extent1d,
     ) -> Result<Extent1d> {
         let owner = self.owner;
+        self.memo = CurveMemo::new();
         match &mut self.kind {
             CurveKind::BSpline(c) => c.reverse_parameterization(old_interval),
             CurveKind::Hyperbola(c) => c.reverse_parameterization(old_interval, owner),
@@ -1616,6 +1696,7 @@ impl Curve {
         scale: Option<Vec3>,
         depth: usize,
     ) -> Result<()> {
+        self.memo = CurveMemo::new();
         match &mut self.kind {
             CurveKind::Composite(c) => c.transform_at_depth(k, rotate_n_move, scale, depth),
             CurveKind::BSpline(c) => c.transform(rotate_n_move, scale),
@@ -1639,6 +1720,7 @@ impl Curve {
     ///
     /// `SM_ERR` for kinds without the edit; those of [`BSplineCurve::trim`].
     pub fn trim(&mut self, k: &Kernel, trim_interval: &mut Extent1d, mode: TrimMode) -> Result<()> {
+        self.memo = CurveMemo::new();
         match &mut self.kind {
             CurveKind::BSpline(c) => c.trim(k, trim_interval, mode),
             CurveKind::Hyperbola(c) => c.base.trim(k, trim_interval, mode),
@@ -2140,7 +2222,7 @@ pub struct CurveContinuity {
 ///
 /// # Errors
 ///
-/// Those of the evaluators and of [`evaluate_curve_continuity`].
+/// Those of the evaluators and of [`evaluate_curve_continuity_with`].
 pub fn evaluate_continuity<A, B>(
     k: &Kernel,
     this: &A,
@@ -2171,7 +2253,14 @@ where
         second: at(&right, 2),
         third: Some(at(&right, 3)),
     };
-    let continuity = evaluate_curve_continuity(&eval_left, &eval_right, continuity_angle_tol)?;
+    let continuity = evaluate_curve_continuity_with(
+        &eval_left,
+        &eval_right,
+        continuity_angle_tol,
+        &ContinuityOptions {
+            geometric_g2: k.fixes.geometric_g2_continuity,
+        },
+    )?;
 
     // set outputs
     Ok(CurveContinuity {

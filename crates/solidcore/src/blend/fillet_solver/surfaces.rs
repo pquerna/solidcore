@@ -17,7 +17,7 @@ use crate::kernel::Kernel;
 use crate::surface::surface::Surface;
 use crate::topology::{Brep, EdgeuseId};
 
-use super::p1::{FilletSolver, FilletSolverOps};
+use super::p1::{FilletSolver, FilletSolverOps, OffsetSurfaceSlot};
 
 struct GeometrySolver<'a> {
     actual: &'a mut ConstantRadiusAssistedFs,
@@ -179,6 +179,133 @@ pub(crate) fn rail_edgeuse_intersect(
         guess,
         tsect,
     )
+}
+
+struct BaseGeometrySolver<'a> {
+    solver: &'a mut FilletSolver,
+    geometry: &'a mut FilletGeom,
+}
+
+impl FilletSolverOps for BaseGeometrySolver<'_> {
+    fn solver(&self) -> &FilletSolver {
+        self.solver
+    }
+
+    fn solver_mut(&mut self) -> &mut FilletSolver {
+        self.solver
+    }
+
+    fn solver_surface(&self, rail: usize) -> Result<Option<&OffsetSurface>> {
+        let own = self.geometry.off_surfs.get(rail).ok_or_else(|| {
+            SolidError::invalid_input("blend::fillet_solver::surfaces", "rail index past 1")
+        })?;
+        if let Some(surface) = own {
+            return Ok(Some(surface));
+        }
+        if self.solver.fillet_geom_for_surfaces().is_some()
+            && self.geometry.fillet_solver().is_some()
+        {
+            return Err(SolidError::invalid_input(
+                "blend::fillet_solver::surfaces",
+                "geometry set for surfaces has no offset surface for rail (UB-204)",
+            ));
+        }
+        Ok(self.solver.surface(rail)?.map(|slot| &slot.surface))
+    }
+
+    fn solver_surface_mut(&mut self, rail: usize) -> Result<Option<&mut OffsetSurface>> {
+        let has_solver = self.geometry.fillet_solver().is_some();
+        let own = self.geometry.off_surfs.get_mut(rail).ok_or_else(|| {
+            SolidError::invalid_input("blend::fillet_solver::surfaces", "rail index past 1")
+        })?;
+        if let Some(surface) = own {
+            return Ok(Some(surface));
+        }
+        if self.solver.fillet_geom_for_surfaces().is_some() && has_solver {
+            return Err(SolidError::invalid_input(
+                "blend::fillet_solver::surfaces",
+                "geometry set for surfaces has no offset surface for rail (UB-204)",
+            ));
+        }
+        Ok(self.solver.surface_mut(rail)?.map(|slot| &mut slot.surface))
+    }
+}
+
+/// Run with a base [`FilletSolver`] and its selected geometry; no offset object moves.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn base_rail_edgeuse_intersect(
+    solver: &mut FilletSolver,
+    k: &Kernel,
+    geometry: &mut FilletGeom,
+    target: &mut Brep,
+    rail_index: usize,
+    edgeuse: EdgeuseId,
+    guess: f64,
+    tsect: &mut TsectPnt,
+) -> Result<Option<f64>> {
+    FilletSolver::rail_edgeuse_intersect(
+        &mut BaseGeometrySolver { solver, geometry },
+        k,
+        target,
+        rail_index,
+        edgeuse,
+        guess,
+        tsect,
+    )
+}
+
+/// The transient keys of the geometry's offset surfaces while a slot-reading solver
+/// holds them; they never leave [`slot_rail_edgeuse_intersect`].
+const SELECTED_KEYS: [u64; 2] = [u64::MAX - 1, u64::MAX];
+
+/// `SmFilletGeom::RailEdgeuseIntersect`'s call into `SmFilletSolver::RailEdgeuseIntersect`
+/// for a solver that reads its rails through its own slots (`SmVariableRadiusFS`,
+/// `SmConstantDistanceFS`) while `geometry` is its geometry for surfaces: every
+/// `GetSurface(rail)` then returns the geometry's offset surface. The geometry's offset
+/// surfaces are moved into the solver's slots for the call and moved back afterwards
+/// (also on error), with the solver's own surfaces and geometry for surfaces restored.
+/// A rail the geometry has no offset surface for has no surface during the call
+/// (upstream's `GetOffsetSurface` falls back to the solver's `GetSurface`, which asks
+/// the same geometry again without end: UB-204).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn slot_rail_edgeuse_intersect<S: FilletSolverOps>(
+    actual: &mut S,
+    k: &Kernel,
+    geometry: &mut FilletGeom,
+    target: &mut Brep,
+    rail_index: usize,
+    edgeuse: EdgeuseId,
+    guess: f64,
+    tsect: &mut TsectPnt,
+) -> Result<Option<f64>> {
+    let saved_geom = actual.solver().fillet_geom_for_surfaces();
+    let mut own: [Option<OffsetSurfaceSlot>; 2] = [None, None];
+    for ((slot, kept), (selected, key)) in actual
+        .solver_mut()
+        .surfaces
+        .iter_mut()
+        .zip(own.iter_mut())
+        .zip(geometry.off_surfs.iter_mut().zip(SELECTED_KEYS))
+    {
+        let selected = selected
+            .take()
+            .map(|surface| OffsetSurfaceSlot { key, surface });
+        *kept = std::mem::replace(slot, selected);
+    }
+    actual.solver_mut().set_fillet_geom_for_surfaces(None);
+    let result =
+        FilletSolver::rail_edgeuse_intersect(actual, k, target, rail_index, edgeuse, guess, tsect);
+    actual.solver_mut().set_fillet_geom_for_surfaces(saved_geom);
+    for ((slot, kept), selected) in actual
+        .solver_mut()
+        .surfaces
+        .iter_mut()
+        .zip(own.iter_mut())
+        .zip(geometry.off_surfs.iter_mut())
+    {
+        *selected = std::mem::replace(slot, kept.take()).map(|slot| slot.surface);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -358,5 +485,46 @@ mod tests {
                 .unwrap(),
             Point3::new(0.25, 0.75, 7.0)
         );
+    }
+
+    #[test]
+    fn base_solver_geometry_context_resolves_offsets_and_guards_ub_204() {
+        let k = Kernel::default();
+        let mut solver = FilletSolver::new(1e-5, 1e-3, 0.01);
+        let saved = Some(FilletGeomId(91));
+        solver.set_fillet_geom_for_surfaces(saved);
+
+        let mut pseudo = FilletBrep::new();
+        let g = pseudo.add_geom(geometry(&k));
+        let err = pseudo
+            .rail_edgeuse_intersect_with_geometry(
+                &k,
+                g,
+                &mut solver,
+                &mut Brep::new(),
+                0,
+                EdgeuseId::from_index(0),
+                0.5,
+                &mut TsectPnt::default(),
+            )
+            .unwrap_err();
+        assert!(!err.is_unported(), "{err:?}");
+        assert_eq!(solver.fillet_geom_for_surfaces(), saved);
+
+        pseudo.geom_mut(g).unwrap().off_surfs[1] = None;
+        let ub = pseudo
+            .rail_edgeuse_intersect_with_geometry(
+                &k,
+                g,
+                &mut solver,
+                &mut Brep::new(),
+                0,
+                EdgeuseId::from_index(0),
+                0.5,
+                &mut TsectPnt::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(ub, SolidError::InvalidInput { .. }), "{ub:?}");
+        assert_eq!(solver.fillet_geom_for_surfaces(), saved);
     }
 }

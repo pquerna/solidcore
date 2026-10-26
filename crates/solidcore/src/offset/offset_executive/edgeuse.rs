@@ -38,11 +38,8 @@ use crate::offset::offset_geometry_creation::{
 };
 use crate::query::edge::ClosestPoint;
 use crate::surface::surface::Surface;
-use crate::surface::surface_cache::face_context::{
-    FaceQueries, MappedCacheFace, PreparedFaceQueries,
-};
+use crate::surface::surface_cache::face_context::{FaceQueries, PreparedFaceQueries};
 use crate::surface::surface_cache::SurfaceCache;
-use crate::surface::trim_srf_cache::CacheFace;
 use crate::surface::volume::Volume;
 use crate::topology::edge::{self, NotifyEnv, SetCurveOptions};
 use crate::topology::edgeuse::{p1 as eu, p2 as eu2, p3 as eu3};
@@ -328,6 +325,60 @@ impl EdgeBrep<'_> {
         Ok(found)
     }
 
+    fn arena_of(&self, brep: &Brep) -> Option<Arena> {
+        if core::ptr::eq(brep, self.original) {
+            Some(Arena::Original)
+        } else if core::ptr::eq(brep, self.offset) {
+            Some(Arena::Offset)
+        } else {
+            None
+        }
+    }
+
+    fn entity_owner_ref(&self, arena: Arena, entity: EntityRef) -> Option<ObjectRef> {
+        let b = self.brep(arena);
+        let expected = (self.key_of(arena))(entity);
+        match entity {
+            EntityRef::Edge(edge) => {
+                let actual = b.edge(edge).ok()?.curve.as_ref().and_then(Curve::owner);
+                if actual == Some(expected) {
+                    return Some(expected);
+                }
+                if let Some(proven) = b.geometry_owner_key(entity) {
+                    if actual == Some(proven) {
+                        return Some(proven);
+                    }
+                }
+                if let Some(serial) = b.notify_serial() {
+                    let canonical = crate::topology::brep::p3::topology_ref(serial, entity);
+                    if actual == Some(canonical) {
+                        return Some(canonical);
+                    }
+                }
+                Some(b.geometry_owner_key(entity).unwrap_or(expected))
+            }
+            EntityRef::Face(face) => {
+                let actual = b.face(face).ok()?.surface.as_ref().and_then(Surface::owner);
+                if actual == Some(expected) {
+                    return Some(expected);
+                }
+                if let Some(proven) = b.geometry_owner_key(entity) {
+                    if actual == Some(proven) {
+                        return Some(proven);
+                    }
+                }
+                if let Some(serial) = b.notify_serial() {
+                    let canonical = crate::topology::brep::p3::topology_ref(serial, entity);
+                    if actual == Some(canonical) {
+                        return Some(canonical);
+                    }
+                }
+                Some(b.geometry_owner_key(entity).unwrap_or(expected))
+            }
+            _ => None,
+        }
+    }
+
     fn take_output(mut self, made: EdgeuseOffset<Handle>) -> Result<EdgeCap> {
         let surface = match made.surface {
             None => None,
@@ -384,6 +435,130 @@ impl ClassGeometry<Handle> for EdgeBrep<'_> {
     fn point(&self, _o: Handle) -> Option<Point3> {
         None
     }
+    fn classification_vertex_point(&self, o: Handle) -> Option<Point3> {
+        let (arena, v) = o.vertex().ok()?;
+        vertex::point(self.brep(arena), v).ok()
+    }
+    fn topology_zone_tol_3d(&self, o: Handle) -> Option<f64> {
+        let (arena, entity) = o.entity().ok()?;
+        let b = self.brep(arena);
+        match entity {
+            EntityRef::Vertex(v) => vertex::tolerance(b, v).ok(),
+            EntityRef::Edge(e) => edge::tolerance(b, e).ok(),
+            EntityRef::Face(f) => face2::tolerance(b, f).ok(),
+            EntityRef::Edgeuse(id) => eu::tolerance(b, id).ok(),
+            _ => None,
+        }
+    }
+    fn topology_entity(&self, o: Handle) -> Option<(&Brep, EntityRef)> {
+        let (arena, entity) = o.entity().ok()?;
+        Some((self.brep(arena), entity))
+    }
+    fn topology_handle_in(&self, brep: &Brep, entity: EntityRef) -> Option<Handle> {
+        Some(Handle::topology(self.arena_of(brep)?, entity))
+    }
+    fn brep_id(&self, brep: &Brep) -> Option<crate::topology::BrepId> {
+        let idx = match self.arena_of(brep)? {
+            Arena::Original => 0,
+            Arena::Offset => 1,
+        };
+        Some(crate::topology::BrepId::from_index(idx))
+    }
+    fn owner_entity(&self, owner: ObjectRef) -> Option<(&Brep, EntityRef)> {
+        if owner.type_code == edge::TYPE {
+            for arena in [Arena::Original, Arena::Offset] {
+                let b = self.brep(arena);
+                for e in b.edges().ids() {
+                    let entity = EntityRef::Edge(e);
+                    if self.entity_owner_ref(arena, entity) == Some(owner) {
+                        return Some((b, entity));
+                    }
+                }
+            }
+            let mut fallback = None;
+            for arena in [Arena::Original, Arena::Offset] {
+                let b = self.brep(arena);
+                for e in b.edges().ids() {
+                    let actual = b.edge(e).ok().and_then(|r| r.curve.as_ref()?.owner());
+                    if actual == Some(owner)
+                        && crate::topology::brep::p1::default_edge_owner(b, e) == owner
+                    {
+                        if fallback.is_some() {
+                            return None;
+                        }
+                        fallback = Some((b, EntityRef::Edge(e)));
+                    }
+                }
+            }
+            return fallback;
+        }
+        if owner.type_code == face2::TYPE {
+            for arena in [Arena::Original, Arena::Offset] {
+                let b = self.brep(arena);
+                for f in b.faces().ids() {
+                    let entity = EntityRef::Face(f);
+                    if self.entity_owner_ref(arena, entity) == Some(owner) {
+                        return Some((b, entity));
+                    }
+                }
+            }
+            let mut fallback = None;
+            for arena in [Arena::Original, Arena::Offset] {
+                let b = self.brep(arena);
+                for f in b.faces().ids() {
+                    let actual = b.face(f).ok().and_then(|r| r.surface.as_ref()?.owner());
+                    if actual == Some(owner)
+                        && crate::topology::brep::p1::default_face_owner(b, f) == owner
+                    {
+                        if fallback.is_some() {
+                            return None;
+                        }
+                        fallback = Some((b, EntityRef::Face(f)));
+                    }
+                }
+            }
+            return fallback;
+        }
+        None
+    }
+    fn owner_of(&self, owner: ObjectRef) -> Option<ObjectRef> {
+        if owner.type_code == eu::TYPE {
+            for arena in [Arena::Original, Arena::Offset] {
+                let b = self.brep(arena);
+                for id in b.edgeuses().ids() {
+                    let entity = EntityRef::Edgeuse(id);
+                    let matches_key = (self.key_of(arena))(entity) == owner
+                        || b.notify_serial().is_some_and(|s| {
+                            crate::topology::brep::p3::topology_ref(s, entity) == owner
+                        });
+                    if matches_key {
+                        let e = eu::edge(b, id).ok()??;
+                        return self.entity_owner_ref(arena, EntityRef::Edge(e));
+                    }
+                }
+            }
+            let mut fallback = None;
+            for arena in [Arena::Original, Arena::Offset] {
+                let b = self.brep(arena);
+                for id in b.edgeuses().ids() {
+                    let actual = b
+                        .edgeuse(id)
+                        .ok()
+                        .and_then(|r| r.uv_trim_curve.as_ref()?.owner());
+                    if actual == Some(owner) {
+                        let e = eu::edge(b, id).ok()??;
+                        let edge_owner = self.entity_owner_ref(arena, EntityRef::Edge(e))?;
+                        if fallback.is_some() {
+                            return None;
+                        }
+                        fallback = Some(edge_owner);
+                    }
+                }
+            }
+            return fallback;
+        }
+        None
+    }
 }
 
 impl ProtoGeometry<Handle> for EdgeBrep<'_> {
@@ -404,16 +579,6 @@ impl ProtoGeometry<Handle> for EdgeBrep<'_> {
 
 fn cache_handle(arena: Arena) -> impl Fn(EntityRef) -> Result<Handle> {
     move |entity| Ok(Handle::topology(arena, entity))
-}
-
-fn cache_entity(arena: Arena) -> impl Fn(Handle) -> Result<EntityRef> {
-    move |handle| match handle.entity()? {
-        (a, entity) if a == arena => Ok(entity),
-        _ => Err(SolidError::invalid_input(
-            OP,
-            "cache handle belongs to the other B-rep",
-        )),
-    }
 }
 
 impl FaceQueries<Handle> for EdgeBrep<'_> {
@@ -447,6 +612,23 @@ impl FaceQueries<Handle> for EdgeBrep<'_> {
         PreparedFaceQueries::new(self.brep(arena), f, &map)?
             .face_point_classify_fast_drop(k, face, uv, src_tol)
     }
+
+    fn curve_edge_tolerance(&self, curve: Handle) -> Option<Result<f64>> {
+        if let Object::EdgeCurve(arena, id) = curve.object {
+            Some(edge::tolerance(self.brep(arena), id))
+        } else {
+            let c = self.resolve_curve(curve.object)?;
+            let edge_ref = match c.edge(|r| self.owner_of(r)) {
+                Ok(Some(r)) => r,
+                Ok(None) => return None,
+                Err(e) => return Some(Err(e)),
+            };
+            let (b, EntityRef::Edge(id)) = self.owner_entity(edge_ref)? else {
+                return None;
+            };
+            Some(edge::tolerance(b, id))
+        }
+    }
 }
 
 impl OffsetBrep<Handle> for EdgeBrep<'_> {
@@ -456,10 +638,8 @@ impl OffsetBrep<Handle> for EdgeBrep<'_> {
         surface: &Surface,
         handle: Option<Handle>,
     ) -> Result<SurfaceCache<Handle>> {
-        use crate::query::face::p2::BrepCacheFace;
-        use crate::surface::surface::p1::{
-            get_surface_cache, make_surface_cache, make_trim_srf_cache_with_face,
-        };
+        use crate::query::face::p2::solve_surface_cache_of_face;
+        use crate::surface::surface::p1::{get_surface_cache, make_surface_cache};
         // the solve's GetTree: a reused cache whose tree is not built builds it now
         let with_tree = |mut cache: SurfaceCache<Handle>| {
             if cache.tree().is_none() {
@@ -489,27 +669,12 @@ impl OffsetBrep<Handle> for EdgeBrep<'_> {
                 "surface owner is not the selected B-rep face",
             ));
         }
+        // the surface's trimmed cache, kept with it as upstream keeps it (reused by
+        // later solves on the same surface)
         let map = cache_handle(arena);
-        let unmap = cache_entity(arena);
-        let mut context = MappedCacheFace::new(BrepCacheFace { b, f: face }, &map, &unmap)?;
-        match make_trim_srf_cache_with_face(k, surface, handle, &mut context) {
-            Ok(mut cache) => {
-                cache.bind_face(
-                    owner,
-                    Handle::topology(arena, EntityRef::Face(face)),
-                    context.zone_tol_3d(k, context.face())?,
-                )?;
-                if cache.base().tree().is_none() {
-                    cache.build_tree_with_face(k, &mut context)?;
-                }
-                Ok(cache.into_base())
-            }
-            Err(
-                e @ (SolidError::Unported { .. }
-                | SolidError::InvalidInput { .. }
-                | SolidError::NotFound { .. }),
-            ) => Err(e),
-            Err(_) => make_surface_cache(k, surface, handle),
+        match solve_surface_cache_of_face(k, b, face, owner, surface, handle, map)? {
+            Some(cache) => Ok(cache),
+            None => make_surface_cache(k, surface, handle),
         }
     }
 

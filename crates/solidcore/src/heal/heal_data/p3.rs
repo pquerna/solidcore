@@ -1274,7 +1274,6 @@ fn move_seam<O: LoopObject>(
                     ok_to_split: split,
                 },
                 Some(p),
-                &NoGeometry,
                 // (no new topology without split; a handle would be InvalidInput)
                 &|_| None,
             )
@@ -1282,13 +1281,36 @@ fn move_seam<O: LoopObject>(
     });
     (res.map(|_| ()), changes)
 }
+/// Classification geometry that resolves topology handles to the healed B-rep and
+/// nothing else: `HasDeadTopologyPointObject` only asks where a vertex, edge or face
+/// point classification's object lives (`SmBrep::IsLiveTopologyMember`).
+struct BrepTopology<'a>(&'a Brep);
+
+impl<O: LoopObject> ClassGeometry<O> for BrepTopology<'_> {
+    fn curve(&self, _: O) -> Option<&Curve> {
+        None
+    }
+    fn surface(&self, _: O) -> Option<&Surface> {
+        None
+    }
+    fn volume(&self, _: O) -> Option<&Volume> {
+        None
+    }
+    fn point(&self, _: O) -> Option<Point3> {
+        None
+    }
+    fn topology_entity(&self, o: O) -> Option<(&Brep, EntityRef)> {
+        o.as_topology().map(|e| (self.0, e))
+    }
+}
+
 fn classification_has_dead_topology<O: LoopObject>(
     b: &Brep,
     class: Option<&CurveClassification<O>>,
 ) -> Result<bool> {
     match class {
         None => Ok(false),
-        Some(class) => class.has_dead_topology_point_object(&NoGeometry, Some(b)),
+        Some(class) => class.has_dead_topology_point_object(&BrepTopology(b), Some(b)),
     }
 }
 fn classified_edges<O: LoopObject>(class: Option<&CurveClassification<O>>) -> Result<Vec<EdgeId>> {
@@ -1323,14 +1345,14 @@ fn merged_changes<O: LoopObject>(
 /// handles have no B-rep meaning here (as in [`merged_changes`]): a merge that makes
 /// topology is `InvalidInput` from the resolver, never an invented id.
 fn split_face_at_seam<O: LoopObject>(
-    k: &Kernel,
+    k: &mut Kernel,
     b: &mut Brep,
     f: FaceId,
     p: &mut FaceProps<O>,
 ) -> Result<(Vec<FaceId>, Changes)> {
     let problem = props_seam_problem(p);
     let split = with_classes(p, |cu, cv, p| {
-        fp1::split_at_seam(k, b, f, cu, cv, problem, Some(p), &NoGeometry, &|_| None)
+        fp1::split_at_seam(k, b, f, cu, cv, problem, Some(p), &|_| None)
     })?;
     let added = split
         .faces

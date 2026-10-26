@@ -39,6 +39,9 @@
 //! co-ported here.
 //!
 //! Deviations:
+//! - **Deleted gap edges (issue #432).** As tangency-labs/smlib be3fc10,
+//!   `FixGaps` unmates each deleted edge even when only one B-rep deletes an edge.
+//!   The pinned reference leaves that edge in the maps and later reads freed memory.
 //! - **Handles and B-reps** as in [`p1`](super::p1): objects are handles `O`, the
 //!   B-reps are read and edited through [`IntersectorBrep`] plus [`IntersectorBrepP2`]
 //!   (`SmVertex::GetEdges` / `GetFaces`, `SmBrep::GetFaces` /
@@ -57,7 +60,9 @@
 //!   Upstream's `IntersectInsertRelate` reports a failure of `ImprintIntersections`
 //!   and then overwrites its status with that of `SetRelationships`, so the boolean
 //!   goes on with both B-reps half imprinted (upstream: reads of freed vertex uses).
-//!   The port deletes the manager and returns the imprint's error.
+//!   The port deletes the manager and returns the imprint's error, unless every
+//!   failing imprint stopped before editing a B-rep (an edge definition without a
+//!   final vertex): the B-reps are then consistent and the port goes on as upstream.
 //! - **Statuses upstream ignores** (`SmBrep` edits whose status is unchecked,
 //!   `RemoveRelationship` in `DeleteFaces` / `FixGaps`, bounding boxes, `DropPoint`,
 //!   `SimpleCoincidenceChecker`, `CalculateUVDomainFromUVTrimCurves`, `Relate` in
@@ -766,21 +771,7 @@ impl<O: ClassObject + SolutionObject + Ord> TopologyIntersector<O> {
                     let deleted_other_edge =
                         brep.brep_combine_coincident_vertices(k, other, other_v2, other_v1)?;
                     ignore_soft(self.remove_relationship(Some(v1), Some(other_v1)))?;
-                    if let (Some(db), Some(dother)) = (deleted_brep_edge, deleted_other_edge) {
-                        // If these are not already a mated pair, then calling
-                        // RemoveRelationship() can leave the maps with different
-                        // sizes, and containing stale pointers.  [B460]
-                        if self.is_mated_pair(Some(db), Some(dother)) {
-                            ignore_soft(self.remove_relationship(Some(db), Some(dother)))?;
-                        } else {
-                            if let Some(mate) = self.other_mate(Some(db)) {
-                                ignore_soft(self.remove_relationship(Some(db), Some(mate)))?;
-                            }
-                            if let Some(mate) = self.brep_mate(Some(dother)) {
-                                ignore_soft(self.remove_relationship(Some(mate), Some(dother)))?;
-                            }
-                        }
-                    }
+                    self.forget_deleted_edge_relationships(deleted_brep_edge, deleted_other_edge)?;
                     out.modified_topology = true;
                     break; // V1 has gone away
                 }
@@ -788,6 +779,33 @@ impl<O: ClassObject + SolutionObject + Ord> TopologyIntersector<O> {
         }
 
         Ok(out)
+    }
+
+    /// Removes deleted edges from both mate maps without unpairing unrelated edges.
+    fn forget_deleted_edge_relationships(
+        &mut self,
+        deleted_brep_edge: Option<O>,
+        deleted_other_edge: Option<O>,
+    ) -> Result<()> {
+        if let (Some(db), Some(dother)) = (deleted_brep_edge, deleted_other_edge) {
+            if self.is_mated_pair(Some(db), Some(dother)) {
+                ignore_soft(self.remove_relationship(Some(db), Some(dother)))?;
+                return Ok(());
+            }
+        }
+        // SolidCraft change (issue #432): either combination may delete an edge
+        // independently. Only remove actual mates, keeping both maps in sync [B460].
+        if let Some(db) = deleted_brep_edge {
+            if let Some(mate) = self.other_mate(Some(db)) {
+                ignore_soft(self.remove_relationship(Some(db), Some(mate)))?;
+            }
+        }
+        if let Some(dother) = deleted_other_edge {
+            if let Some(mate) = self.brep_mate(Some(dother)) {
+                ignore_soft(self.remove_relationship(Some(mate), Some(dother)))?;
+            }
+        }
+        Ok(())
     }
 
     // ---- closing intersection loops (co-ported) ----------------------------------------
@@ -1133,9 +1151,10 @@ impl<O: ClassObject + SolutionObject + Ord> TopologyIntersector<O> {
     ///
     /// Those of the manager's construction, `IntersectTopology` and
     /// `ResolveIntersections` (the manager then stays installed, as upstream leaks
-    /// it); every error of the imprint, after deleting the manager (SolidCraft fix
-    /// af8db37: upstream goes on with the half-imprinted B-reps, UB-242, which
-    /// [`Kernel::note_upstream_ub`] records);
+    /// it); every error of the imprint that may have edited a B-rep, after deleting
+    /// the manager (SolidCraft fix af8db37: upstream goes on with the half-imprinted
+    /// B-reps, UB-242, which [`Kernel::note_upstream_ub`] records); an imprint failure
+    /// that edited nothing only warns, as upstream;
     /// [`SolidError::InvalidInput`] without both B-reps. Where the manager's
     /// destructor would read a freed proto edge upstream (UB-175) the port's defined
     /// teardown goes on and [`Kernel::note_upstream_ub`] records `"UB-175"`.
@@ -1178,11 +1197,25 @@ impl<O: ClassObject + SolutionObject + Ord> TopologyIntersector<O> {
         // Resolve Intersections; if that didn't work, quit before we mess up the Breps.
         deleted.extend(self.resolve_intersections(k, brep)?);
 
-        // Imprint Intersections, now we'll modify the Breps. If that didn't work, the
-        // Breps are partly imprinted and no longer consistent: stop here, so that no
-        // caller goes on to relate, classify or measure them (SolidCraft change,
-        // tangency-labs/smlib af8db37; upstream only warns and overwrites the status).
-        match self.imprint_intersections(k, brep) {
+        // Imprint Intersections, now we'll modify the Breps. If that didn't work and a
+        // failing imprint edited a Brep, the Breps are partly imprinted and no longer
+        // consistent: stop here, so that no caller goes on to relate, classify or
+        // measure them (SolidCraft change, tangency-labs/smlib af8db37; upstream only
+        // warns and overwrites the status). A failure that edited nothing (an edge
+        // definition without a final vertex) leaves the Breps consistent, and upstream
+        // goes on.
+        let outcome = self
+            .imprint_intersections_reporting_edits(k, brep)
+            .and_then(|o| {
+                if o.failure_edited {
+                    o.status.map(|()| o.deleted)
+                } else {
+                    // If that didn't work, inform the public (SE_MSG: the status is
+                    // overwritten below).
+                    Ok(o.deleted)
+                }
+            });
+        match outcome {
             Ok(d) => deleted.extend(d),
             Err(e) => {
                 if let Some(mut mgr) = self.proto_topo_mgr.take() {
@@ -2204,4 +2237,56 @@ fn teardown_reads_freed<O: ClassObject>(mgr: &ProtoTopologyManager<O>) -> bool {
     lists
         .iter()
         .any(|(_, l)| l.iter().any(|e| freed.contains(e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::solution_array::ObjectKind;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    struct Edge(u8);
+
+    impl ClassObject for Edge {
+        fn class_kind(&self) -> ClassObjectKind {
+            ClassObjectKind::Edge
+        }
+    }
+
+    impl SolutionObject for Edge {
+        fn kind(&self) -> ObjectKind {
+            ObjectKind::Edge
+        }
+    }
+
+    #[test]
+    fn squeezed_edges_leave_both_mate_maps_even_when_only_one_side_deletes() {
+        let pairs = [(Edge(0), Edge(1)), (Edge(2), Edge(3)), (Edge(4), Edge(5))];
+        for (deleted_primary, deleted_other, remaining) in [
+            (Some(Edge(0)), None, vec![pairs[1], pairs[2]]),
+            (None, Some(Edge(1)), vec![pairs[1], pairs[2]]),
+            (Some(Edge(0)), Some(Edge(1)), vec![pairs[1], pairs[2]]),
+            (Some(Edge(0)), Some(Edge(3)), vec![pairs[2]]),
+            (None, None, pairs.to_vec()),
+            (Some(Edge(6)), Some(Edge(7)), pairs.to_vec()),
+        ] {
+            let mut ti = TopologyIntersector::new(None, None, 1e-5, 0.1);
+            ti.seed_mates_for_test(&pairs);
+            ti.forget_deleted_edge_relationships(deleted_primary, deleted_other)
+                .unwrap();
+            assert_eq!(
+                ti.mapped_brep_objects(ClassObjectKind::Edge).unwrap(),
+                remaining.iter().map(|&(a, _)| a).collect::<Vec<_>>(),
+                "deleted {deleted_primary:?} / {deleted_other:?}"
+            );
+            for (primary, other) in pairs {
+                let kept = remaining.contains(&(primary, other));
+                assert_eq!(ti.other_mate(Some(primary)), kept.then_some(other));
+                assert_eq!(ti.brep_mate(Some(other)), kept.then_some(primary));
+            }
+            // Repeating cleanup is harmless; a deleted edge has no remaining mate.
+            ti.forget_deleted_edge_relationships(deleted_primary, deleted_other)
+                .unwrap();
+        }
+    }
 }

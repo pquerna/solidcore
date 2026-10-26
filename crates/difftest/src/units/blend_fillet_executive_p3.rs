@@ -178,6 +178,17 @@ impl ExecutiveAccess<Handle> for Access {
     fn corner_tangent_solver(&self, _: Handle, _: Handle) -> SolidResult<Option<Handle>> {
         missing()
     }
+    /// `SmFilletExecutive::CreateFilletCorners`, the ported
+    /// `FilletExecutive::create_fillet_corners`. The fixture names no vertices, so
+    /// its corner factory (`SmFilletCorner::Create`) rejects any it is asked for.
+    fn create_corners(
+        &mut self,
+        k: &mut Kernel,
+        executive: &mut FilletExecutive<Handle>,
+        error: Option<&mut ErrorInfo<Handle>>,
+    ) -> SolidResult<()> {
+        executive.create_fillet_corners(k, |_, _, _, _| missing(), error)
+    }
     // This empty-B-rep fixture has no face handles or intersector world. These
     // required adapters reject nonexistent objects; they are not UNPORTED calls
     // to the now-ported face p3, topology intersector p2, stitch p2, fillet geom p4
@@ -744,24 +755,8 @@ fn rust(input: &Inputs) -> Result<Output, HarnessError> {
         if !input.record.is_empty() {
             return Err(HarnessError::new("mixed fixture forms"));
         }
-        // These fixture constructors are the actual missing API entrypoints, not
-        // geometric passes or a replacement for direct p3 parity.
-        let symbol = match example {
-            // UNPORTED(blend.fillet_executive_p1): SmApiCircularFillet
-            0 => "SmApiCircularFillet",
-            // UNPORTED(blend.fillet_executive_p1): SmApiChamferFillet
-            1 => "SmApiChamferFillet",
-            // UNPORTED(blend.fillet_executive_p1): SmApiFilletEdges
-            2 => "SmApiFilletEdges",
-            // UNPORTED(blend.fillet_executive_p1): SmApiFilletEdgesPerEdge
-            3 => "SmApiFilletEdgesPerEdge",
-            // UNPORTED(blend.fillet_executive_p1): SmApiVariableRadiusFillet
-            4 => "SmApiVariableRadiusFillet",
-            // UNPORTED(blend.fillet_executive_p1): SmApiSetBevelCorners
-            5 | 6 => "SmApiSetBevelCorners",
-            _ => return Err(HarnessError::new("unknown upstream fixture")),
-        };
-        return Ok(Output::deferred("blend.fillet_executive_p1", symbol));
+        return end_to_end::upstream_example(example)?
+            .ok_or_else(|| HarnessError::new("unknown upstream fixture"));
     }
     ffi::validate(&input.record).map_err(|e| HarnessError::new(e.to_string()))?;
     let [op, has_target, initialized, prior_boolean, editing, want_error, seed_code, tolerance, piecewise, insertion, global, trimming, classification] =

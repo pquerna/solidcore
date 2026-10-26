@@ -30,6 +30,7 @@ dependencies = [
  "solidcore-ffi",
  "solidcore-ssi",
  "ssi",
+ "step-import",
  "toml",
 ]
 
@@ -199,6 +200,7 @@ version = "0.1.0"
 dependencies = [
  "cc",
  "serde_json",
+ "step-import",
 ]
 
 [[package]]
@@ -211,6 +213,25 @@ dependencies = [
 
 [[package]]
 name = "ssi"
+version = "0.1.0"
+
+[[package]]
+name = "step-brep"
+version = "0.1.0"
+dependencies = [
+ "solidcore",
+ "step-import",
+]
+
+[[package]]
+name = "step-export"
+version = "0.1.0"
+dependencies = [
+ "step-import",
+]
+
+[[package]]
+name = "step-import"
 version = "0.1.0"
 
 [[package]]

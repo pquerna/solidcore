@@ -39,6 +39,9 @@
 //!   cache store and is dropped whenever the curve changes. The curve's handle in
 //!   the caller's object space (`O`, see [`crate::geom::tree`]) is optional and is
 //!   what the tree reports as its owner object.
+//! - **Handle space.** `CurveCache::retag` (not upstream) copies a cache into
+//!   another handle space; the memo of `curve.curve_p5` (`make_curve_cache`) keeps one
+//!   handle-free cache per curve value and hands each caller such a copy.
 //! - **Memory managers.** `m_sBezMgr` / `m_sParentMgr` are `Vec`s; the NLib Bezier
 //!   blocks (`sSegmentBeziersMgr`, `sBezStack`, the working Bezier) are owned
 //!   [`Nurb`] values and a `Vec` used as the split stack (same push/pop order). The
@@ -355,6 +358,28 @@ impl<O: Copy + PartialEq> CurveCache<O> {
             parents: Vec::new(),
             opts,
         }
+    }
+
+    /// This cache in another handle space, naming the curve `handle` (not upstream; see
+    /// [`crate::curve::curve::p5::make_curve_cache`]): what a build with `handle` gives,
+    /// since the handle is only stored. `None` when the tree names other objects.
+    pub(crate) fn retag<P: Copy + PartialEq>(&self, handle: Option<P>) -> Option<CurveCache<P>> {
+        let tree = match &self.tree {
+            Some(t) => Some(t.retag_curve_tree(handle)?),
+            None => None,
+        };
+        Some(CurveCache {
+            curve: self.curve.clone_detached(),
+            curve_handle: handle,
+            interval: self.interval,
+            tree,
+            continuities: self.continuities.clone(),
+            tried_analytic: self.tried_analytic,
+            analytic: self.analytic.as_ref().map(Curve::clone_detached),
+            spans: self.spans.clone(),
+            parents: self.parents.clone(),
+            opts: self.opts,
+        })
     }
 
     /// Sets the handle of the cached curve, reported as the owner object of the
@@ -1538,8 +1563,10 @@ impl EvalFunction for FindCurveDistanceExtrema<'_> {
         out.f_prime = 0.0;
         out.found_answer = false;
 
-        let pv1 = self.curve1.evaluate(k, t, 2, true, true)?;
-        let pv2 = self.curve2.evaluate(k, t, 2, true, true)?;
+        let mut pv1 = [Vec3::ZERO; 3];
+        let mut pv2 = [Vec3::ZERO; 3];
+        self.curve1.evaluate_into(k, t, true, true, &mut pv1)?;
+        self.curve2.evaluate_into(k, t, true, true, &mut pv2)?;
         let (a0, a1, a2) = (at(&pv1, 0), at(&pv1, 1), at(&pv1, 2));
         let (b0, b1, b2) = (at(&pv2, 0), at(&pv2, 1), at(&pv2, 2));
 

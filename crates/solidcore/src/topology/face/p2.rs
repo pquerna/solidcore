@@ -58,17 +58,14 @@
 //!   leaves the caller's default point ([`Point2::UNDEF`]); a failed `DropPoint` is
 //!   no drop point; a failed evaluation keeps the previous value (initially
 //!   [`Vec3::UNDEF`]).
-//! - **`sm_FixUVTrimCurves` does not trim and re-stretch the UV trim curves by default**
-//!   (tangency-labs/solidcore#570, the fix of tangency-labs/smlib@5af7070). Upstream
-//!   drops the vertex's UV point onto each of the two curves, `Trim`s the curve there
-//!   and `EditParameterization`s it back over its old interval before moving the end
-//!   point. The stretch moves every interior parameter of the trim off its edge's by
-//!   the trimmed length (a 1e-6 corner gap left a thread edge's trim 5e-5 off its
-//!   edge, tolerance 1e-5), and any point classification builds the trim cache that
-//!   runs it. By default only the end control points move here, by the UV gap
-//!   (`plan/upstream-issues.md` WR-255); [`crate::geom::context::Context::set_trim_uv_curves_at_corner_drops`]
-//!   re-enables the pinned-`c9c5979` `DropPoint` + `Trim` + `EditParameterization`
-//!   stretch where a difftest compares against the unmodified C++ reference.
+//! - **`sm_FixUVTrimCurves` opt-in fix** (WR-255, tangency-labs/solidcore#959/#570, the
+//!   fork's tangency-labs/smlib@5af7070). Upstream drops the vertex's UV point onto
+//!   each of the two curves, `Trim`s the curve there and `EditParameterization`s it back
+//!   over its old interval before moving the end point. The stretch moves every interior
+//!   parameter of the trim off its edge's by the trimmed length (a 1e-6 corner gap left a
+//!   thread edge's trim 5e-5 off its edge, tolerance 1e-5). That is the default here, as
+//!   upstream; with [`UpstreamFixes::uv_trim_corner_end_points_only`](crate::kernel::UpstreamFixes::uv_trim_corner_end_points_only)
+//!   only the end control points move, by the UV gap.
 //! - **Edit notifications.** [`fix_uv_trim_curves_notified`] notifies its two
 //!   `EditEndPoint`s (`SM_NO_PRE_EDIT` / `SM_NO_POST_EDIT`, caller and first data
 //!   object the UV trim curve under its kernel-issued identity) through the caller's
@@ -109,6 +106,12 @@
 //!   the B-rep stays there.
 //! - **`CreateCurvesByTrimming`** drops its unused `bForceUVClassify` argument; the
 //!   output arrays are asked for with `want_3d` / `want_uv`.
+//! - **`CalculateAnInternalPoint` / `CreateCurvesByTrimming`** take the B-rep mutably:
+//!   their classifications run on it in place, so what upstream's `const` queries leave
+//!   on the B-rep stays there. Callers that hold only `&Brep` (the topology solver's
+//!   face silhouettes, `sm_CountContainedSamples`) use the crate-private `_snapshot`
+//!   entries, which classify on a private copy and drop those edits (temporary; see
+//!   `query::face::p2`).
 //! - **Unported callees.** `SmCurveClassification::ReSet` in the constructor of a curve
 //!   (`intersect.curve_class_p2`; `SmFace::CurveOnClassify` follows it), the face member
 //!   `GetUpwardFaceuse` of an opaque handle in `SmCurveInterval::GetIvlBound_EdgeuseObj`,
@@ -130,6 +133,7 @@ use crate::geom::tol::{are_same, zone_tol3d};
 use crate::geom::vector2d::{Point2, Vec2};
 use crate::intersect::curve_class::p1::{CurveClassification, CurveInterval};
 use crate::intersect::curve_class::p4::ClassificationInit;
+use crate::intersect::curve_class::p5::ClassGeometryMut;
 use crate::intersect::point_class::{ClassGeometry, ClassObject, ClassObjectKind, PointClassType};
 use crate::kernel::Kernel;
 use crate::math::{Point3, Vec3, BIG_DOUBLE, EFF_ZERO, EFF_ZERO_SQ};
@@ -139,7 +143,8 @@ use crate::nurbs::b_spline_surface::p1::SurfParamType;
 use crate::nurbs::b_spline_surface_n_lib::p2::{EvaluateFlags, OrientType};
 use crate::nurbs::knots::Side;
 use crate::query::face::p2::{
-    curve_on_classify_cached, CurveOnClassifyCache, CurveOnClassifyObjects,
+    curve_on_classify_cached, curve_on_classify_mut, CurveOnClassifyBrep, CurveOnClassifyCache,
+    CurveOnClassifyObjects, FaceBrep,
 };
 use crate::query::face::p3 as qf3;
 use crate::surface::offset_surface::{OffsetSurface, SS_UNKNOWN};
@@ -412,17 +417,18 @@ impl ClassObject for UvLineHandle {
 
 /// The UV line `sm_FaceClassifyUVLine` made last (`sCurveClassification.GetCurve()`),
 /// and the face `f` of `b` whose objects the other handles name.
-pub(crate) struct UvLineObjects<'a> {
-    b: &'a Brep,
+pub(crate) struct UvLineObjects<B> {
+    b: B,
     f: FaceId,
     line: Option<Curve>,
     resolve_topology: bool,
 }
 
-impl<'a> UvLineObjects<'a> {
-    /// The objects of face `f` of `b`, before `sm_FaceClassifyUVLine` makes its line
-    /// (also used by `topology::face::p4`'s `GlobalLineIntersect`).
-    pub(crate) const fn new(b: &'a Brep, f: FaceId) -> Self {
+impl<B> UvLineObjects<B> {
+    /// The objects of face `f` of `b` (`&Brep`, or `&mut Brep` to classify in place),
+    /// before `sm_FaceClassifyUVLine` makes its line (also used by
+    /// `topology::face::p4`'s `GlobalLineIntersect`).
+    pub(crate) const fn new(b: B, f: FaceId) -> Self {
         Self {
             b,
             f,
@@ -432,18 +438,18 @@ impl<'a> UvLineObjects<'a> {
     }
 }
 
-impl ClassGeometry<UvLineHandle> for UvLineObjects<'_> {
+impl<B: FaceBrep> ClassGeometry<UvLineHandle> for UvLineObjects<B> {
     fn curve(&self, o: UvLineHandle) -> Option<&Curve> {
         match o {
             UvLineHandle::Line => self.line.as_ref(),
-            UvLineHandle::EdgeCurve(e) => self.b.edge(e).ok()?.curve.as_ref(),
-            UvLineHandle::Trim(eu) => eu1::uv_trim_curve(self.b, eu).ok()?.0,
+            UvLineHandle::EdgeCurve(e) => self.b.brep().edge(e).ok()?.curve.as_ref(),
+            UvLineHandle::Trim(eu) => eu1::uv_trim_curve(self.b.brep(), eu).ok()?.0,
             _ => None,
         }
     }
     fn surface(&self, o: UvLineHandle) -> Option<&Surface> {
         match o {
-            UvLineHandle::Surface => self.b.face(self.f).ok()?.surface.as_ref(),
+            UvLineHandle::Surface => self.b.brep().face(self.f).ok()?.surface.as_ref(),
             _ => None,
         }
     }
@@ -455,15 +461,15 @@ impl ClassGeometry<UvLineHandle> for UvLineObjects<'_> {
     }
     fn classification_vertex_point(&self, o: UvLineHandle) -> Option<Point3> {
         match o {
-            UvLineHandle::Vertex(v) => self.b.vertex(v).ok().map(|v| v.point),
+            UvLineHandle::Vertex(v) => self.b.brep().vertex(v).ok().map(|v| v.point),
             _ => None,
         }
     }
     fn topology_zone_tol_3d(&self, o: UvLineHandle) -> Option<f64> {
         match o {
-            UvLineHandle::Vertex(v) => self.b.vertex(v).ok().map(|v| v.tolerance),
-            UvLineHandle::Edge(e) => self.b.edge(e).ok().map(|e| e.tolerance),
-            UvLineHandle::Face => self.b.face(self.f).ok().map(|f| f.tolerance),
+            UvLineHandle::Vertex(v) => self.b.brep().vertex(v).ok().map(|v| v.tolerance),
+            UvLineHandle::Edge(e) => self.b.brep().edge(e).ok().map(|e| e.tolerance),
+            UvLineHandle::Face => self.b.brep().face(self.f).ok().map(|f| f.tolerance),
             _ => None,
         }
     }
@@ -482,7 +488,7 @@ impl ClassGeometry<UvLineHandle> for UvLineObjects<'_> {
             | UvLineHandle::EdgeCurve(_)
             | UvLineHandle::Trim(_) => return None,
         };
-        Some((self.b, e))
+        Some((self.b.brep(), e))
     }
     fn topology_handle(&self, e: EntityRef) -> Option<UvLineHandle> {
         if !self.resolve_topology {
@@ -499,7 +505,7 @@ impl ClassGeometry<UvLineHandle> for UvLineObjects<'_> {
     }
 }
 
-impl CurveOnClassifyObjects<UvLineHandle> for UvLineObjects<'_> {
+impl<B: FaceBrep> CurveOnClassifyObjects<UvLineHandle> for UvLineObjects<B> {
     fn face(&self, _f: FaceId) -> UvLineHandle {
         UvLineHandle::Face
     }
@@ -530,7 +536,7 @@ impl CurveOnClassifyObjects<UvLineHandle> for UvLineObjects<'_> {
     }
 }
 
-impl qf3::ClassifyCurveObjects<UvLineHandle> for UvLineObjects<'_> {
+impl<B: FaceBrep> qf3::ClassifyCurveObjects<UvLineHandle> for UvLineObjects<B> {
     fn set_classify_curves(
         &mut self,
         curve: Curve,
@@ -538,6 +544,29 @@ impl qf3::ClassifyCurveObjects<UvLineHandle> for UvLineObjects<'_> {
     ) -> Result<(UvLineHandle, Option<UvLineHandle>)> {
         self.line = Some(curve);
         Ok((UvLineHandle::Line, None))
+    }
+}
+
+impl ClassGeometryMut<UvLineHandle> for UvLineObjects<&mut Brep> {
+    fn curve_mut(&mut self, _o: UvLineHandle) -> Option<&mut Curve> {
+        // ClassifyFaceInterval does not edit the classified line
+        None
+    }
+    fn topology_entity_mut(&mut self, o: UvLineHandle) -> Option<(&mut Brep, EntityRef)> {
+        let (_, e) = self.topology_entity(o)?;
+        Some((&mut *self.b, e))
+    }
+}
+
+impl<B: FaceBrep> FaceBrep for UvLineObjects<B> {
+    fn brep(&self) -> &Brep {
+        self.b.brep()
+    }
+}
+
+impl CurveOnClassifyBrep<UvLineHandle> for UvLineObjects<&mut Brep> {
+    fn brep_mut(&mut self) -> &mut Brep {
+        self.b
     }
 }
 
@@ -586,15 +615,19 @@ impl ClassObject for ClassHandle {
     }
 }
 
-/// The objects behind the [`ClassHandle`]s of one `CurveOnClassify` call.
-struct FaceClassifyObjects<'c> {
+/// The objects behind the [`ClassHandle`]s of one `CurveOnClassify` call over the
+/// face's B-rep `B` (`&Brep` for the snapshot entry, `&mut Brep` to classify in place).
+struct FaceClassify<'c, B> {
     /// The B-rep of the face.
-    brep: &'c Brep,
+    brep: B,
     /// The classified curve.
     curve: &'c Curve,
 }
 
-impl CurveOnClassifyObjects<ClassHandle> for FaceClassifyObjects<'_> {
+/// [`FaceClassify`] over a shared B-rep (the `curve_on_classify_cached` snapshot entry).
+type FaceClassifyObjects<'c> = FaceClassify<'c, &'c Brep>;
+
+impl<B: FaceBrep> CurveOnClassifyObjects<ClassHandle> for FaceClassify<'_, B> {
     fn face(&self, f: FaceId) -> ClassHandle {
         ClassHandle::Face(f)
     }
@@ -603,6 +636,7 @@ impl CurveOnClassifyObjects<ClassHandle> for FaceClassifyObjects<'_> {
     }
     fn face_surface(&self, f: FaceId) -> Option<ClassHandle> {
         self.brep
+            .brep()
             .face(f)
             .ok()
             .and_then(|r| r.surface.as_ref())
@@ -631,32 +665,37 @@ impl CurveOnClassifyObjects<ClassHandle> for FaceClassifyObjects<'_> {
     }
 }
 
-impl ClassGeometry<ClassHandle> for FaceClassifyObjects<'_> {
+impl<B: FaceBrep> ClassGeometry<ClassHandle> for FaceClassify<'_, B> {
     fn classification_vertex_point(&self, o: ClassHandle) -> Option<Point3> {
         match o {
-            ClassHandle::Vertex(v) => self.brep.vertex(v).ok().map(|v| v.point),
+            ClassHandle::Vertex(v) => self.brep.brep().vertex(v).ok().map(|v| v.point),
             _ => None,
         }
     }
     fn topology_zone_tol_3d(&self, o: ClassHandle) -> Option<f64> {
         match o {
-            ClassHandle::Vertex(v) => self.brep.vertex(v).ok().map(|v| v.tolerance),
-            ClassHandle::Face(f) => self.brep.face(f).ok().map(|f| f.tolerance),
-            ClassHandle::Edge(e) => self.brep.edge(e).ok().map(|e| e.tolerance),
+            ClassHandle::Vertex(v) => self.brep.brep().vertex(v).ok().map(|v| v.tolerance),
+            ClassHandle::Face(f) => self.brep.brep().face(f).ok().map(|f| f.tolerance),
+            ClassHandle::Edge(e) => self.brep.brep().edge(e).ok().map(|e| e.tolerance),
             _ => None,
         }
     }
     fn curve(&self, o: ClassHandle) -> Option<&Curve> {
         match o {
             ClassHandle::Curve => Some(self.curve),
-            ClassHandle::EdgeCurve(e) => self.brep.edge(e).ok()?.curve.as_ref(),
-            ClassHandle::Trim(eu) => eu1::uv_trim_curve(self.brep, eu).ok()?.0,
+            ClassHandle::EdgeCurve(e) => self.brep.brep().edge(e).ok()?.curve.as_ref(),
+            ClassHandle::Trim(eu) => eu1::uv_trim_curve(self.brep.brep(), eu).ok()?.0,
             _ => None,
         }
     }
     fn surface(&self, o: ClassHandle) -> Option<&Surface> {
         match o {
-            ClassHandle::Surface(f) => self.brep.face(f).ok().and_then(|r| r.surface.as_ref()),
+            ClassHandle::Surface(f) => self
+                .brep
+                .brep()
+                .face(f)
+                .ok()
+                .and_then(|r| r.surface.as_ref()),
             _ => None,
         }
     }
@@ -680,7 +719,7 @@ impl ClassGeometry<ClassHandle> for FaceClassifyObjects<'_> {
             | ClassHandle::Trim(_)
             | ClassHandle::Curve => return None,
         };
-        Some((self.brep, e))
+        Some((self.brep.brep(), e))
     }
     fn topology_handle(&self, e: EntityRef) -> Option<ClassHandle> {
         match e {
@@ -693,6 +732,30 @@ impl ClassGeometry<ClassHandle> for FaceClassifyObjects<'_> {
             EntityRef::Vertexuse(vu) => Some(ClassHandle::Vertexuse(vu)),
             _ => None,
         }
+    }
+}
+
+impl ClassGeometryMut<ClassHandle> for FaceClassify<'_, &mut Brep> {
+    fn curve_mut(&mut self, _o: ClassHandle) -> Option<&mut Curve> {
+        // the classified curve is the caller's (read-only); ClassifyFaceInterval does
+        // not edit it
+        None
+    }
+    fn topology_entity_mut(&mut self, o: ClassHandle) -> Option<(&mut Brep, EntityRef)> {
+        let (_, e) = self.topology_entity(o)?;
+        Some((&mut *self.brep, e))
+    }
+}
+
+impl<B: FaceBrep> FaceBrep for FaceClassify<'_, B> {
+    fn brep(&self) -> &Brep {
+        self.brep.brep()
+    }
+}
+
+impl CurveOnClassifyBrep<ClassHandle> for FaceClassify<'_, &mut Brep> {
+    fn brep_mut(&mut self) -> &mut Brep {
+        self.brep
     }
 }
 
@@ -714,9 +777,10 @@ fn classify_curve_on_face(
     classify_curve_on_face_cached(k, b, f, curve, with_uv_curve, tol, data_size, &mut cache)
 }
 
-/// [`classify_curve_on_face`] on the caller's B-rep: the UV trim curves (with their
-/// edge tolerance growth) and gap caches the classification makes stay on `b`, as
-/// upstream's `const` `CurveOnClassify` leaves them.
+/// [`classify_curve_on_face`] on the caller's B-rep in place
+/// ([`curve_on_classify_mut`]): the UV trim curves (with their edge tolerance growth),
+/// gap caches and trimmed surface cache the classification makes stay on `b`, as
+/// upstream's `const` `CurveOnClassify` leaves them, also when it fails.
 fn classify_curve_on_face_in_place(
     k: &Kernel,
     b: &mut Brep,
@@ -724,12 +788,50 @@ fn classify_curve_on_face_in_place(
     curve: &Curve,
     with_uv_curve: bool,
     tol: f64,
+    data_size: usize,
 ) -> Result<Vec<CurveInterval<ClassHandle>>> {
-    let mut cache = CurveOnClassifyCache::default();
-    let intervals =
-        classify_curve_on_face_cached(k, b, f, curve, with_uv_curve, tol, 0, &mut cache);
-    cache.apply_uv_trim_updates(b)?;
-    intervals
+    let mut objects = FaceClassify { brep: b, curve };
+    let init = classification_init(k, &objects, f, curve, with_uv_curve, tol, data_size);
+    let mut classification = CurveClassification::with_curve(k, &init)?;
+    // bHasBigGaps, bDoCheck3d: FALSE; bUVSpaceOkay: TRUE (the defaults)
+    curve_on_classify_mut(
+        k,
+        f,
+        &mut objects,
+        true,
+        &mut classification,
+        false,
+        false,
+        true,
+    )?;
+    Ok(classification.intervals().to_vec())
+}
+
+/// `SmCurveClassification(curve, curve->GetNaturalInterval(), uv_curve, tol, data_size,
+/// data, FALSE, TRUE, this->GetSurface())`.
+fn classification_init<B: FaceBrep>(
+    k: &Kernel,
+    objects: &FaceClassify<'_, B>,
+    f: FaceId,
+    curve: &Curve,
+    with_uv_curve: bool,
+    tol: f64,
+    data_size: usize,
+) -> ClassificationInit<ClassHandle> {
+    ClassificationInit {
+        curve: Some(ClassHandle::Curve),
+        interval: curve.natural_interval(),
+        uv_curve: with_uv_curve.then_some(ClassHandle::Curve),
+        src_zone_tol_3d: zone_tol3d(k, tol),
+        opt_data_size: data_size,
+        is_curve_owned: false,
+        is_curve_current: true,
+        // this->GetSurface()
+        surface1: CurveOnClassifyObjects::face_surface(objects, f),
+        surface2: None,
+        uv_curve2: None,
+        ti: None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // upstream's constructor arguments
@@ -744,20 +846,7 @@ fn classify_curve_on_face_cached(
     cache: &mut CurveOnClassifyCache,
 ) -> Result<Vec<CurveInterval<ClassHandle>>> {
     let objects = FaceClassifyObjects { brep: b, curve };
-    let init = ClassificationInit {
-        curve: Some(ClassHandle::Curve),
-        interval: curve.natural_interval(),
-        uv_curve: with_uv_curve.then_some(ClassHandle::Curve),
-        src_zone_tol_3d: zone_tol3d(k, tol),
-        opt_data_size: data_size,
-        is_curve_owned: false,
-        is_curve_current: true,
-        // this->GetSurface()
-        surface1: CurveOnClassifyObjects::face_surface(&objects, f),
-        surface2: None,
-        uv_curve2: None,
-        ti: None,
-    };
+    let init = classification_init(k, &objects, f, curve, with_uv_curve, tol, data_size);
     let mut classification = CurveClassification::with_curve(k, &init)?;
     // bHasBigGaps, bDoCheck3d: FALSE; bUVSpaceOkay: TRUE (the defaults)
     curve_on_classify_cached(
@@ -773,6 +862,55 @@ fn classify_curve_on_face_cached(
         cache,
     )?;
     Ok(classification.intervals().to_vec())
+}
+
+/// Classifies an explicit edge interval for the B-rep coincidence validator, on the
+/// caller's B-rep in place ([`curve_on_classify_mut`]): the classification keeps the
+/// caller's interval, and the trim/gap updates it makes stay on `b`, including those
+/// made before a failed status.
+pub(crate) fn classify_interval_on_face(
+    k: &Kernel,
+    b: &mut Brep,
+    f: FaceId,
+    curve: &Curve,
+    interval: Extent1d,
+    tol: f64,
+) -> Result<Vec<PointClassType>> {
+    let mut objects = FaceClassify { brep: b, curve };
+    let init = ClassificationInit {
+        curve: Some(ClassHandle::Curve),
+        interval,
+        uv_curve: None,
+        src_zone_tol_3d: zone_tol3d(k, tol),
+        opt_data_size: 0,
+        is_curve_owned: false,
+        is_curve_current: true,
+        surface1: None,
+        surface2: None,
+        uv_curve2: None,
+        ti: None,
+    };
+    let mut classification = CurveClassification::with_curve(k, &init)?;
+    let result = curve_on_classify_mut(
+        k,
+        f,
+        &mut objects,
+        true,
+        &mut classification,
+        false,
+        false,
+        true,
+    );
+    if let Err(error) = result {
+        if error.is_unported() {
+            return Err(error);
+        }
+    }
+    Ok(classification
+        .intervals()
+        .iter()
+        .map(|i| i.mid.point_class())
+        .collect())
 }
 
 /// `SmFace::CalculateUVDomainFromUVTrimCurves(rTrimUVDomain)` (unit `topology.face_p1`),
@@ -1154,9 +1292,112 @@ pub fn review_start_and_stop_on_seam_crv_classifies<O: ClassObject>(
 /// [`SolidError::NotFound`] for a dangling id; `SM_ERR` (upstream: output `(0, 0, 0)`)
 /// without surface, for a surface without owner, and when no line meets the face
 /// interior; [`SolidError::Unported`] from the line classification.
-pub fn calculate_an_internal_point(k: &Kernel, b: &Brep, f: FaceId) -> Result<Point3> {
+pub fn calculate_an_internal_point(k: &Kernel, b: &mut Brep, f: FaceId) -> Result<Point3> {
+    internal_point(k, b, f)
+}
+
+/// [`calculate_an_internal_point`] for a caller that holds only `&Brep`
+/// (`query::api_queries`' `sm_CountContainedSamples`, whose sample B-rep is borrowed
+/// next to the classified target): the line classifications run on a private copy of
+/// the B-rep ([`qf3::face_classify_uv_line`]), so their lazy edits are dropped.
+///
+/// # Errors
+///
+/// As [`calculate_an_internal_point`].
+pub(crate) fn calculate_an_internal_point_snapshot(
+    k: &Kernel,
+    b: &Brep,
+    f: FaceId,
+) -> Result<Point3> {
+    internal_point(k, b, f)
+}
+
+/// The B-rep forms the face queries `CalculateAnInternalPoint` and
+/// `CreateCurvesByTrimming` classify on: `&mut Brep` in place
+/// ([`curve_on_classify_mut`]), `&Brep` on the classification's snapshot.
+trait QueryBrep: FaceBrep + Sized {
+    /// `sm_FaceClassifyUVLine` of face `f` with `objects`.
+    #[allow(clippy::too_many_arguments)] // sm_FaceClassifyUVLine's arguments
+    fn classify_uv_line(
+        k: &Kernel,
+        f: FaceId,
+        objects: &mut UvLineObjects<Self>,
+        start: Point2,
+        end: Point2,
+        src_zone_tol_3d: f64,
+        cc: &mut CurveClassification<UvLineHandle>,
+    ) -> Result<()>;
+
+    /// [`classify_curve_on_face`] of face `f`.
+    #[allow(clippy::too_many_arguments)] // upstream's constructor arguments
+    fn classify_curve(
+        &mut self,
+        k: &Kernel,
+        f: FaceId,
+        curve: &Curve,
+        with_uv_curve: bool,
+        tol: f64,
+        data_size: usize,
+    ) -> Result<Vec<CurveInterval<ClassHandle>>>;
+}
+
+impl QueryBrep for &Brep {
+    fn classify_uv_line(
+        k: &Kernel,
+        f: FaceId,
+        objects: &mut UvLineObjects<Self>,
+        start: Point2,
+        end: Point2,
+        src_zone_tol_3d: f64,
+        cc: &mut CurveClassification<UvLineHandle>,
+    ) -> Result<()> {
+        let b = objects.b;
+        qf3::face_classify_uv_line(k, b, f, objects, start, end, src_zone_tol_3d, cc)
+    }
+
+    fn classify_curve(
+        &mut self,
+        k: &Kernel,
+        f: FaceId,
+        curve: &Curve,
+        with_uv_curve: bool,
+        tol: f64,
+        data_size: usize,
+    ) -> Result<Vec<CurveInterval<ClassHandle>>> {
+        classify_curve_on_face(k, self, f, curve, with_uv_curve, tol, data_size)
+    }
+}
+
+impl QueryBrep for &mut Brep {
+    fn classify_uv_line(
+        k: &Kernel,
+        f: FaceId,
+        objects: &mut UvLineObjects<Self>,
+        start: Point2,
+        end: Point2,
+        src_zone_tol_3d: f64,
+        cc: &mut CurveClassification<UvLineHandle>,
+    ) -> Result<()> {
+        qf3::face_classify_uv_line_mut(k, f, objects, start, end, src_zone_tol_3d, cc)
+    }
+
+    fn classify_curve(
+        &mut self,
+        k: &Kernel,
+        f: FaceId,
+        curve: &Curve,
+        with_uv_curve: bool,
+        tol: f64,
+        data_size: usize,
+    ) -> Result<Vec<CurveInterval<ClassHandle>>> {
+        classify_curve_on_face_in_place(k, self, f, curve, with_uv_curve, tol, data_size)
+    }
+}
+
+/// `CalculateAnInternalPoint` on `b` (see [`QueryBrep`]).
+fn internal_point<B: QueryBrep>(k: &Kernel, b: B, f: FaceId) -> Result<Point3> {
     // locals
-    let face = b.face(f)?;
+    let face = b.brep().face(f)?;
     let uv_dom = face.uv_domain;
     let u_min = uv_dom.u_min();
     let u_max = uv_dom.u_max();
@@ -1176,12 +1417,7 @@ pub fn calculate_an_internal_point(k: &Kernel, b: &Brep, f: FaceId) -> Result<Po
     }
 
     let mut classification: CurveClassification<UvLineHandle> = CurveClassification::new(k);
-    let mut uv_objects = UvLineObjects {
-        b,
-        f,
-        line: None,
-        resolve_topology: true,
-    };
+    let mut uv_objects = UvLineObjects::new(b, f);
 
     // first for constant U then V isoparameter lines
     for ii in 0..2 {
@@ -1198,9 +1434,8 @@ pub fn calculate_an_internal_point(k: &Kernel, b: &Brep, f: FaceId) -> Result<Po
             };
 
             // classify the target UVLine (status ignored)
-            ignore_status(qf3::face_classify_uv_line(
+            ignore_status(B::classify_uv_line(
                 k,
-                b,
                 f,
                 &mut uv_objects,
                 start,
@@ -1222,6 +1457,11 @@ pub fn calculate_an_internal_point(k: &Kernel, b: &Brep, f: FaceId) -> Result<Po
                     let curve_parameter = ivl.interval.evaluate(0.45);
                     let Ok(uv3) = uv_crv.evaluate_point(k, curve_parameter) else {
                         continue;
+                    };
+                    // pSurface: the face's surface, read after the classification's
+                    // edits (it stays the same surface)
+                    let Some(surf) = uv_objects.brep().face(f)?.surface.as_ref() else {
+                        return Err(SolidError::sm_err(OP));
                     };
                     let Ok(p) = surf.evaluate_point(k, Point2::new(uv3.x, uv3.y)) else {
                         continue;
@@ -1382,7 +1622,7 @@ pub fn points_in_face(
             // classify the isoParameter UVTrimCurve against the face
             let tol = b.face(f)?.tolerance;
             let crv = Curve::from(uv_curve.clone());
-            let intervals = classify_curve_on_face_in_place(k, b, f, &crv, true, tol)?;
+            let intervals = classify_curve_on_face_in_place(k, b, f, &crv, true, tol, 0)?;
             if intervals
                 .iter()
                 .any(|ivl| ivl.mid.point_class() == PointClassType::Face)
@@ -1599,10 +1839,12 @@ impl<'a> OdeIsoCurveLength<'a> {
             let uv = Point2::new(self.u_iso_value, t);
 
             if self.face_thickness < EFF_ZERO {
-                let r = self
-                    .surface
-                    .evaluate_simple(self.kernel, uv, 1, 1, simple_flags())?;
-                copy_block(&mut pv, &r);
+                self.surface.evaluate_simple_first_into(
+                    self.kernel,
+                    uv,
+                    simple_flags(),
+                    &mut pv,
+                )?;
             } else if i == 0 {
                 let r = offset_evaluate_simple(
                     self.kernel,
@@ -1954,7 +2196,62 @@ pub struct TrimmedCurves {
 #[allow(clippy::too_many_arguments)]
 pub fn create_curves_by_trimming(
     k: &Kernel,
+    b: &mut Brep,
+    f: FaceId,
+    curve_tolerance: Option<f64>,
+    curves_3d: Option<&[Option<Curve>]>,
+    uv_curves: Option<&[Option<Curve>]>,
+    want_3d: bool,
+    want_uv: bool,
+) -> Result<TrimmedCurves> {
+    curves_by_trimming(
+        k,
+        b,
+        f,
+        curve_tolerance,
+        curves_3d,
+        uv_curves,
+        want_3d,
+        want_uv,
+    )
+}
+
+/// [`create_curves_by_trimming`] for a caller that holds only `&Brep`
+/// (`intersect::topology_solver`'s face silhouettes, whose objects lend the face's
+/// B-rep read-only): the classifications run on a private copy of the B-rep
+/// ([`classify_curve_on_face`]), so their lazy edits are dropped.
+///
+/// # Errors
+///
+/// As [`create_curves_by_trimming`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_curves_by_trimming_snapshot(
+    k: &Kernel,
     b: &Brep,
+    f: FaceId,
+    curve_tolerance: Option<f64>,
+    curves_3d: Option<&[Option<Curve>]>,
+    uv_curves: Option<&[Option<Curve>]>,
+    want_3d: bool,
+    want_uv: bool,
+) -> Result<TrimmedCurves> {
+    curves_by_trimming(
+        k,
+        b,
+        f,
+        curve_tolerance,
+        curves_3d,
+        uv_curves,
+        want_3d,
+        want_uv,
+    )
+}
+
+/// `CreateCurvesByTrimming` on `b` (see [`QueryBrep`]).
+#[allow(clippy::too_many_arguments)]
+fn curves_by_trimming<B: QueryBrep>(
+    k: &Kernel,
+    mut b: B,
     f: FaceId,
     curve_tolerance: Option<f64>,
     curves_3d: Option<&[Option<Curve>]>,
@@ -1967,7 +2264,7 @@ pub fn create_curves_by_trimming(
     let mut new_uv: Vec<Option<Curve>> = Vec::new();
 
     // get max allowed distance from output 3DCurves to face
-    let face_tol = tolerance(b, f)?;
+    let face_tol = tolerance(b.brep(), f)?;
     let tol_3d = match curve_tolerance {
         Some(t) => face_tol.max(t),
         None => face_tol,
@@ -1975,8 +2272,8 @@ pub fn create_curves_by_trimming(
 
     if let Some(uv_list) = uv_curves {
         // a reasonable 2d tolerance based on the 3d tol
-        let surf = surface_deref(b, f)?;
-        let uv_scale = approx_derivative_lengths(k, surf, &uv_domain(b, f)?)?;
+        let surf = surface_deref(b.brep(), f)?;
+        let uv_scale = approx_derivative_lengths(k, surf, &uv_domain(b.brep(), f)?)?;
         let mut uv_scale_avg = 0.5 * (uv_scale.x + uv_scale.y);
         if uv_scale_avg < tol_3d / 1000.0 {
             uv_scale_avg = tol_3d / 1000.0;
@@ -1992,7 +2289,7 @@ pub fn create_curves_by_trimming(
             }
 
             // classify the UVCurve against the face
-            let intervals = classify_curve_on_face(k, b, f, curve, true, tol_uv, 20)?;
+            let intervals = b.classify_curve(k, f, curve, true, tol_uv, 20)?;
 
             // for every curve classification
             for ivl in &intervals {
@@ -2051,7 +2348,7 @@ pub fn create_curves_by_trimming(
             }
 
             // Classify the curve against the face
-            let intervals = classify_curve_on_face(k, b, f, curve, false, tol_3d, 20)?;
+            let intervals = b.classify_curve(k, f, curve, false, tol_3d, 20)?;
 
             for ivl in &intervals {
                 if ivl.mid.point_class() == PointClassType::Face
@@ -2264,15 +2561,28 @@ fn notified_end_point_edit(
     edit_start: bool,
     weight: Option<f64>,
 ) -> Result<()> {
-    let Some(env) = env.filter(|e| e.context.is_some()) else {
-        return edit_end_point(held_curve_mut(b, holder)?, point, edit_start, weight);
-    };
+    let edit = |c: &mut Curve| edit_end_point(c, point, edit_start, weight);
+    match env.filter(|e| e.context.is_some()) {
+        Some(env) => notify_around_edit(b, env, holder, edit),
+        None => edit(held_curve_mut(b, holder)?),
+    }
+}
+
+/// `edit` of the UV trim curve `holder` holds, between `SM_NO_PRE_EDIT` and
+/// `SM_NO_POST_EDIT` with the curve as caller and first data object, after reporting
+/// the curve's and the edge use's owner links.
+fn notify_around_edit(
+    b: &mut Brep,
+    env: &mut NotifyEnv<'_>,
+    holder: EdgeuseId,
+    edit: impl Fn(&mut Curve) -> Result<()>,
+) -> Result<()> {
     let holder_ref = (env.key_of)(EntityRef::Edgeuse(holder));
     let edge_ref = eu1::edge(b, holder)?.map(|e| (env.key_of)(EntityRef::Edge(e)));
     let this = {
         let curve = held_curve_mut(b, holder)?;
         let Some(ctx) = env.context.as_deref_mut() else {
-            return Err(null("EditEndPoint: no context"));
+            return Err(null("FixUVTrimCurves: no context"));
         };
         ObjectRef {
             type_code: curve.type_code(),
@@ -2294,8 +2604,34 @@ fn notified_end_point_edit(
         )
     };
     notify(env, NotifyOperation::PreEdit)?;
-    edit_end_point(held_curve_mut(b, holder)?, point, edit_start, weight)?;
+    edit(held_curve_mut(b, holder)?)?;
     notify(env, NotifyOperation::PostEdit)
+}
+
+/// A `Trim` or `EditParameterization` of the UV trim curve `holder` holds, as
+/// `sm_FixUVTrimCurves` makes them: when the edit does work (it changes the curve's
+/// natural interval; both return before notifying otherwise), it notifies as
+/// [`notified_end_point_edit`] does. Whether the edit works is found by running it on
+/// a copy first.
+fn notified_curve_edit(
+    b: &mut Brep,
+    env: Option<&mut NotifyEnv<'_>>,
+    holder: EdgeuseId,
+    edit: impl Fn(&mut Curve) -> Result<()>,
+) -> Result<()> {
+    let Some(env) = env.filter(|e| e.context.is_some()) else {
+        return edit(held_curve_mut(b, holder)?);
+    };
+    let before = held_curve(b, holder)?.natural_interval();
+    let mut probe = held_curve(b, holder)?.clone();
+    edit(&mut probe)?;
+    let after = probe.natural_interval();
+    if before.min().to_bits() == after.min().to_bits()
+        && before.max().to_bits() == after.max().to_bits()
+    {
+        return edit(held_curve_mut(b, holder)?);
+    }
+    notify_around_edit(b, env, holder, edit)
 }
 
 /// `SmBSplineCurve::EditEndPoint(point, bEditStart, pdWeight)` of a UV trim curve.
@@ -2359,9 +2695,10 @@ pub fn fix_uv_trim_curves(
     )
 }
 
-/// [`fix_uv_trim_curves`] whose end point edits notify through `env`: each
+/// [`fix_uv_trim_curves`] whose curve edits notify through `env`: each
 /// `EditEndPoint` sends `SM_NO_PRE_EDIT` and `SM_NO_POST_EDIT` with the edited UV trim
-/// curve as caller and first data object ([`notified_end_point_edit`]). Without `env`
+/// curve as caller and first data object ([`notified_end_point_edit`]), and so does each
+/// `Trim` and `EditParameterization` that does work ([`notified_curve_edit`]). Without `env`
 /// (or without its context) the edits notify nobody.
 ///
 /// # Errors
@@ -2452,12 +2789,9 @@ pub fn fix_uv_trim_curves_notified(
     let _prev_edge_gap = surf_vertex.distance(prev_edge_point);
     let _ = tol_3d;
 
-    // Move the UVTrimCurve end points to the vertex's UV point (#570 / WR-255).
-    // By default (`!k.context.trim_uv_curves_at_corner_drops()`), only the end control
-    // points move (`tangency-labs/smlib@5af7070`), keeping interior parameters aligned
-    // with the 3D edge. Pinned-`c9c5979` difftest callers may opt into upstream's
-    // DropPoint + Trim + EditParameterization stretch.
-    if k.context.trim_uv_curves_at_corner_drops() {
+    // drop sUVVertex to each UVTrimCurve, trim there and stretch back (upstream). The
+    // opt-in WR-255 fix (#959/#570) skips this and only moves the end points below.
+    if !k.fixes.uv_trim_corner_end_points_only {
         let curr_drop = ignored(held_curve(b, curr_holder)?.drop_point(
             k,
             &curr_ivl,
@@ -2486,9 +2820,13 @@ pub fn fix_uv_trim_curves_notified(
                     let _ = trim_ivl.set_min_max(curr_ivl.min(), t_curr_new);
                 }
                 if !are_same(trim_ivl.min(), trim_ivl.max()) {
-                    let c = held_curve_mut(b, curr_holder)?;
-                    c.trim(k, &mut trim_ivl, TrimMode::Notify)?;
-                    c.edit_parameterization(k, &curr_ivl)?;
+                    notified_curve_edit(b, env.as_deref_mut(), curr_holder, |c| {
+                        let mut ivl = trim_ivl;
+                        c.trim(k, &mut ivl, TrimMode::Notify)
+                    })?;
+                    notified_curve_edit(b, env.as_deref_mut(), curr_holder, |c| {
+                        c.edit_parameterization(k, &curr_ivl)
+                    })?;
                 }
             }
         }
@@ -2502,9 +2840,13 @@ pub fn fix_uv_trim_curves_notified(
                     let _ = trim_ivl.set_min_max(t_prev_new, prev_ivl.max());
                 }
                 if !are_same(trim_ivl.min(), trim_ivl.max()) {
-                    let c = held_curve_mut(b, prev_holder)?;
-                    c.trim(k, &mut trim_ivl, TrimMode::Notify)?;
-                    c.edit_parameterization(k, &prev_ivl)?;
+                    notified_curve_edit(b, env.as_deref_mut(), prev_holder, |c| {
+                        let mut ivl = trim_ivl;
+                        c.trim(k, &mut ivl, TrimMode::Notify)
+                    })?;
+                    notified_curve_edit(b, env.as_deref_mut(), prev_holder, |c| {
+                        c.edit_parameterization(k, &prev_ivl)
+                    })?;
                 }
             }
         }
@@ -2996,12 +3338,12 @@ mod tests {
         let f = b.add_face(s).unwrap();
         let k = Kernel::default();
         assert!(matches!(
-            calculate_an_internal_point(&k, &b, f),
+            calculate_an_internal_point(&k, &mut b, f),
             Err(SolidError::Upstream { .. })
         ));
         b.face_mut(f).unwrap().surface = Some(plane());
         assert!(matches!(
-            calculate_an_internal_point(&k, &b, f),
+            calculate_an_internal_point(&k, &mut b, f),
             Err(SolidError::Upstream { .. })
         ));
         b.face_mut(f)
@@ -3016,7 +3358,7 @@ mod tests {
         // no loops: no line interval classifies into the face (the line statuses are
         // ignored), so the final SM_ERR
         assert!(matches!(
-            calculate_an_internal_point(&k, &b, f),
+            calculate_an_internal_point(&k, &mut b, f),
             Err(SolidError::Upstream { .. })
         ));
     }
@@ -3043,7 +3385,8 @@ mod tests {
         b.face_mut(f).unwrap().uv_domain = Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0);
         let k = Kernel::default();
         let uv = [None];
-        let r = create_curves_by_trimming(&k, &b, f, None, None, Some(&uv), true, true).unwrap();
+        let r =
+            create_curves_by_trimming(&k, &mut b, f, None, None, Some(&uv), true, true).unwrap();
         assert_eq!(r.curves_3d.map(|v| v.len()), Some(0));
         assert_eq!(r.uv_curves.map(|v| v.len()), Some(0));
         let line = Curve::from(
@@ -3052,10 +3395,10 @@ mod tests {
         let uv = [Some(line)];
         // a face without loops: CurveOnClassify's status
         assert!(matches!(
-            create_curves_by_trimming(&k, &b, f, Some(1.0), None, Some(&uv), false, true),
+            create_curves_by_trimming(&k, &mut b, f, Some(1.0), None, Some(&uv), false, true),
             Err(SolidError::Upstream { .. })
         ));
-        assert!(create_curves_by_trimming(&k, &b, f, None, None, None, true, false).is_err());
+        assert!(create_curves_by_trimming(&k, &mut b, f, None, None, None, true, false).is_err());
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3084,14 +3427,14 @@ mod tests {
         }
     }
 
-    /// #570: closing a corner's UV gap moves only the trim's end control point. Upstream
-    /// trims the curve at the vertex's drop point and stretches it back over its
-    /// interval, which slides every interior knot (and so every interior point at a
-    /// given parameter) off the edge's.
-    #[test]
-    fn fix_uv_trim_curves_keeps_interior_parameters() {
+    /// A box whose first self-holding UV trim is replaced by a three-span line that
+    /// overshoots its vertex by 1e-3, after `fix_uv_trim_curves` with the WR-255 fix
+    /// `end_points_only`: the trim before and after, whether its edge use runs `Same`,
+    /// and the vertex's UV point.
+    fn fix_overshooting_trim(end_points_only: bool) -> (Curve, Curve, bool, Point3) {
         use crate::nurbs::math::CPoint;
         let k = &mut Kernel::default();
+        k.fixes.uv_trim_corner_end_points_only = end_points_only;
         let mut b = crate::primitive::api_primitives::create_box(k, Point3::ZERO, 10.0, 10.0, 10.0)
             .unwrap();
         // the first edge use holding its own UV trim curve, with its loop neighbour
@@ -3137,7 +3480,15 @@ mod tests {
         let before = held_curve(&b, eu).unwrap().clone();
         let fixed = fix_uv_trim_curves(k, &mut b, eu, prev, v, 1e-5, gap, &dom).unwrap();
         assert!(fixed);
-        let after = held_curve(&b, eu).unwrap();
+        let after = held_curve(&b, eu).unwrap().clone();
+        (before, after, same, at_vertex)
+    }
+
+    /// #959/#570 (WR-255): with the fix, closing a corner's UV gap moves only the trim's
+    /// end control point: same knots, interior control points untouched.
+    #[test]
+    fn issue_959_fix_uv_trim_curves_keeps_interior_parameters() {
+        let (before, after, same, at_vertex) = fix_overshooting_trim(true);
         let (CurveKind::BSpline(c0), CurveKind::BSpline(c1)) = (before.kind(), after.kind()) else {
             panic!("UV trim curve is no longer a B-spline");
         };
@@ -3152,6 +3503,17 @@ mod tests {
             moved.distance(at_vertex) < 1e-12,
             "{moved:?} vs {at_vertex:?}"
         );
+    }
+
+    /// WR-255 without the fix (upstream): the trim is cut at the vertex's drop point and
+    /// stretched back over its interval, so its interior knots slide.
+    #[test]
+    fn fix_uv_trim_curves_stretches_the_trim_by_default() {
+        let (before, after, _, _) = fix_overshooting_trim(false);
+        let (CurveKind::BSpline(c0), CurveKind::BSpline(c1)) = (before.kind(), after.kind()) else {
+            panic!("UV trim curve is no longer a B-spline");
+        };
+        assert_ne!(c0.knots(None).unwrap(), c1.knots(None).unwrap());
     }
 
     #[test]

@@ -141,7 +141,11 @@ Every ported file starts with:
 
 Unit list and states: `plan/units/<unit id>.toml`, one file per unit (format:
 `plan/modules.schema.md`, order: `plan/order.md`). **`plan/PROGRESS.md` is the checklist** (regenerated on `main` by CI;
-never edit it in a PR). **Any `todo` unit can be claimed.** A unit is *ready* when its `depends_on` are all
+never edit it in a PR). **Any `todo` unit or unclaimed completion task can be claimed.** A claim reserves
+its stated scope, not every future change to the unit. Missing functions, back-edge
+wiring, exact runner imports, fixtures and demonstrated parity bugs remain useful
+work in `partial` and `green` units; inspect source and reports, not status alone.
+A unit is *ready* when its `depends_on` are all
 `green` or `partial` (`soft_depends_on` never blocks; see section 4a); ready units are
 the easiest, lowest `layer` first. Claiming a unit that is not ready is fine:
 - Calls into a missing dependency are stubbed (`UNPORTED(<unit>)`, cases deferred; 4a).
@@ -156,14 +160,44 @@ the easiest, lowest `layer` first. Claiming a unit that is not ready is fine:
 into `upstream/` (see README), then run `scripts/fetch-cpp.sh`, or
 `nice -n 10 harness/cpp/build.sh --jobs 6` to build from source.
 
-1. **Claim = a draft PR.** Check nobody has it:
-   `gh pr list --state open --search "<unit id> in:title"`. If none, branch from the
-   latest `main` (`git fetch origin && git switch -c unit/<unit id> origin/main`),
-   `git commit --allow-empty -m "claim: <unit id>"`, push, and open a draft PR titled
-   exactly **`port: <unit id>`**. **The lowest-numbered open PR for a unit wins**; if
-   yours lost, close it. Do not edit `plan/units/` to claim. Push WIP at least
-   daily; a draft PR with no pushes for 48 h may be taken over (comment on it first).
-   If the unit's `notes` mention a WIP branch on `origin`, start from it.
+1. **Claim = a scoped draft PR.** Search open PR titles and bodies for the unit,
+   symbols and affected paths, including `wire:`, `fix:` and `difftest:` work; a title
+   search for `port:` alone misses completion work. Branch from the latest `main`.
+   Do not edit `plan/units/` to claim.
+   Initial whole-unit ports keep the title **`port: <unit id>`**. For completion work,
+   use a descriptive title such as **`wire: <unit id> — <function group>`** and name
+   the unit in the body. An empty claim commit is sufficient to open a draft.
+
+   Include this scope in the PR body (update it as the work changes):
+   ```text
+   Units:
+   In scope: upstream symbols, Rust functions and intended behavior
+   Expected edits: paths and shared interfaces
+   Evidence: failing/deferred case IDs or missing branches; validation planned
+   Related PRs / dependencies:
+   Available follow-ups: independent work others can take
+   Status / blockers / next step:
+   ```
+   For overlapping whole-unit `port:` claims, the lowest-numbered open PR wins.
+   For completion tasks, the earliest open claim wins only for overlapping work.
+   Non-overlapping work in
+   the same unit is welcome. Link the related PR and state the boundary before
+   starting; independent work need not wait for a whole-unit owner to reply.
+   If work changes the same function or shared interface, agree on a split in the
+   existing PR first, or build on its branch and document the dependency. If the
+   boundary is unclear, ask there and take a different independent task meanwhile.
+   Never implement a competing version of an actively claimed change.
+
+   Push WIP or post a concrete progress update at least daily while implementing.
+   After 48 h without either, comment with the exact scope you propose to take over
+   and allow 24 h for a response; then continue from published WIP, crediting its
+   author. Do not take over a PR merely because it awaits review or CI: offer review,
+   conflict resolution or a coordinated follow-up instead. A blocker update should
+   identify what is blocked and release independent work, rather than reserve the
+   whole unit indefinitely. When pausing, release the scope and link the WIP.
+   Existing PR authors retain their active scope; this is not a reset of claims.
+   If the unit's notes mention a WIP branch, inspect it before starting.
+
 2. **Port** the upstream functions the unit owns (listed in
    `harness/callgraph/units.json`) into its `rust_module`, plus the C++ shim
    (`harness/cpp/shim/<unit_id_with_underscores>.cpp`, functions `sc_<unit>_<fn>`, plain
@@ -254,6 +288,29 @@ into `upstream/` (see README), then run `scripts/fetch-cpp.sh`, or
 `plan/findings/<slug>.md`, set `status = "blocked"` with a reason in `notes`, and open the PR
 with just that so others can see it. Never sit on a draft PR you have stopped working
 on: close it, and say where the WIP is.
+
+### Completion evidence
+
+For new ports and completion changes, include the [completion evidence checklist](docs/completion-evidence.md)
+in the PR description. The evidence table is required for `wire:` PRs that remove
+`UNPORTED` stubs, including when existing fixtures do not reach the continuation. Identify the owned functions and branches implemented, which
+operations actually complete successfully against C++, and which remain unreachable.
+A passing status or empty result is evidence for that case, not proof that the
+operation's successful construction or mutation path works.
+
+A dependency stub replaces the missing call only. Port the upstream logic following
+it as well, preserving control flow and operation order; do not omit the continuation
+and present the function as complete. If an incremental PR deliberately leaves an
+owned body or continuation missing, list the exact symbols and remaining work.
+Report that limitation even if existing fixtures never reach it. Unit status follows
+the existing gate; it does not certify complete function or branch coverage.
+
+When a dependency is wired, rerun the affected callers and add cases that reach the
+previously blocked continuations. Keep newly exposed mismatches visible. Review
+runner skips, stand-in geometry and absent-entity cases before claiming coverage.
+Record independent harness follow-ups with reproducible evidence and check existing
+PRs before implementing them. This checklist supplements the existing correctness
+gate; it does not change tolerances, outcomes or status accounting.
 
 ## 4a. Cycles, back-edges and the merge lock
 

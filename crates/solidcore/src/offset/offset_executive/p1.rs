@@ -64,6 +64,9 @@
 //! null-pointer error, a null blended face is `RelatePair`'s invalid input, and any
 //! failed `CreateCornerBlend` is `SM_ERR` (`SER(SM_ERR)`), unported callees aside.
 //! No new input-driven recursion; existing topology walks are cycle-bounded.
+//! Issue #368: as tangency-labs/smlib 5fe723c, removed offset faces leave all four
+//! correspondence maps before `RemoveFaces`; deleted blends also lose their outgoing
+//! pairs. The pinned reference retains stale faces that `PiecewiseMerge` later reads.
 //! The lamina clean-up's `DeleteFaces` runs through merge p4's arena intersector over
 //! the offset B-rep alone (both upstream operands are that B-rep); it notifies under
 //! `DELETE_FACES_NAMESPACE` rather than the caller's offset keys.
@@ -645,7 +648,7 @@ impl OffsetExecutive {
     /// Removes excess faces using the result's actual editing flag and kernel marks.
     /// An empty deletion list still calls the landed `RemoveFaces` implementation.
     pub fn remove_excess_faces_with_kernel_context(
-        &self,
+        &mut self,
         kernel: &mut Kernel,
         original: &mut Brep,
         result: &mut Brep,
@@ -653,6 +656,7 @@ impl OffsetExecutive {
         let Some(delete_faces) = self.excess_faces(kernel, original, result)? else {
             return Ok(());
         };
+        self.forget_faces(&delete_faces)?;
         let editing_enabled = result.editing_enabled();
         // cpp:2099–2102 ignores ordinary RemoveFaces failures but still executes
         // its editing guard and traversal-mark effects. Missing work must defer.
@@ -662,6 +666,30 @@ impl OffsetExecutive {
             editing_enabled,
             &delete_faces,
         ))
+    }
+
+    /// Forgets correspondence to faces about to be removed (SolidCraft change, #368).
+    fn forget_faces(&mut self, faces: &[FaceId]) -> Result<()> {
+        fn forget_second<A: Ord + Copy>(
+            relation: &mut Relation<A, FaceId>,
+            face: FaceId,
+        ) -> Result<()> {
+            for first in relation.firsts(face) {
+                relation.remove_pair(first, face)?;
+            }
+            Ok(())
+        }
+
+        for &face in faces {
+            forget_second(&mut self.faceuse_to_faces, face)?;
+            forget_second(&mut self.edge_to_faces, face)?;
+            forget_second(&mut self.vertex_to_faces, face)?;
+            forget_second(&mut self.blend_to_faces, face)?;
+            for second in self.blend_to_faces.seconds(face) {
+                self.blend_to_faces.remove_pair(face, second)?;
+            }
+        }
+        Ok(())
     }
 
     fn excess_faces(
@@ -1416,22 +1444,18 @@ impl OffsetExecutive {
         for faceuse in self.faceuse_to_faces.all_firsts() {
             let face = required(original.faceuse(faceuse)?.face)?;
             for offset_face in self.faceuse_to_faces.seconds(faceuse) {
-                required(result.face(offset_face)?.surface.as_ref())?;
                 for edge_id in face_edges(original, face)? {
                     let edge_faces = self.edge_to_faces.seconds(edge_id);
                     for &edge_face in &edge_faces {
-                        required(result.face(edge_face)?.surface.as_ref())?;
                         for blended in self.blend_to_faces.seconds(edge_face) {
-                            required(result.face(blended)?.surface.as_ref())?;
-                            relate_surface_pair(&mut no_ssi, blended, edge_face)?;
+                            relate_surface_pair(result, &mut no_ssi, blended, edge_face)?;
                         }
-                        relate_surface_pair(&mut no_ssi, offset_face, edge_face)?;
+                        relate_surface_pair(result, &mut no_ssi, offset_face, edge_face)?;
                         let start = edge::vertex(original, edge_id)?;
                         let end = edge::other_vertex(original, edge_id, start)?;
                         for vertex in [start, end].into_iter().flatten() {
                             if let Some(vertex_face) = self.vertex_to_faces.second(vertex) {
-                                required(result.face(vertex_face)?.surface.as_ref())?;
-                                relate_surface_pair(&mut no_ssi, edge_face, vertex_face)?;
+                                relate_surface_pair(result, &mut no_ssi, edge_face, vertex_face)?;
                             }
                         }
                     }
@@ -1454,8 +1478,12 @@ impl OffsetExecutive {
                                     let radial_faceuse = required(eu::faceuse(original, radial)?)?;
                                     for radial_face in self.faceuse_to_faces.seconds(radial_faceuse)
                                     {
-                                        required(result.face(radial_face)?.surface.as_ref())?;
-                                        relate_surface_pair(&mut no_ssi, offset_face, radial_face)?;
+                                        relate_surface_pair(
+                                            result,
+                                            &mut no_ssi,
+                                            offset_face,
+                                            radial_face,
+                                        )?;
                                     }
                                 }
                             }
@@ -1464,8 +1492,7 @@ impl OffsetExecutive {
                 }
                 for vertex in face_vertices(original, face)? {
                     if let Some(vertex_face) = self.vertex_to_faces.second(vertex) {
-                        required(result.face(vertex_face)?.surface.as_ref())?;
-                        relate_surface_pair(&mut no_ssi, offset_face, vertex_face)?;
+                        relate_surface_pair(result, &mut no_ssi, offset_face, vertex_face)?;
                     }
                 }
             }
@@ -2234,10 +2261,19 @@ fn offset_env<'a>(
 }
 
 fn relate_surface_pair(
+    result: &Brep,
     relation: &mut Relation<FaceId, FaceId>,
     a: FaceId,
     b: FaceId,
 ) -> Result<()> {
+    // Upstream `SmOffsetExecutive::PiecewiseMerge` (cpp:2313–2412) does not null-check
+    // `GetSurface()`, and `SmRelation::RelatePair` (SmRelation.h:203–206, unchecked) is
+    // a no-op when either pointer is NULL — including faces already destroyed by
+    // `RemoveExcessFaces` whose `~SmFace` cleared `m_pSurface` (UB-256).
+    let has_surface = |id: FaceId| result.faces().get(id).is_some_and(|f| f.surface.is_some());
+    if !has_surface(a) || !has_surface(b) {
+        return Ok(());
+    }
     relation.relate_pair(a, b)?;
     relation.relate_pair(b, a)
 }
@@ -3376,6 +3412,61 @@ mod tests {
     }
 
     #[test]
+    fn removed_offset_faces_leave_every_correspondence_in_both_directions() {
+        let mut exec = executive();
+        let gone = FaceId::from_index(0);
+        let kept = FaceId::from_index(1);
+        let blend = FaceId::from_index(2);
+        let faceuses = [FaceuseId::from_index(0), FaceuseId::from_index(1)];
+        let edges = [EdgeId::from_index(0), EdgeId::from_index(1)];
+        let vertices = [VertexId::from_index(0), VertexId::from_index(1)];
+        for face in [gone, kept] {
+            for source in faceuses {
+                exec.relate_faceuse(source, face);
+            }
+            for source in edges {
+                exec.relate_edge_face(source, face);
+            }
+            for source in vertices {
+                exec.relate_vertex_face(source, face);
+            }
+            exec.relate_blend_face(blend, face);
+        }
+        exec.relate_blend_face(gone, kept);
+        exec.relate_blend_face(gone, gone);
+        exec.relate_blend_face(kept, gone);
+
+        // Duplicate candidates and repeated cleanup are harmless. Original ids can
+        // have the same numeric indices as result ids, but must remain related to kept.
+        exec.forget_faces(&[gone, gone]).unwrap();
+        exec.forget_faces(&[gone]).unwrap();
+        for source in faceuses {
+            assert_eq!(exec.offset_faces(source), vec![kept]);
+        }
+        for source in edges {
+            assert_eq!(exec.edge_to_faces.seconds(source), vec![kept]);
+        }
+        for source in vertices {
+            assert_eq!(exec.vertex_to_faces.seconds(source), vec![kept]);
+        }
+        assert_eq!(exec.blend_to_faces.seconds(blend), vec![kept]);
+        assert!(exec.blend_to_faces.seconds(gone).is_empty());
+        assert!(exec.blend_to_faces.seconds(kept).is_empty());
+        assert!(exec.faceuse_to_faces.firsts(gone).is_empty());
+        assert!(exec.edge_to_faces.firsts(gone).is_empty());
+        assert!(exec.vertex_to_faces.firsts(gone).is_empty());
+        assert!(exec.blend_to_faces.firsts(gone).is_empty());
+        assert_eq!(exec.blend_to_faces.firsts(kept), vec![blend]);
+
+        exec.forget_faces(&[kept]).unwrap();
+        assert!(exec.faceuse_to_faces.all_firsts().is_empty());
+        assert!(exec.edge_to_faces.all_firsts().is_empty());
+        assert!(exec.vertex_to_faces.all_firsts().is_empty());
+        assert!(exec.blend_to_faces.all_firsts().is_empty());
+        assert!(exec.blend_to_faces.all_seconds().is_empty());
+    }
+
+    #[test]
     fn implicit_offsets_are_replaced_by_approximations_of_their_base() {
         use crate::surface::offset_surface::OffsetSurface;
         let patch = || {
@@ -3783,6 +3874,33 @@ mod tests {
         ));
         assert!(executive.offset_brep().is_some());
         assert_eq!(executive.offset_edgeuse(EdgeuseId::from_index(1)), None);
+    }
+
+    #[test]
+    fn relate_surface_pair_skips_destroyed_faces_without_surfaces() {
+        let mut brep = Brep::new();
+        let (live_a, _) = add_face(
+            &mut brep,
+            Surface::from(Plane::from_normal(Vec3::ZERO, Vec3::Z)),
+        );
+        let (live_b, _) = add_face(
+            &mut brep,
+            Surface::from(Plane::from_normal(Vec3::Z, Vec3::Z)),
+        );
+        let (destroyed, _) = add_face(
+            &mut brep,
+            Surface::from(Plane::from_normal(Vec3::ZERO, Vec3::Y)),
+        );
+        brep.face_mut(destroyed).unwrap().surface = None;
+
+        let mut no_ssi = Relation::default();
+        relate_surface_pair(&brep, &mut no_ssi, destroyed, live_a).unwrap();
+        relate_surface_pair(&brep, &mut no_ssi, live_a, FaceId::from_index(999)).unwrap();
+        assert!(no_ssi.all_firsts().is_empty());
+
+        relate_surface_pair(&brep, &mut no_ssi, live_a, live_b).unwrap();
+        assert_eq!(no_ssi.seconds(live_a), vec![live_b]);
+        assert_eq!(no_ssi.seconds(live_b), vec![live_a]);
     }
 
     fn add_face(brep: &mut Brep, surface: Surface) -> (FaceId, FaceuseId) {

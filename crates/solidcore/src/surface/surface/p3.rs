@@ -13,7 +13,7 @@
 //! | [`Surface::evaluate_geometric`], [`evaluate_geometric_of`] | `SmSurface::EvaluateGeometric`          |
 //! | [`Surface::evaluate_normal_section`], [`evaluate_normal_section_of`], [`SurfaceNormalSection`] | `SmSurface::EvaluateNormalSection` |
 //! | [`Surface::get_singularities`], [`Surface::get_singularities_of_face`], [`Singularities`] | `SmSurface::GetSingularities`                    |
-//! | [`Surface::cover_coincident_surface`], [`CoverCoincident`] | `SmSurface::CoverCoincidentSurface`     |
+//! | [`Surface::cover_coincident_surface_deferring_trims`], [`CoverCoincident`] | `SmSurface::CoverCoincidentSurface`     |
 //! | [`check_shape_match`]                             | `smsurf_CheckShapeMatch`                         |
 //! | [`FindPsNormalEnfo`] (`EvalNFunctions`)           | `SmFindPSNormalENFO::Evaluate` (struct: `surface.surface_p1`) |
 //! | [`SssIntersectEnfo`] (`EvalNFunctions`)           | `SmSSSIntersectENFO::Evaluate` (struct: `surface.surface_p1`) |
@@ -27,7 +27,7 @@
 //! - **Out-params** become return values; a solve that finds nothing returns `None`.
 //! - **Temporary out-of-bounds evaluation.** `SmTemporaryChangeValue` on the
 //!   `OutOfBoundsEnabled` flag of the (B-spline based) surfaces is done on the surface
-//!   itself where it is `&mut` ([`Surface::cover_coincident_surface`]) and on an
+//!   itself where it is `&mut` ([`Surface::cover_coincident_surface_deferring_trims`]) and on an
 //!   out-of-bounds copy where upstream changes a `const` surface
 //!   ([`Surface::local_surface_surface_intersect`]).
 //! - **Ignored statuses.** Where upstream ignores the status of an evaluation its
@@ -44,11 +44,11 @@
 //!   curves itself. [`Surface::cover_coincident_surface_deferring_trims`] returns the
 //!   face in [`CoverCoincident::remove_uv_trim_curves_of`] and the caller that holds the
 //!   B-rep runs `topology::face::p1::remove_uv_trim_curves` right after the call (nothing
-//!   runs in between, so the order is upstream's).
-//!   [`Surface::cover_coincident_surface`] keeps returning [`SolidError::Unported`]
-//!   (`topology.face_p1`) for a face-owned surface for callers without the B-rep.
-//! - **A folded continuation is not covered.** SolidCraft change,
-//!   tangency-labs/smlib 1b6f5fa (`SmSurface::CoverCoincidentSurface`, before its
+//!   runs in between, so the order is upstream's). There is no entry point that skips
+//!   the deletion: every caller receives the face.
+//! - **A folded continuation is not covered** (opt-in
+//!   `Kernel::fixes.cover_refuses_folded_continuation`, WR-407; off by default, which
+//!   merges as upstream does). SolidCraft change, tangency-labs/smlib 1b6f5fa (`SmSurface::CoverCoincidentSurface`, before its
 //!   `AdjustSTEPUVDomain`): when a B-spline-based surface would be extended past its
 //!   natural domain, its normal may neither vanish nor turn back between neighbouring
 //!   samples of a 21 x 21 grid over the domain the merge uses; otherwise the cover fails
@@ -267,7 +267,7 @@ pub struct Singularities {
     pub pole_normals: Option<[Vec3; 4]>,
 }
 
-/// The result of [`Surface::cover_coincident_surface`].
+/// The result of [`Surface::cover_coincident_surface_deferring_trims`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CoverCoincident {
     /// `rbSuccess`: the other surface fits inside this one.
@@ -280,8 +280,7 @@ pub struct CoverCoincident {
     /// The face owning this surface whose `SmFace::RemoveUVTrimCurves` upstream runs at
     /// the end of a successful call: the caller holding the B-rep runs it
     /// (`topology::face::p1::remove_uv_trim_curves`) right after the call. `None` on
-    /// failure and for a surface no face owns. Set only by
-    /// [`Surface::cover_coincident_surface_deferring_trims`].
+    /// failure and for a surface no face owns.
     pub remove_uv_trim_curves_of: Option<ObjectRef>,
 }
 
@@ -744,41 +743,12 @@ impl Surface {
     /// Whether `other` (or the subset `other_domain` of it) fits inside this surface: a
     /// grid of points of `other` is dropped to this surface and, when all coincide within
     /// `tol`, this surface's STEP domain is expanded to cover them
-    /// (`CoverCoincidentSurface`). The surface is changed only on success.
-    ///
-    /// # Errors
-    ///
-    /// [`SolidError::Unported`]: `SmFace::RemoveUVTrimCurves` for a successful cover by a
-    /// surface owned by a face (`topology.face_p1`; the surface has been expanded, as
-    /// upstream before that call); those of the evaluations and of `STEPInversion`.
-    /// A caller holding the B-rep uses
-    /// [`Surface::cover_coincident_surface_deferring_trims`] instead.
-    pub fn cover_coincident_surface(
-        &mut self,
-        k: &Kernel,
-        other: &Surface,
-        tol: f64,
-        other_domain: Option<&Extent2d>,
-    ) -> Result<CoverCoincident> {
-        let r = self.cover_coincident_surface_deferring_trims(k, other, tol, other_domain)?;
-        if r.remove_uv_trim_curves_of.is_some() {
-            // UNPORTED(topology.face_p1): SmFace::RemoveUVTrimCurves
-            // (ported as topology::face::p1::remove_uv_trim_curves; a caller without
-            // the B-rep of the owner face cannot run it: callers with it use
-            // `cover_coincident_surface_deferring_trims`)
-            return Err(SolidError::unported(
-                "SmFace::RemoveUVTrimCurves",
-                "topology.face_p1",
-            ));
-        }
-        Ok(r)
-    }
-
-    /// [`Surface::cover_coincident_surface`] for a caller holding the B-rep: on success
+    /// (`CoverCoincidentSurface`). The surface is changed only on success. On success
     /// for a face-owned surface, the face whose UV trim curves upstream deletes at the
     /// end of the call (`SmFace::RemoveUVTrimCurves`) is returned in
-    /// [`CoverCoincident::remove_uv_trim_curves_of`], and the caller runs
-    /// `topology::face::p1::remove_uv_trim_curves` on it right after this call.
+    /// [`CoverCoincident::remove_uv_trim_curves_of`], and the caller, which holds the
+    /// B-rep, runs `topology::face::p1::remove_uv_trim_curves` on it right after this
+    /// call.
     ///
     /// # Errors
     ///
@@ -834,7 +804,8 @@ impl Surface {
         result
     }
 
-    /// The body of [`Surface::cover_coincident_surface`] with out-of-bounds evaluation on.
+    /// The body of [`Surface::cover_coincident_surface_deferring_trims`] with out-of-bounds
+    /// evaluation on.
     fn cover_coincident_surface_inner<O: SolutionObject>(
         &mut self,
         k: &Kernel,
@@ -1172,8 +1143,10 @@ impl Surface {
         // its edges (two swept arc walls sharing their top and bottom planes, joined: UV gaps
         // and the wrong volume). The continued surface must not fold over the domain the
         // merge will use: its normal must not vanish or turn back between neighbouring
-        // samples of a grid over that domain.
-        if out_of_bounds_enabled(self).is_some()
+        // samples of a grid over that domain. Opt-in (`Kernel::fixes.cover_refuses_folded_continuation`,
+        // WR-407); upstream merges onto the continuation.
+        if k.fixes.cover_refuses_folded_continuation
+            && out_of_bounds_enabled(self).is_some()
             && !update_domain.is_contained_by(&orig_domain, 0.0)
         {
             let Some((_, reference)) = self.step_normal(k, orig_domain.evaluate(0.5, 0.5))? else {
@@ -1777,15 +1750,13 @@ mod tests {
 
     /// A B-spline surface covers past its natural domain by continuing its end spans, and
     /// that continuation need not be one sheet. This one's u derivative vanishes at
-    /// `u = 1.5` and turns back: it must not cover a coincident plane that needs that
-    /// continuation (SolidCraft change, tangency-labs/smlib 1b6f5fa, #434).
-    #[test]
-    fn cover_refuses_a_continuation_that_folds() -> Result<()> {
+    /// `u = 1.5` and turns back; `other` is a coincident plane that needs that
+    /// continuation. Returns the cover and the surface's u domain end after it.
+    fn issue_434_cover_across_a_fold(k: &Kernel) -> Result<(CoverCoincident, f64)> {
         use crate::nurbs::b_spline_surface::p1::BSplineSurface as Bss;
         use crate::nurbs::math::CPoint;
         use crate::nurbs::srf_basic::Surface as NlSurface;
 
-        let k = Kernel::default();
         // u: the cubic Bezier through x = 0, 1, 2, 23/9 (its x derivative is zero at
         // u = 1.5: 0.25 - 1.5 + 2.25 * 5/9); v: straight in y. The sheet is z = 0 and the
         // natural u domain is [0, 1], so only the continuation past u = 1 folds.
@@ -1829,13 +1800,38 @@ mod tests {
             false,
         ));
 
-        let covered = this.cover_coincident_surface(&k, &other, 1.0e-6, None)?;
+        let covered = this.cover_coincident_surface_deferring_trims(k, &other, 1.0e-6, None)?;
+        Ok((covered, this.step_uv_domain().u_interval().max()))
+    }
+
+    /// With `fixes.cover_refuses_folded_continuation` (WR-407, #434; SolidCraft change,
+    /// tangency-labs/smlib 1b6f5fa) the cover across the fold fails and changes nothing.
+    #[test]
+    fn issue_434_cover_refuses_a_continuation_that_folds() -> Result<()> {
+        let mut k = Kernel::default();
+        k.fixes.cover_refuses_folded_continuation = true;
+        let (covered, u_max) = issue_434_cover_across_a_fold(&k)?;
         assert!(
             !covered.success,
             "the fold at u = 1.5 must not be covered: {covered:?}"
         );
         // Nothing was changed by the refused cover.
-        assert_eq!(this.step_uv_domain().u_interval().max(), 1.0);
+        assert_eq!(u_max, 1.0);
+        Ok(())
+    }
+
+    /// Default (pinned SMLib `c9c5979`): the cover succeeds and extends the domain onto
+    /// the fold, as upstream does (WR-407).
+    #[test]
+    fn issue_434_default_covers_across_the_fold() -> Result<()> {
+        let k = Kernel::default();
+        assert!(!k.fixes.cover_refuses_folded_continuation);
+        let (covered, u_max) = issue_434_cover_across_a_fold(&k)?;
+        assert!(
+            covered.success,
+            "upstream covers across the fold: {covered:?}"
+        );
+        assert!(u_max > 1.0, "upstream extends the u domain: {u_max}");
         Ok(())
     }
 }

@@ -477,7 +477,7 @@ where
     D::Surface: Ord,
 {
     let (final_result, original_other) = driver.operands();
-    let final_result = final_result.ok_or_else(|| SolidError::null_pointer(OP))?;
+    final_result.ok_or_else(|| SolidError::null_pointer(OP))?;
     let original_other = original_other.ok_or_else(|| SolidError::null_pointer(OP))?;
     // The first surface query is observable even though upstream overwrites it.
     let _ = driver.surfaces(original_other)?;
@@ -485,6 +485,37 @@ where
     // half edited) ends the merge (SolidCraft change, tangency-labs/smlib af8db37;
     // upstream ignores its status).
     driver.intersect_insert_relate(k)?;
+    piecewise_merge_related(
+        k,
+        driver,
+        skip_pairs,
+        use_existing_topology,
+        create_new_breps_for_faces,
+    )
+}
+
+/// [`piecewise_merge`] after its leading `m_vTI.IntersectInsertRelate()`: the caller
+/// has already intersected, inserted and related the operands on the intersector
+/// that `SmMerge::m_vTI` names (as `SmFilletExecutive::DoPiecewiseMerge` does with
+/// its own `m_vTI`, which carries its corners' registered SSI), and the
+/// face-at-a-time merges follow on `driver`.
+///
+/// # Errors
+/// As [`piecewise_merge`].
+pub fn piecewise_merge_related<D: PiecewiseAccess>(
+    k: &mut Kernel,
+    driver: &mut D,
+    skip_pairs: Option<&Relation<D::Surface, D::Surface>>,
+    use_existing_topology: bool,
+    create_new_breps_for_faces: bool,
+) -> Result<Option<D::Operand>>
+where
+    D::Operand: Copy,
+    D::Surface: Ord,
+{
+    let (final_result, original_other) = driver.operands();
+    let final_result = final_result.ok_or_else(|| SolidError::null_pointer(OP))?;
+    let original_other = original_other.ok_or_else(|| SolidError::null_pointer(OP))?;
     let surfaces = driver.surfaces(original_other)?;
     driver.clear_relationships()?;
     if let Some(pairs) = skip_pairs {
@@ -788,7 +819,7 @@ fn list_operand(k: &mut Kernel, breps: &[Brep], surfaces: &[Surface]) -> Result<
             let copy = copy_base_surface(k, source)?;
             // Upstream records ONLY the last surface's kind.
             planar = matches!(copy.kind(), SurfaceKind::Plane(_));
-            let domain = copy.natural_uv_domain();
+            let domain = copy.natural_uv_domain_with_nurb(k)?;
             create_face_from_surface(k, &mut result, copy, domain)?;
         }
         (result, planar)

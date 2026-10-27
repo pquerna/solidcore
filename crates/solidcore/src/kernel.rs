@@ -153,6 +153,10 @@ pub struct UpstreamFixes {
     pub fillet_refuse_rails_leaving_faces: bool,
     /// `create_fillet_brep` refuses blends that take the whole of a face they roll on (`FacesOutlastTheirBlends`, no room) (WR-320, #879).
     pub fillet_refuse_face_consuming_blends: bool,
+    /// `DoFillet` refuses a filleted target that is not a closed manifold solid (an edge that is not `SmEdge::IsManifold`) with `SM_FILERR_BAD_MERGE`, where upstream returns success (WR-212, #422).
+    pub fillet_refuse_non_manifold_result: bool,
+    /// The fillet executive refuses two rounds on edges of one face whose rails cross on it (no room between them), before the target is edited, where upstream builds an open body (WR-460, #1073).
+    pub fillet_refuse_crossing_rails: bool,
     /// The fillet solver tries the corner ball's patch after the torus when a round's centre line collapses to a point (WR-420, #416).
     pub fillet_corner_ball_patch: bool,
     /// `CalcTorusFilletGeom` revolves a linear section into a cone (WR-421, #420).
@@ -191,7 +195,7 @@ pub struct UpstreamFixes {
     pub cylinder_rebuild_mean_radius: bool,
     /// `SweepProfilesAlongPath` asks for caps only when the profile closes (WR-400, #837).
     pub planar_path_uncapped_open_profiles: bool,
-    /// A full-turn rotational sweep of a multi-curve profile makes lines and arcs their analytic surfaces (WR-401, #545).
+    /// A rotational sweep (whole or partial turn) makes each line and circular arc of its profile its cylinder, cone, sphere or torus, not only a one-curve profile's (WR-448, #545; SolidCraft change, tangency-labs/smlib 0b143f7).
     pub revolve_analytic_profile_faces: bool,
     /// A taper extrude's corner whose links meet at both ends pivots on the joint nearest its offset curve (WR-402, #479).
     pub taper_pivot_nearest_corner: bool,
@@ -207,6 +211,8 @@ pub struct UpstreamFixes {
     pub offset_resolve_crossing_loops: bool,
     /// An inward shell mates the walls across rounds thinner than it (collapsed faces) (#397).
     pub offset_collapsed_rounds_mated: bool,
+    /// `FaceuseOffset` fails on a face whose offset surface is missing without collapsing (`SmSurface::OffsetCollapses`: a cone, cylinder, sphere or torus offset onto its spine), where upstream reads any missing surface as a collapsed round (WR-464, #1072).
+    pub offset_missing_surface_fails: bool,
     /// At an Nx1 corner whose end rib cannot be built because a rail missed a side edge ending within the fillet's width, the rib is deleted and the global merge cuts the round off (WR-303, #841).
     pub fillet_nx1_end_rib_global_merge: bool,
     /// `sm_FixUVTrimCurves` moves only the end control points of the two UV trims meeting at a corner onto the vertex's UV point, without dropping the vertex onto them, trimming there and stretching them back over the edge interval (WR-255, #959/#570; the fork's tangency-labs/smlib@5af7070).
@@ -233,6 +239,34 @@ pub struct UpstreamFixes {
     pub sweep_frame_on_planar_path_normal: bool,
     /// `CoverCoincidentSurface` refuses a cover that extends a B-spline-based surface onto a continuation whose normal vanishes or turns back (a fold) over the domain the merge would use (WR-407, #434; SolidCraft change, tangency-labs/smlib 1b6f5fa).
     pub cover_refuses_folded_continuation: bool,
+    /// A boolean vertex takes its position from the intersection curve that crosses its edge most steeply (WR-410, #1059).
+    pub boolean_vertex_by_best_crossing: bool,
+    /// `SmMerge::BooleanPostProcess` also checks the merged face's edges that a face merge left with that face on both sides (slits), not only the intersection edges (WR-304, #1120).
+    pub boolean_cleanup_removes_slits: bool,
+    /// `SmFace::CurveOnClassify` classifies an interval whose two ends lie on one face edge (or its vertices) and whose midpoint is within the intersection tolerance of it as on that edge (the fork's `ClassifyEdgeInterval`, WR-305, #1057).
+    pub classify_edge_interval: bool,
+    /// `SmProtoEdge::Resolve` treats a proto edge from a proto vertex back to itself whose ends find one vertex definition as degenerate below twice the proto vertex's containment radius, and `ImprintIntersections` fits that vertex to its edges (WR-306, #1058).
+    pub degenerate_proto_edge_in_one_vertex: bool,
+    /// `MakeEdgeInFaceWithVU` grows each end vertex's tolerance to twice its gap to the new edge's end (only if larger), after `RefreshTolerance` keeps it as it was, so `AssertValid` does not refuse the edge (WR-469, #870; the SolidCraft fork's fix; `plan/upstream-issues/WR-469--make-edge-in-face-vertex-tolerance-gap.md`).
+    pub new_edge_vertex_tolerance_covers_gap: bool,
+    /// A torus rebuilt from its NURB measures its generating interval signed (WR-408, #1112).
+    pub torus_signed_gen_curve_interval: bool,
+    /// A sheet sweep's open-profile wires are glued where the curves meet (WR-409, #1113).
+    pub sheet_sweep_joins_profile_wires: bool,
+    /// `FindPolygonGuess` keeps a suspicious control-net triangle guess as a candidate against the nearest control point's, and returns the nearer one on the surface, so a rational surface whose control points are farther apart than its neighbouring parts does not lose a good guess (WR-444, #1164).
+    pub point_solve_keeps_triangle_guess: bool,
+    /// `SmFilletVertex::CalcSetBackVert` measures a corner setback from the vertex `GetStartVertex()` marks over the edge's own interval, not from `GetVertex()` over the curve's natural interval, so an edge whose primary edge use runs against its curve is not measured from its far end (WR-445, #1169).
+    pub fillet_setback_from_start_vertex: bool,
+    /// `SmEdgeDefinition::Imprint` first moves each end of an intersection edge's interval to the curve's point nearest its proto vertex when that point lies inside the interval, so the edge does not run past its vertex along a face rim (screw-thread groove booleans: "Face has partially Coincident Edges", `SmFace` test #34; WR-452, #435, #410; tangency-labs/smlib b43876f).
+    pub imprint_trims_edge_to_proto_vertex: bool,
+    /// `SmEdgeDefinition::Imprint` continues an intersection edge's 3d and UV curves, each by the polynomial of its own end span, to a proto vertex that lies a few tolerances past the curve's end, so the edge reaches its vertex (internal thread cuts; WR-453, #410; tangency-labs/smlib a8caccd).
+    pub imprint_extends_edge_to_proto_vertex: bool,
+    /// `SmBSplineSurface::CopyAndAddAnalytics` keeps an exact copy where the recognised analytic surface does not give the same points at the same parameters (7 x 7 grid), so a face split by `MakeEdgeInFaceWithVU` keeps trims that still lie on its edges (WR-450, #387; the fork's tangency-labs/smlib@276b509).
+    pub analytic_copy_keeps_parameterization: bool,
+    /// `SmFilletSolver::ComputePointValues`' bigger-step retry of the forward finite-difference step solves with the bigger step (`dBigStep`), not with the small `dStep` again (WR-456, #1181).
+    pub fillet_point_bigger_step_retry: bool,
+    /// A fillet's trace also runs through the filleted edge's end where a rail ends on an extended edge, so the surface reaches that end (#1022, WR-468).
+    pub fillet_through_extended_rail_end: bool,
 }
 
 /// Options for [`Kernel::new`].

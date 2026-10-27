@@ -25,6 +25,7 @@
 //! | [`Ellipse::create_simple_offset`]                  | `SmCircle::CreateSimpleOffset`                    |
 //! | [`Ellipse::assert_valid`]                          | `SmEllipse::AssertValid`, `SmCircle::AssertValid` |
 //! | [`Ellipse::read_from_db`]                          | `SmEllipse::ReadFromDB`, `SmCircle::ReadFromDB`   |
+//! | [`Ellipse::write_to_db`]                           | `SmEllipse::WriteToDB`, `SmCircle::WriteToDB`     |
 //! | [`Ellipse::convert_to_2d`]                         | `SmEllipse::ConvertTo2D`                          |
 //! | [`Ellipse::convert_t_from_nurbs_to_step`]          | `SmEllipse::ConvertTFromNURBSToSTEP`              |
 //! | [`Ellipse::adjust_step_interval`]                  | `SmEllipse::AdjustSTEPInterval`                   |
@@ -40,6 +41,7 @@
 //! | [`PolarConversion::is_current`]                    | `SmPolarConversion::IsCurrent`                    |
 //! | [`PolarConversion::assert_valid`]                  | `SmPolarConversion::AssertValid`                  |
 //! | [`PolarConversion::read_from_db`], [`PolarConversion::read_from_db_with_curve`] | `SmPolarConversion::ReadFromDB` (ellipse back pointer; null back pointer, from `SmSurfOfRevolution::ReadFromDB`) |
+//! | [`PolarConversion::write_to_db`]                   | `SmPolarConversion::WriteToDB`                    |
 //!
 //! Deviations:
 //! - **Circle class.** `SmCircle` derives from `SmEllipse` without data of its own;
@@ -55,6 +57,8 @@
 //!   one owned by a surface of extrusion or revolution needs its generator range
 //!   (units `surface.surf_of_extrusion_p1`, `surface.surf_of_revolution_p1`). These
 //!   return [`SolidError::Unported`].
+//!   Trimming accepts a caller-resolved owning edge tolerance through
+//!   `trim_with_zone_tol`; public ownerless trimming uses the system tolerance.
 //! - **Notifications.** `Notify(SM_NO_POST_EDIT)` rebuilds the polar converter
 //!   (status ignored); the other operations only drop caches the ellipse does not
 //!   own here, and `SM_NO_UNKNOWN` only logs. `SmCurve::Notify`'s cache bookkeeping
@@ -116,7 +120,9 @@ use crate::nurbs::crv_basic::ConicType;
 use crate::nurbs::crv_common::{elliptical_arc_tol, EllipseArc};
 use crate::nurbs::index::at;
 use crate::nurbs::nurbs_crv::to_euclid;
-use crate::topology::database_io::{DatabaseReader, FileType, InputStream};
+use crate::topology::database_io::{
+    fixed16, DatabaseReader, DatabaseWriter, FileType, InputStream,
+};
 
 use super::p2::{Ellipse, EllipseOptions, PolarConversion};
 
@@ -563,6 +569,101 @@ impl PolarConversion {
         }
         pc.has_curve = curve.is_some();
         Ok((pc, curve))
+    }
+
+    /// `WriteToDB`: writes the set-up flag, the knot, angle and exactness counts and
+    /// whether the table owns a copy of its curve (`owned_curve`; the ellipse's own
+    /// table borrows it and passes `None`), then the three arrays (ASCII: a line
+    /// break after the elements with index 5, 10, ... and after a partial last line),
+    /// then the owned curve (`m_cpCurve`, any curve kind) with its type header, as
+    /// a curve nested `depth` levels deep.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`crate::topology::geometry_write::write_curve_at`] for the owned curve.
+    pub fn write_to_db(
+        &self,
+        db: &mut DatabaseWriter,
+        version: u64,
+        owned_curve: Option<&Curve>,
+        depth: usize,
+    ) -> Result<()> {
+        let ascii = db.file_type() == FileType::Ascii;
+        let n_knots = self.natural_knots.len() as u64;
+        let n_angles = self.angles.len() as u64;
+        let n_exact = self.exact_conversion.len() as u64;
+        let has_curve = i32::from(owned_curve.is_some());
+        let possible = i32::from(self.possible);
+
+        if ascii {
+            db.out_i64(possible.into());
+            db.out_str(
+                " SmPolarConversion PolarConversionPossible - TRUE=tables are initialized \n",
+            );
+            db.out_u64(n_knots);
+            db.out_str(" SmPolarConversion Number of Natural Knots \n");
+            db.out_u64(n_angles);
+            db.out_str(" SmPolarConversion Number of Angles \n");
+            db.out_u64(n_exact);
+            db.out_str(" SmPolarConversion Number of ExactConversion Flags \n");
+            db.out_i64(has_curve.into());
+            db.out_str(
+                " SmPolarConversion TRUE = Has Curve for stored conversions, \
+                 FALSE = back pointer \n",
+            );
+        } else {
+            db.write_boolean(possible);
+            db.write_long(n_knots as i64);
+            db.write_long(n_angles as i64);
+            db.write_long(n_exact as i64);
+            db.write_boolean(has_curve);
+        }
+
+        // Write Arrays
+        if ascii {
+            let rows = |db: &mut DatabaseWriter, values: &mut dyn Iterator<Item = String>| {
+                let mut n = 0usize;
+                for (ii, v) in values.enumerate() {
+                    db.out_str(&v).out_str(" ");
+                    if ii > 0 && ii % 5 == 0 {
+                        db.out_str("\n");
+                    }
+                    n += 1;
+                }
+                if n > 0 && n % 5 != 0 {
+                    db.out_str("\n");
+                }
+            };
+            let exact = &self.exact_conversion;
+            let mut flags = exact.iter().map(|&b| i32::from(b).to_string());
+            rows(db, &mut self.natural_knots.iter().map(|&x| fixed16(x)));
+            rows(db, &mut self.angles.iter().map(|&x| fixed16(x)));
+            rows(db, &mut flags);
+        } else {
+            if n_knots > 0 {
+                db.write_doubles(&self.natural_knots);
+            }
+            if n_angles > 0 {
+                db.write_doubles(&self.angles);
+            }
+            if n_exact > 0 {
+                let exact = &self.exact_conversion;
+                let flags: Vec<i32> = exact.iter().map(|&b| i32::from(b)).collect();
+                db.write_booleans(&flags);
+            }
+        }
+
+        // write out the curve the table owns (the ellipse's own table borrows it)
+        if let Some(c) = owned_curve {
+            if ascii {
+                db.out_str(" SmPolarConversion->CurveBeingConverted \n");
+            }
+            db.write_type(c.type_code(), Some(c.dim()));
+            crate::topology::geometry_write::write_curve_at(c, db, version, depth)?;
+        } else if ascii {
+            db.out_str("Has No Copy of SmPolarConversion->CurveBeingConverted \n");
+        }
+        Ok(())
     }
 
     /// The end of a read whose table has no stored curve: the back pointer
@@ -1242,6 +1343,53 @@ impl Ellipse {
         Ok(e)
     }
 
+    /// `WriteToDB` (`SmCircle::WriteToDB` is the same): writes the placement origin
+    /// and axes, the angular domain (degrees), the two radii and the inside-out flag,
+    /// then the polar converter (which borrows this ellipse) and the B-spline curve
+    /// part.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`PolarConversion::write_to_db`]; `SM_ERR` when the B-spline part has
+    /// no NURB (upstream ignores the part's status; its virtual
+    /// `GetOrCreateGwNurbPointer` always has one to write).
+    pub fn write_to_db(&self, db: &mut DatabaseWriter, version: u64) -> Result<()> {
+        let o = self.position.origin();
+        let x = self.position.x_axis();
+        let y = self.position.y_axis();
+        let (lo, hi) = (self.anal_domain.min(), self.anal_domain.max());
+        let inside_out = i32::from(self.inside_out);
+        let ascii = db.file_type() == FileType::Ascii;
+        if ascii {
+            db.out_reals(&[o.x, o.y, o.z]);
+            db.out_str(" SmEllipse Axis Origin \n");
+            db.out_reals(&[x.x, x.y, x.z]);
+            db.out_str(" SmEllipse X Axis\n");
+            db.out_reals(&[y.x, y.y, y.z]);
+            db.out_str(" SmEllipse Y Axis\n");
+            db.out_reals(&[lo, hi]);
+            db.out_str(" SmEllipse angular arc domain in degrees \n");
+            db.out_f64(self.radius_x);
+            db.out_str(" SmEllipse X_Axis radius \n");
+            db.out_f64(self.radius_y);
+            db.out_str(" SmEllipse Y_Axis radius \n");
+            db.out_i64(inside_out.into());
+            db.out_str(" SmEllipse InsideOut Flag \n");
+        } else {
+            db.write_doubles(&[o.x, o.y, o.z, x.x, x.y, x.z, y.x, y.y, y.z]);
+            db.write_doubles(&[lo, hi, self.radius_x, self.radius_y]);
+            db.write_boolean(inside_out);
+        }
+
+        // PolarConverter
+        if ascii {
+            db.out_str(" SmEllipse->PolarConverter \n");
+        }
+        self.polar.write_to_db(db, version, None, 0)?;
+
+        self.base.write_to_db(db, version)
+    }
+
     // ---- conversions ------------------------------------------------------------------
 
     /// Projects the ellipse onto the x-y plane (`ConvertTo2D`): the NURB is made 2D
@@ -1871,6 +2019,27 @@ impl Ellipse {
     /// Those of [`BSplineCurve::trim`]; `InvalidInput` when an end cannot be converted
     /// (upstream: an uninitialised angle).
     pub fn trim(&mut self, k: &Kernel, trim_interval: &mut Extent1d, mode: TrimMode) -> Result<()> {
+        self.trim_with_zone_tol(
+            k,
+            trim_interval,
+            mode,
+            crate::geom::tol::zone_tol_3d(k, crate::geom::tol::SmallTopoType::NormalSize),
+        )
+    }
+
+    /// Trims with the caller-resolved owning edge's 3D zone tolerance, forwarding
+    /// it to both base-curve trim passes without changing interval-only behavior.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`Self::trim`].
+    pub(crate) fn trim_with_zone_tol(
+        &mut self,
+        k: &Kernel,
+        trim_interval: &mut Extent1d,
+        mode: TrimMode,
+        zone_tol_3d: f64,
+    ) -> Result<()> {
         // no work - current natural interval is a subSet of targetInterval
         let nat_ivl = self.base.natural_interval();
         if nat_ivl.is_contained_by(trim_interval, EFF_ZERO) {
@@ -1878,7 +2047,8 @@ impl Ellipse {
         }
 
         // First ask SmBSplineCurve::Trim to compute the actual trim interval.
-        self.base.trim(k, trim_interval, TrimMode::IntervalOnly)?;
+        self.base
+            .trim_with_zone_tol(k, trim_interval, TrimMode::IntervalOnly, zone_tol_3d)?;
 
         // all done when asked to stop here
         if mode == TrimMode::IntervalOnly {
@@ -1900,7 +2070,8 @@ impl Ellipse {
         let max_step = to_step(self, trim_interval.max())?;
 
         // pass the call to Trim the BSpline - skip its Notify call
-        self.base.trim(k, trim_interval, TrimMode::Silent)?;
+        self.base
+            .trim_with_zone_tol(k, trim_interval, TrimMode::Silent, zone_tol_3d)?;
 
         // store the angular interval paying attention to m_bInsideOut
         if self.inside_out {

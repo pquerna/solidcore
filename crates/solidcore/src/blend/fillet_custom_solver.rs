@@ -282,27 +282,52 @@ pub(crate) fn offset_local_point_solve(
 }
 
 /// `GlobalPointSolve(domain, SM_SO_MINIMIZE, point, SM_EFF_ZERO_SQ, NULL, SM_SR_SINGLE,
-/// ..)` of a base surface: the UV points of the solutions.
+/// ..)` of a base surface: the UV points of the solutions. `owner` is the B-rep and
+/// face owning the surface (a face's surface, `SurfaceId::Face`), whose trim test the
+/// fast drop runs (`pFace->PointClassify`, making the face's trimmed cache when it has
+/// none).
 pub(crate) fn surface_global_point_solve(
     k: &Kernel,
     s: &Surface,
+    owner: Option<(&mut Brep, FaceId)>,
     domain: &Extent2d,
     point: Point3,
     tol: f64,
 ) -> Result<Vec<Point2>> {
-    let starts = crate::surface::surface::p4::global_point_solve_starts(
-        k,
-        s,
-        domain,
-        SolverOperation::Minimize,
-        point,
-        tol,
-        SolutionRequested::Single,
-    )?;
+    let starts = match owner {
+        Some((b, f)) => crate::intersect::point_class::live_owned_surface_global_point_solve(
+            k,
+            s,
+            b,
+            f,
+            domain,
+            SolverOperation::Minimize,
+            point,
+            tol,
+            SolutionRequested::Single,
+        )?,
+        None => crate::surface::surface::p4::global_point_solve_starts(
+            k,
+            s,
+            domain,
+            SolverOperation::Minimize,
+            point,
+            tol,
+            SolutionRequested::Single,
+        )?,
+    };
     starts
         .iter()
         .map(|e| Ok(Point2::new(e.param(0)?, e.param(1)?)))
         .collect()
+}
+
+/// The B-rep and face owning a base surface: `GetOwner()` of a face's surface.
+pub(crate) fn face_owner(brep: Option<&mut Brep>, base: SurfaceId) -> Option<(&mut Brep, FaceId)> {
+    match (brep, base) {
+        (Some(b), SurfaceId::Face(f)) => Some((b, f)),
+        _ => None,
+    }
 }
 
 // ---- co-ported solver data ------------------------------------------------------------
@@ -316,6 +341,12 @@ pub struct ConstantRadiusAssistedFs {
     pub solver: FilletSolver,
     /// `m_dFilletRadii`: the offset radius of each surface.
     pub fillet_radii: [f64; 2],
+    /// The object is an `SmConstantRadiusFS` itself, not an
+    /// `SmConstantRadiusAssistedFS`: `GetType`, `IsKindOf`, `GetSolverType` and
+    /// `PointOnPlaneSolve` are then `SmConstantRadiusFS`'s (the last the base
+    /// `SmFilletSolver::PointOnPlaneSolve`). Set by the constructors that build a plain
+    /// `SmConstantRadiusFS` (`SetFilletParameters`); `false` from [`Self::from_parts`].
+    pub plain: bool,
 }
 
 impl ConstantRadiusAssistedFs {
@@ -364,6 +395,7 @@ impl ConstantRadiusAssistedFs {
         Self {
             solver,
             fillet_radii,
+            plain: false,
         }
     }
 
@@ -570,7 +602,7 @@ struct InitialSetup {
 fn initial_setup(
     fs: &ConstantRadiusAssistedFs,
     k: &Kernel,
-    brep: Option<&Brep>,
+    brep: Option<&mut Brep>,
     rail_index: usize,
     surface1: &mut OffsetSurface,
     surface1_index: usize,
@@ -602,7 +634,7 @@ fn initial_setup(
     let mut other_eu = fs.solver.edgeuses.get(other_rail).copied().flatten();
     let need_brep = || SolidError::invalid_input(op, "edge uses without their B-rep");
     if let Some(eu) = other_eu {
-        let b = brep.ok_or_else(need_brep)?;
+        let b = brep.as_deref().ok_or_else(need_brep)?;
         if edgeuse::uv_trim_curve(b, eu)?.0.is_none() {
             other_eu = None;
         }
@@ -611,7 +643,7 @@ fn initial_setup(
     // But: if we are rolling on a different face (e.g., doing a rollover),
     // then this is the wrong Edgeuse, and we don't have an appropriate one to use.
     if let Some(eu) = other_eu {
-        let b = brep.ok_or_else(need_brep)?;
+        let b = brep.as_deref().ok_or_else(need_brep)?;
         if let Some(f) = edgeuse::face(b, eu)? {
             let same = b.face(f)?.surface.is_some() && surface2.base_id == SurfaceId::Face(f);
             if !same {
@@ -621,7 +653,7 @@ fn initial_setup(
     }
 
     if let Some(eu) = other_eu {
-        let b = brep.ok_or_else(need_brep)?;
+        let b = brep.as_deref().ok_or_else(need_brep)?;
         let edge_id = edgeuse::edge(b, eu)?
             .ok_or_else(|| SolidError::invalid_input(op, "edge use without edge"))?;
         let edge = b.edge(edge_id)?;
@@ -687,8 +719,14 @@ fn initial_setup(
         uv2 = guess2;
         fillet_edge = Some((curve, t));
     } else {
-        let sols =
-            surface_global_point_solve(k, base2, &base2.natural_uv_domain(), pnt, EFF_ZERO_SQ)?;
+        let sols = surface_global_point_solve(
+            k,
+            base2,
+            face_owner(brep, surface2.base_id),
+            &base2.natural_uv_domain(),
+            pnt,
+            EFF_ZERO_SQ,
+        )?;
         if sols.len() != 1 {
             return Err(SolidError::sm_err(op));
         }
@@ -828,7 +866,7 @@ impl EiffelTowerFs {
     pub fn load_initial_values(
         &mut self,
         k: &Kernel,
-        brep: Option<&Brep>,
+        brep: Option<&mut Brep>,
         do_surf2_calcs: bool,
         rail_index: usize,
         surface1: &mut OffsetSurface,
@@ -1408,7 +1446,7 @@ impl SecantConstantRadiusFs {
     pub fn load_initial_values(
         &mut self,
         k: &Kernel,
-        brep: Option<&Brep>,
+        brep: Option<&mut Brep>,
         do_surf2_calcs: bool,
         rail_index: usize,
         surface1: &mut OffsetSurface,
@@ -1718,7 +1756,7 @@ macro_rules! fillet_solver_ops {
             fn load_initial_values(
                 &mut self,
                 k: &Kernel,
-                brep: Option<&Brep>,
+                mut brep: Option<&mut Brep>,
                 do_surf2_calcs: bool,
                 rail_index: usize,
                 surface1: &mut OffsetSurface,
@@ -1730,7 +1768,7 @@ macro_rules! fillet_solver_ops {
                 <$t>::load_initial_values(
                     self,
                     k,
-                    brep,
+                    brep.as_deref_mut(),
                     do_surf2_calcs,
                     rail_index,
                     surface1,
@@ -1747,6 +1785,7 @@ macro_rules! fillet_solver_ops {
             fn point_on_plane_solve(
                 &mut self,
                 k: &Kernel,
+                mut brep: Option<&mut Brep>,
                 plane_origin: Point3,
                 plane_normal: Vec3,
                 uv_domain1: &Extent2d,
@@ -1758,7 +1797,7 @@ macro_rules! fillet_solver_ops {
                 crate::blend::fillet_standard_solver::p2::point_on_plane_solve(
                     self,
                     k,
-                    None,
+                    brep.as_deref_mut(),
                     plane_origin,
                     plane_normal,
                     uv_domain1,
@@ -1908,6 +1947,8 @@ macro_rules! fillet_intersector_ops {
 
             fn smooth_out_intersection(
                 &mut self,
+                k: &Kernel,
+                pseudo: &mut FilletBrep,
                 geom: &Self::FilletGeom,
                 curves_3d: &mut Vec<BSplineCurve>,
                 uv_curves1: &mut Vec<BSplineCurve>,
@@ -1915,6 +1956,8 @@ macro_rules! fillet_intersector_ops {
             ) -> Result<()> {
                 IntersectorOps::smooth_out_intersection(
                     &mut self.base,
+                    k,
+                    pseudo,
                     geom,
                     curves_3d,
                     uv_curves1,
@@ -2024,6 +2067,7 @@ impl FilletSolverOps for ConstantRadiusAssistedFs {
         &mut self,
         k: &Kernel,
         geometry: &mut crate::blend::fillet_geom::p1::FilletGeom,
+        rollover: crate::blend::fillet_solver::p1::RolloverGuesses,
         target: &mut Brep,
         rail_index: usize,
         edgeuse: EdgeuseId,
@@ -2031,7 +2075,7 @@ impl FilletSolverOps for ConstantRadiusAssistedFs {
         tsect: &mut TsectPnt,
     ) -> Result<Option<f64>> {
         crate::blend::fillet_solver::surfaces::rail_edgeuse_intersect(
-            self, k, geometry, target, rail_index, edgeuse, guess, tsect,
+            self, k, geometry, rollover, target, rail_index, edgeuse, guess, tsect,
         )
     }
 
@@ -2054,8 +2098,12 @@ impl FilletSolverOps for ConstantRadiusAssistedFs {
         Ok(ConstantRadiusAssistedFs::offset_radii_can_change(self))
     }
 
-    /// `SmConstantRadiusAssistedFS::GetType` (`SM_COMMON`).
+    /// `SmConstantRadiusAssistedFS::GetType` (`SM_COMMON`); `SmConstantRadiusFS`'s for a
+    /// [`plain`](Self::plain) solver.
     fn type_code(&self) -> Result<i64> {
+        if self.plain {
+            return Ok(crate::blend::fillet_standard_solver::p1::CONSTANT_RADIUS_FS_TYPE);
+        }
         Ok(CONSTANT_RADIUS_ASSISTED_FS_TYPE)
     }
 
@@ -2066,12 +2114,20 @@ impl FilletSolverOps for ConstantRadiusAssistedFs {
     /// `blend.fillet_solver_p4`'s `ShimSolver` does). It returned `SM_FS_CONST_RADIUS`
     /// until `blend.fillet_solver_p4` wired `ComputePointValues`, which made the
     /// intersector's `ComputeNextPoint` cases reach `StepSolve` and showed the gap.
+    /// A [`plain`](Self::plain) solver is `SmConstantRadiusFS`: `SM_FS_CONST_RADIUS`.
     fn solver_type(&self) -> Result<FilletSolverType> {
+        if self.plain {
+            return Ok(FilletSolverType::ConstRadius);
+        }
         Ok(FilletSolverType::ConstRadiusAssisted)
     }
 
-    /// `SmConstantRadiusAssistedFS::IsKindOf` (unit `blend.fillet_standard_solver_p2`).
+    /// `SmConstantRadiusAssistedFS::IsKindOf` (unit `blend.fillet_standard_solver_p2`);
+    /// `SmConstantRadiusFS::IsKindOf` for a [`plain`](Self::plain) solver.
     fn is_kind_of(&self, t: i64) -> Result<bool> {
+        if self.plain {
+            return Ok(crate::blend::fillet_standard_solver::p1::constant_radius_is_kind_of(t));
+        }
         Ok(crate::blend::fillet_standard_solver::p2::constant_radius_assisted_is_kind_of(t))
     }
 
@@ -2108,7 +2164,7 @@ impl FilletSolverOps for ConstantRadiusAssistedFs {
     fn load_initial_values(
         &mut self,
         k: &Kernel,
-        brep: Option<&Brep>,
+        brep: Option<&mut Brep>,
         do_surf2_calcs: bool,
         rail_index: usize,
         surface1: &mut OffsetSurface,
@@ -2134,10 +2190,11 @@ impl FilletSolverOps for ConstantRadiusAssistedFs {
     /// `SmConstantRadiusAssistedFS::PointOnPlaneSolve` (unit
     /// `blend.fillet_standard_solver_p2`): the override `StepSolve` and the other
     /// callers of the virtual dispatch to (the base `SmFilletSolver` version solves
-    /// a different system).
+    /// a different system, and is the one a [`plain`](Self::plain) solver inherits).
     fn point_on_plane_solve(
         &mut self,
         k: &Kernel,
+        mut brep: Option<&mut Brep>,
         plane_origin: Point3,
         plane_normal: Vec3,
         uv_domain1: &Extent2d,
@@ -2146,10 +2203,24 @@ impl FilletSolverOps for ConstantRadiusAssistedFs {
         uv2: Point2,
         point: &mut TsectPnt,
     ) -> Result<bool> {
+        if self.plain {
+            return FilletSolver::point_on_plane_solve(
+                self,
+                k,
+                brep.as_deref_mut(),
+                plane_origin,
+                plane_normal,
+                uv_domain1,
+                uv_domain2,
+                uv1,
+                uv2,
+                point,
+            );
+        }
         crate::blend::fillet_standard_solver::p2::point_on_plane_solve(
             self,
             k,
-            None,
+            brep,
             plane_origin,
             plane_normal,
             uv_domain1,

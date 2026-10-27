@@ -131,6 +131,12 @@ pub trait SweepIdentities {
     fn new_curve(&self, _brep: BrepId, _edge: EdgeId, _type_code: i64) -> Result<ObjectRef> {
         Err(invalid("new split curve needs its caller identity"))
     }
+    /// Whether a curve the merge allocates at an edge split takes its actual Curve
+    /// identity from the edit's notification context when it is constructed
+    /// (`p9::CurveIdentity::Actual`), instead of [`Self::new_curve`].
+    fn actual_curve_identities(&self) -> bool {
+        false
+    }
     /// Reserve two distinct non-object handles for each primary region's merge
     /// source lists. They must not collide with topology, geometry or other lists.
     fn source_lists(
@@ -152,6 +158,10 @@ impl core::fmt::Debug for Identities<'_> {
     }
 }
 impl Identities<'_> {
+    fn actual_curve_identities(self) -> bool {
+        self.0.is_some_and(SweepIdentities::actual_curve_identities)
+    }
+
     fn source_lists(
         self,
         namespace: u32,
@@ -552,6 +562,49 @@ impl<'a> SweepStore<'a> {
             )?
             .ok_or_else(|| SolidError::null_pointer(OP))
         })
+    }
+
+    /// [`Self::piecewise_merge_skipping`] after its leading `IntersectInsertRelate`
+    /// ([`crate::boolean::merge::p3::piecewise_merge_related`]): the caller has
+    /// already related the operands on its own intersector.
+    ///
+    /// # Errors
+    /// As [`Self::piecewise_merge_skipping`].
+    pub fn piecewise_merge_related_skipping(
+        &mut self,
+        id: SweepMergeId,
+        skip_pairs: Option<&Relation<ObjectRef, ObjectRef>>,
+        use_existing_topology: bool,
+        create_new_breps_for_faces: bool,
+    ) -> Result<BrepId> {
+        self.run_merge(id, |k, driver| {
+            crate::boolean::merge::p3::piecewise_merge_related(
+                k,
+                driver,
+                skip_pairs,
+                use_existing_topology,
+                create_new_breps_for_faces,
+            )?
+            .ok_or_else(|| SolidError::null_pointer(OP))
+        })
+    }
+
+    /// The `m_vTI` of a live merge session, for a caller that configures it as its
+    /// own `SmMerge` base does (`SmFilletExecutive` sets `m_bIgnoreTangency` and
+    /// `m_bDoingFillets`).
+    ///
+    /// # Errors
+    /// An unknown or released merge.
+    pub fn merge_intersector_mut(
+        &mut self,
+        id: SweepMergeId,
+    ) -> Result<&mut KernelManifoldIntersector> {
+        Ok(&mut self
+            .merges
+            .get_mut(id.0 as usize)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| invalid("unknown or released merge"))?
+            .intersector)
     }
 
     fn insert_body(&mut self, context: ContextId, mut body: Body<'a>) -> Result<BrepId> {

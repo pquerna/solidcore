@@ -12,8 +12,9 @@
 //! recurses once with maximum length zero; an explicit depth limit of two guards
 //! that invariant. Split arrays are limited to 1,000,000 entries before allocation
 //! or concatenation. Unsupported surface virtuals return `Unported`, never an
-//! approximate replacement (the diagonal curves of a cone, sphere or torus, which
-//! the port's B-spline-only `SmCrvOnSurf` cannot carry). Iso curves come from the
+//! approximate replacement. The diagonal curves of a cone, sphere or torus are
+//! `SmCrvOnSurf` over the analytic surface itself ([`CrvOnSurf`] holds any
+//! [`Surface`]). Iso curves come from the
 //! kind's own `CreateIsoParametricCurve`, and implicit iso curves evaluate the plane,
 //! cone, sphere and torus through their own evaluation, as upstream's virtuals;
 //! curve-bounded, STEP, offset and in-volume surfaces build both kinds of iso curve
@@ -53,23 +54,22 @@ use crate::surface::surface_cache::BezierPatch;
 const OP: &str = "surface::surface::p9::find_tessellation_splits";
 const MAX_SPLITS: usize = 1_000_000;
 
-fn bss(surface: &Surface) -> Result<Cow<'_, BSplineSurface>> {
+fn bss<'a>(k: &Kernel, surface: &'a Surface) -> Result<Cow<'a, BSplineSurface>> {
     match surface.kind() {
         SurfaceKind::BSpline(s) => Ok(Cow::Borrowed(s)),
         SurfaceKind::Plane(p) => Ok(p.base_for_query()),
         SurfaceKind::Cone(_) | SurfaceKind::Sphere(_) | SurfaceKind::Torus(_) => {
-            // DISPATCH GAP: only the diagonal `SmCrvOnSurf` of `FindTessellationSplits`
-            // gets here (iso curves dispatch to the kinds' own overrides; the kernel
-            // asks for diagonals only for B-spline and extrusion surfaces): the port's
-            // `CrvOnSurf` holds a B-spline surface, upstream's the analytic one.
-            // UNPORTED(surface.surface_p9): SmCrvOnSurf over an analytic surface
-            Err(SolidError::unported(
-                "SmCrvOnSurf::SmCrvOnSurf(analytic surface)",
-                "surface.surface_p9",
+            // (unreachable: iso curves of these kinds dispatch to the kinds' own
+            // overrides, and the diagonal `SmCrvOnSurf` of `FindTessellationSplits`
+            // holds the analytic surface itself, as upstream, not a B-spline view)
+            Err(SolidError::invalid_input(
+                OP,
+                "surface has no B-spline view",
             ))
         }
         SurfaceKind::SurfOfRevolution(s) => Ok(Cow::Borrowed(s.base())),
-        SurfaceKind::SurfOfExtrusion(s) => Ok(Cow::Borrowed(s.base())),
+        // (the B-spline evaluation makes a missing NURB: GetOrCreateGwNurbPointer)
+        SurfaceKind::SurfOfExtrusion(s) => s.base_with_nurb(k),
         SurfaceKind::CurveBounded(_)
         | SurfaceKind::Step(_)
         | SurfaceKind::OffsetSurface(_)
@@ -106,7 +106,7 @@ fn typed_iso_curve(
     value: f64,
     approx_tol: f64,
 ) -> Result<(BSplineCurve, Curve)> {
-    let typed = match surface.kind() {
+    let typed = match surface.kind_with_nurb(k)? {
         // (no override: the `SmSurface` body, whose approximation uses the tolerance)
         SurfaceKind::CurveBounded(_)
         | SurfaceKind::Step(_)
@@ -137,7 +137,7 @@ fn typed_iso_curve(
                 .curve
         }
         _ => {
-            let base = bss(surface)?
+            let base = bss(k, surface)?
                 .create_iso_parametric_curve(k, direction, value, IsoCurveOptions::default())?
                 .curve;
             let typed = Curve::from(base.clone());
@@ -150,6 +150,7 @@ fn typed_iso_curve(
 /// `SmIsoCurve(surface, direction, value, left)` (clamped input): over the B-spline
 /// view of `surface`, or over the surface itself for a plane, cone, sphere or torus.
 pub(super) fn implicit_iso(
+    k: &Kernel,
     surface: &Surface,
     direction: SurfParamType,
     value: f64,
@@ -177,7 +178,7 @@ pub(super) fn implicit_iso(
         )?));
     }
     Ok(Curve::from(IsoCurve::new(
-        bss(surface)?.copy(),
+        bss(k, surface)?.copy(),
         direction,
         value,
         left,
@@ -225,7 +226,7 @@ impl Surface {
         direction: SurfParamType,
         tolerance: f64,
     ) -> Result<Option<(Curve, Curve)>> {
-        let domain = self.natural_uv_domain();
+        let domain = self.natural_uv_domain_with_nurb(k)?;
         let (min, max) = match direction {
             SurfParamType::U => (domain.min().x, domain.max().x),
             SurfParamType::V => (domain.min().y, domain.max().y),
@@ -389,7 +390,7 @@ impl Surface {
             } else {
                 boundary.x
             };
-            let curve = implicit_iso(self, direction, value, true)?;
+            let curve = implicit_iso(k, self, direction, value, true)?;
             let degenerate = curve.is_degenerate(k, EFF_ZERO, None)?;
             let is_linear = curve.is_linear(k, linear_tol, true)?.linear;
             let mut splits = Vec::new();
@@ -409,7 +410,7 @@ impl Surface {
                 } else {
                     uv.x
                 };
-                let curve = implicit_iso(self, direction, value, true)?;
+                let curve = implicit_iso(k, self, direction, value, true)?;
                 final_linear = curve.is_linear(k, linear_tol, true)?.linear;
                 if !final_linear {
                     match curve.tessellate_by_bisection(k, &interval, chord, angle, max_side) {
@@ -870,7 +871,7 @@ impl<'a, O: SolutionObject + 'a> CsiGlobalSolver<'a, '_, O> {
                 t_conts[1] = continuity;
             }
         }
-        let natural_domain = parent_surface.natural_uv_domain();
+        let natural_domain = parent_surface.natural_uv_domain_with_nurb(k)?;
         for (dir, leaf, parent, work, conts) in [
             (
                 SurfParamType::U,
@@ -1148,7 +1149,7 @@ impl<'a, O: SolutionObject + 'a> CsiGlobalSolver<'a, '_, O> {
                 if cont.is_none_or(|c| (*c as i32) > ContinuityType::C0 as i32) {
                     continue;
                 }
-                let iso = implicit_iso(eval_surface, dir, constant, j == 0)?;
+                let iso = implicit_iso(k, eval_surface, dir, constant, j == 0)?;
                 if iso.is_degenerate(k, EFF_ZERO, None)? {
                     continue;
                 }

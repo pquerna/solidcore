@@ -2207,8 +2207,8 @@ impl<'a> GapFunction<'a> {
         let (mut knots_u, mut knots_v) = match (this_curve, this_surface) {
             (Some(c), _) => (unique_knots(c.knots(k, None))?, vec![0.0]),
             (None, Some(s)) => (
-                unique_knots(s.knots(SurfParamType::U, None))?,
-                unique_knots(s.knots(SurfParamType::V, None))?,
+                unique_knots(s.knots_with_nurb(k, SurfParamType::U, None))?,
+                unique_knots(s.knots_with_nurb(k, SurfParamType::V, None))?,
             ),
             (None, None) => return Err(SolidError::invalid_input(OP_GF, "no this geometry")),
         };
@@ -2593,7 +2593,7 @@ impl<'a> GapFunction<'a> {
             (Some(u), Some(v)) => Some(Point2::new(u, v)),
             _ => None,
         };
-        let domain = other.natural_uv_domain();
+        let domain = other.natural_uv_domain_with_nurb(k)?;
         let (mut success, mut uv, mut dist) = surface_drop(k, other, this_pos, &domain, guess)?;
 
         // If we don't like the result of the drop with a guess, try without a guess
@@ -2622,7 +2622,7 @@ impl<'a> GapFunction<'a> {
             sample.set_canonical(this_pos, this_u, this_v, p, uv.x, uv.y, drop_type, tol);
         } else {
             // failed to drop - load a zero length gap vector
-            let min = other.natural_uv_domain().min();
+            let min = other.natural_uv_domain_with_nurb(k)?.min();
             sample.set_canonical(
                 this_pos,
                 this_u,

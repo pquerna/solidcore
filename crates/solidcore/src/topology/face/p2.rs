@@ -66,6 +66,9 @@
 //!   thread edge's trim 5e-5 off its edge, tolerance 1e-5). That is the default here, as
 //!   upstream; with [`UpstreamFixes::uv_trim_corner_end_points_only`](crate::kernel::UpstreamFixes::uv_trim_corner_end_points_only)
 //!   only the end control points move, by the UV gap.
+//!   Each `Trim` uses the tolerance of the edge reached through the UV curve's actual
+//!   holding edge use, matching `SmTol::GetZoneTol3d(curve)`; an owner path without an
+//!   edge uses the system tolerance. Notification probes use that same tolerance.
 //! - **Edit notifications.** [`fix_uv_trim_curves_notified`] notifies its two
 //!   `EditEndPoint`s (`SM_NO_PRE_EDIT` / `SM_NO_POST_EDIT`, caller and first data
 //!   object the UV trim curve under its kernel-issued identity) through the caller's
@@ -969,15 +972,22 @@ fn is_singularity(
 
 /// `SmOffsetSurface(dOffset, rSurface).EvaluateSimple(uv, 1, 1, TRUE, TRUE, TRUE, ..)`:
 /// a temporary offset (not owning, default singularities, so its constructor runs the
-/// surface's `IsPeriodic` and `GetSingularities`) over a copy of `surface` that keeps
-/// its owner (upstream shares it).
+/// surface's `IsPeriodic` and `GetSingularities`) over an exact evaluation copy of
+/// `surface` that keeps its owner (upstream shares it; [`Surface`]'s `Clone` would run
+/// the copy constructor's knot fix-up).
 fn offset_evaluate_simple(
     k: &Kernel,
     surface: &Surface,
     offset: f64,
     uv: Point2,
 ) -> Result<Vec<Vec<Vec3>>> {
-    let off = OffsetSurface::new(k, offset, surface.clone_keeping_owner(), false, SS_UNKNOWN)?;
+    let off = OffsetSurface::new(
+        k,
+        offset,
+        surface.clone_for_evaluation()?,
+        false,
+        SS_UNKNOWN,
+    )?;
     off.evaluate_simple(k, uv, 1, 1, simple_flags())
 }
 
@@ -1188,7 +1198,7 @@ pub fn are_connected(
     // when gaps across MissingSeams are allowed
     if crosses_missing_seam_ok {
         // check for a properly oriented seam gap
-        let domain = surf.natural_uv_domain();
+        let domain = surf.natural_uv_domain_with_nurb(k)?;
         let (closed_u, _) = surf.is_closed(k, &domain, SurfParamType::U, Some(uv_tol), false)?;
         let (closed_v, _) = surf.is_closed(k, &domain, SurfParamType::V, Some(uv_tol), false)?;
 
@@ -1579,7 +1589,7 @@ pub fn points_in_face(
             Err(e) if e.is_unported() => return Err(e),
             Err(_) => b.face(f)?.uv_domain,
         };
-        let srf_dom = surf.natural_uv_domain();
+        let srf_dom = surf.natural_uv_domain_with_nurb(k)?;
         // (SmExtent2d::Intersect leaves the output unchanged when disjoint)
         let uv_dom = srf_dom
             .intersect(&trim_uv_domain)
@@ -2659,9 +2669,9 @@ fn edit_end_point(
 
 /// `sm_FixUVTrimCurves`: closes the UV gap between the start of `eu_current`'s UV trim
 /// curve and the end of `eu_previous`'s (its clockwise neighbour in the loop) by
-/// moving their end control points onto the vertex's UV point. Unlike upstream, the
-/// curves are not first trimmed at their drop points and stretched back over their
-/// intervals (module docs, #570). Gaps below `SM_EFF_ZERO / 10` or above a twentieth of the
+/// moving their end control points onto the vertex's UV point after trimming at their
+/// drop points and stretching back over their intervals (unless the opt-in fix skips
+/// those edits; module docs, #570). Gaps below `SM_EFF_ZERO / 10` or above a twentieth of the
 /// smaller side of `uv_domain` are left alone. `vertex` is the vertex between the two
 /// edge uses; `tol_3d` and `uv_dist_between` (the current UV gap) as upstream.
 /// Returns whether the curves were modified.
@@ -2820,9 +2830,17 @@ pub fn fix_uv_trim_curves_notified(
                     let _ = trim_ivl.set_min_max(curr_ivl.min(), t_curr_new);
                 }
                 if !are_same(trim_ivl.min(), trim_ivl.max()) {
+                    // SmTol::GetZoneTol3d(curve) follows its actual holder's edge.
+                    let zone_tol_3d = match eu1::edge(b, curr_holder)? {
+                        Some(edge) => b.edge(edge)?.tolerance,
+                        None => crate::geom::tol::zone_tol_3d(
+                            k,
+                            crate::geom::tol::SmallTopoType::NormalSize,
+                        ),
+                    };
                     notified_curve_edit(b, env.as_deref_mut(), curr_holder, |c| {
                         let mut ivl = trim_ivl;
-                        c.trim(k, &mut ivl, TrimMode::Notify)
+                        c.trim_with_zone_tol(k, &mut ivl, TrimMode::Notify, zone_tol_3d)
                     })?;
                     notified_curve_edit(b, env.as_deref_mut(), curr_holder, |c| {
                         c.edit_parameterization(k, &curr_ivl)
@@ -2840,9 +2858,17 @@ pub fn fix_uv_trim_curves_notified(
                     let _ = trim_ivl.set_min_max(t_prev_new, prev_ivl.max());
                 }
                 if !are_same(trim_ivl.min(), trim_ivl.max()) {
+                    // The previous curve can likewise be held by another edge use.
+                    let zone_tol_3d = match eu1::edge(b, prev_holder)? {
+                        Some(edge) => b.edge(edge)?.tolerance,
+                        None => crate::geom::tol::zone_tol_3d(
+                            k,
+                            crate::geom::tol::SmallTopoType::NormalSize,
+                        ),
+                    };
                     notified_curve_edit(b, env.as_deref_mut(), prev_holder, |c| {
                         let mut ivl = trim_ivl;
-                        c.trim(k, &mut ivl, TrimMode::Notify)
+                        c.trim_with_zone_tol(k, &mut ivl, TrimMode::Notify, zone_tol_3d)
                     })?;
                     notified_curve_edit(b, env.as_deref_mut(), prev_holder, |c| {
                         c.edit_parameterization(k, &prev_ivl)

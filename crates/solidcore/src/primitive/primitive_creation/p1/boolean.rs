@@ -76,6 +76,7 @@ pub(super) fn finish(
         primary_curve: &curve,
         other_curve: &curve,
         source_lists: &no_sources,
+        actual_curve_identities: false,
     };
     let attributes = &mut *notifications.attributes;
     let context = &mut notifications.context;
@@ -245,7 +246,7 @@ fn finish_with(
                 } else {
                     original.clone_for_evaluation()?
                 };
-                let domain = surface.natural_uv_domain();
+                let domain = surface.natural_uv_domain_with_nurb(k)?;
                 covering = detailed_face(
                     k,
                     a,

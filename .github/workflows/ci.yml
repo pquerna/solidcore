@@ -62,6 +62,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: scripts/ci/test-difftest-baseline.sh
+      - run: python3 -I scripts/ci/check_record_ids.py
 
   fmt:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -303,7 +304,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      # main's reports are published from here (site, PROGRESS.md case counts,
+      # main's reports are published from here (site, checklist case counts,
       # scripts/fetch-reports.sh), never committed.
       - name: Upload difftest reports
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.green.outputs.any == 'true' && !cancelled()

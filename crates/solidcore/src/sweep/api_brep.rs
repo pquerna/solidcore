@@ -25,6 +25,10 @@
 //!   `rpResult`). The optional face arrays of the curve sweeps are always returned.
 //! - **Context.** `SmApiGetOrCreateContext()` is the caller's [`Kernel`], used for the
 //!   curve copies.
+//! - **Cached topology.** Every returned B-rep has the port's own cached fields
+//!   ([`crate::topology::Edge::vertices`], `Face::shell`, ..., not maintained by topology
+//!   edits) rewritten from its use links by [`Brep::refresh_cached_topology`]; nothing
+//!   else changes.
 //! - **Pointers.** A `NULL` curve that upstream tests for is `None`: the entries of the
 //!   consumed curve arrays (copied first, `SM_ERR_INVALID_INPUT` for `NULL`), the
 //!   entries of a curve-sweep profile (passed on, upstream skips them), and the path,
@@ -300,7 +304,7 @@ pub fn create_sweep_along_planar_path(
     let profiles: Vec<Curve> = profile_curves.iter().map(|c| (*c).clone()).collect();
     let paths: Vec<Curve> = path_curves.iter().map(|c| (*c).clone()).collect();
     // The static entry point makes its own B-rep in the context of the model's.
-    let (_, result) = PrimitiveModel::build_new(k, |_, model| {
+    let (_, mut result) = PrimitiveModel::build_new(k, |_, model| {
         let id = PrimitiveCreation::create_sweep_along_planar_path(
             model,
             PrimitiveModel::MAIN,
@@ -313,6 +317,8 @@ pub fn create_sweep_along_planar_path(
         )?;
         model.take_brep(id)
     })?;
+    // (not upstream: the port's cached topology fields, true for the caller)
+    result.refresh_cached_topology();
     Ok(result)
 }
 
@@ -602,7 +608,11 @@ fn build(
     k: &mut Kernel,
     body: impl FnOnce(&mut PrimitiveCreation, &mut PrimitiveModel<'_>) -> Result<()>,
 ) -> Result<Brep> {
-    PrimitiveModel::build_new(k, body).map(|(brep, ())| brep)
+    PrimitiveModel::build_new(k, body).map(|(mut brep, ())| {
+        // (not upstream: the port's cached topology fields, true for the caller)
+        brep.refresh_cached_topology();
+        brep
+    })
 }
 
 /// The start, side and end faces of a curve sweep.
@@ -613,12 +623,14 @@ fn curve_sweep(
     k: &mut Kernel,
     body: impl FnOnce(&mut PrimitiveCreation, &mut PrimitiveModel<'_>, &mut SweepFaces) -> Result<()>,
 ) -> Result<CurveSweep> {
-    let (brep, (start_faces, side_faces, end_faces)) =
+    let (mut brep, (start_faces, side_faces, end_faces)) =
         PrimitiveModel::build_new(k, |pc, model| {
             let mut faces = SweepFaces::default();
             body(pc, model, &mut faces)?;
             Ok(faces)
         })?;
+    // (not upstream: the port's cached topology fields, true for the caller)
+    brep.refresh_cached_topology();
     Ok(CurveSweep {
         brep,
         start_faces,
@@ -662,6 +674,7 @@ fn sweep_curves(
 mod tests {
     use super::*;
     use crate::curve::hermite_curve::HermiteCurve;
+    use crate::geom::axis2_placement::Axis2Placement;
     use crate::primitive::api_curves;
 
     fn circle() -> Curve {
@@ -925,5 +938,81 @@ mod tests {
             None,
             None
         )));
+    }
+
+    /// The surface kinds of a B-rep's faces, in face order.
+    fn face_kinds(b: &Brep) -> Vec<&'static str> {
+        use crate::surface::surface::SurfaceKind;
+        b.face_list()
+            .iter()
+            .map(
+                |&f| match b.face(f).unwrap().surface.as_ref().unwrap().kind() {
+                    SurfaceKind::Cone(c) if c.is_cylinder_class() => "cylinder",
+                    SurfaceKind::Cone(_) => "cone",
+                    SurfaceKind::Sphere(_) => "sphere",
+                    SurfaceKind::Torus(_) => "torus",
+                    SurfaceKind::Plane(_) => "plane",
+                    SurfaceKind::SurfOfRevolution(_) => "revolution",
+                    _ => "other",
+                },
+            )
+            .collect()
+    }
+
+    #[test]
+    fn a_whole_turn_of_a_profile_gives_each_curve_its_analytic_face() {
+        // Not upstream (WR-448, #545, `fixes.revolve_analytic_profile_faces`): upstream
+        // makes an SmSurfOfRevolution of every curve of a profile longer than one curve
+        let mut k = Kernel::default();
+        let seg =
+            |a: Vec3, b: Vec3| Curve::from(BSplineCurve::create_line_segment(3, a, b).unwrap());
+        let arc = |c: Vec3, x: Vec3, y: Vec3, r: f64, s: f64, e: f64| {
+            Curve::from(
+                BSplineCurve::create_circle_segment(
+                    3,
+                    &Axis2Placement::new(c, x, y),
+                    r,
+                    s,
+                    e,
+                    crate::nurbs::b_spline_curve::NurbCircleParam::Quadratic,
+                )
+                .unwrap(),
+            )
+        };
+        // a drilled hole: its wall and the drill point
+        let wall = seg(Vec3::new(2.0, 0.0, 5.0), Vec3::new(2.0, 0.0, 1.0));
+        let point = seg(Vec3::new(2.0, 0.0, 1.0), Vec3::ZERO);
+        // a dome on its disc
+        let dome = arc(Vec3::ZERO, Vec3::X, Vec3::Z, 3.0, 0.0, 90.0);
+        let rim = seg(Vec3::ZERO, Vec3::new(3.0, 0.0, 0.0));
+        // a torus from two half circles
+        let outer = arc(Vec3::new(5.0, 0.0, 0.0), -Vec3::Z, Vec3::X, 1.0, 0.0, 180.0);
+        let inner = arc(Vec3::new(5.0, 0.0, 0.0), Vec3::Z, -Vec3::X, 1.0, 0.0, 180.0);
+        // by default (the fix off), upstream's surfaces of revolution
+        for (fix, expected) in [
+            (false, ["revolution", "revolution"]),
+            (true, ["cylinder", "cone"]),
+        ] {
+            k.fixes.revolve_analytic_profile_faces = fix;
+            let b = create_rotational_sweep(
+                &mut k,
+                &[Some(&wall), Some(&point)],
+                Vec3::ZERO,
+                Vec3::Z,
+                360.0,
+                false,
+            )
+            .unwrap();
+            assert_eq!(face_kinds(&b), expected);
+        }
+        for (curves, expected) in [
+            ([Some(&dome), Some(&rim)], ["sphere", "plane"]),
+            ([Some(&outer), Some(&inner)], ["torus", "torus"]),
+        ] {
+            let b = create_rotational_sweep(&mut k, &curves, Vec3::ZERO, Vec3::Z, 360.0, false)
+                .unwrap();
+            assert_eq!(face_kinds(&b), expected);
+            assert!(crate::topology::brep::p2::is_manifold_solid(&b).unwrap());
+        }
     }
 }

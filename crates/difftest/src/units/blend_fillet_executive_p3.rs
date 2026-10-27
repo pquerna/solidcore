@@ -24,6 +24,8 @@ use std::collections::BTreeMap;
 
 #[path = "blend_fillet_executive_p3/end_to_end.rs"]
 mod end_to_end;
+#[path = "blend_fillet_executive_p3/surface_bodies.rs"]
+mod surface_bodies;
 
 /// Parity runner for the three executive orchestration methods.
 pub struct Runner;
@@ -36,6 +38,10 @@ struct Inputs {
     upstream_case: Option<usize>,
     #[serde(default)]
     real_solid: Option<end_to_end::RealSolid>,
+    #[serde(default)]
+    surface_surface: Option<end_to_end::SurfaceSurface>,
+    #[serde(default)]
+    surface_surface_bodies: Option<surface_bodies::SurfaceSurfaceBodies>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -188,6 +194,15 @@ impl ExecutiveAccess<Handle> for Access {
         error: Option<&mut ErrorInfo<Handle>>,
     ) -> SolidResult<()> {
         executive.create_fillet_corners(k, |_, _, _, _| missing(), error)
+    }
+    /// `SmFilletExecutive::DoPiecewiseMerge`: this empty-B-rep fixture never builds a
+    /// fillet B-rep, so there is nothing to merge piecewise.
+    fn piecewise_merge(
+        &mut self,
+        _: &mut Kernel,
+        _: &mut FilletExecutive<Handle>,
+    ) -> SolidResult<()> {
+        missing()
     }
     // This empty-B-rep fixture has no face handles or intersector world. These
     // required adapters reject nonexistent objects; they are not UNPORTED calls
@@ -692,6 +707,13 @@ impl ExecutiveAccess<Handle> for Access {
     fn set_surface_generator(&mut self, _: Handle, _: Handle) -> SolidResult<()> {
         missing()
     }
+    fn new_fillet_solver(
+        &mut self,
+        _: &mut Kernel,
+        _: &solidcore::blend::fillet_executive::p2::SolverSpec<'_, Handle>,
+    ) -> SolidResult<Handle> {
+        missing()
+    }
 }
 
 fn flag(value: bool) -> f64 {
@@ -886,7 +908,7 @@ fn rust(input: &Inputs) -> Result<Output, HarnessError> {
             .chain(error_out.comment.bytes())
             .map(f64::from),
     );
-    output(&values)
+    Ok(with_point_step(output(&values)?, rust_point_step(&k)))
 }
 
 impl UnitDiff for Runner {
@@ -902,6 +924,22 @@ impl UnitDiff for Runner {
     }
     fn run_cpp(&self, case: &Case) -> Result<Output, HarnessError> {
         let input = case.parse::<Inputs>()?;
+        if let Some(pair) = &input.surface_surface_bodies {
+            if input.surface_surface.is_some()
+                || input.real_solid.is_some()
+                || input.upstream_case.is_some()
+                || !input.record.is_empty()
+            {
+                return Err(HarnessError::new("mixed fixture forms"));
+            }
+            return surface_bodies::cpp(pair);
+        }
+        if let Some(pair) = &input.surface_surface {
+            if input.real_solid.is_some() || input.upstream_case.is_some() || !input.record.is_empty() {
+                return Err(HarnessError::new("mixed fixture forms"));
+            }
+            return end_to_end::surface_surface_cpp(pair);
+        }
         if let Some(real) = &input.real_solid {
             if input.upstream_case.is_some() || !input.record.is_empty() {
                 return Err(HarnessError::new("mixed fixture forms"));
@@ -912,19 +950,37 @@ impl UnitDiff for Runner {
             if !input.record.is_empty() {
                 return Err(HarnessError::new("mixed fixture forms"));
             }
-            let values =
-                ffi::upstream_fixture(example).map_err(|e| HarnessError::new(e.to_string()))?;
+            let (values, step) = fresh_cpp(|| ffi::upstream_fixture(example))
+                .map_err(|e| HarnessError::new(e.to_string()))?;
             let mut out = Output::new();
             out.ints.insert(
                 "api_status_counts".into(),
                 values.into_iter().map(|v| v as i64).collect(),
             );
-            return Ok(out);
+            return Ok(with_point_step(out, step));
         }
-        output(&ffi::eval(&input.record).map_err(|e| HarnessError::new(e.to_string()))?)
+        let (values, step) =
+            fresh_cpp(|| ffi::eval(&input.record)).map_err(|e| HarnessError::new(e.to_string()))?;
+        Ok(with_point_step(output(&values)?, step))
     }
     fn run_rust(&self, case: &Case) -> Result<Output, HarnessError> {
         let input = case.parse::<Inputs>()?;
+        if let Some(pair) = &input.surface_surface_bodies {
+            if input.surface_surface.is_some()
+                || input.real_solid.is_some()
+                || input.upstream_case.is_some()
+                || !input.record.is_empty()
+            {
+                return Err(HarnessError::new("mixed fixture forms"));
+            }
+            return surface_bodies::rust(pair);
+        }
+        if let Some(pair) = &input.surface_surface {
+            if input.real_solid.is_some() || input.upstream_case.is_some() || !input.record.is_empty() {
+                return Err(HarnessError::new("mixed fixture forms"));
+            }
+            return end_to_end::surface_surface_rust(pair);
+        }
         if let Some(real) = &input.real_solid {
             if input.upstream_case.is_some() || !input.record.is_empty() {
                 return Err(HarnessError::new("mixed fixture forms"));
@@ -941,4 +997,34 @@ impl UnitDiff for Runner {
             flag(rng.chance(0.5)), flag(rng.chance(0.5)), flag(rng.chance(0.5)),
             flag(rng.chance(0.5)), flag(rng.chance(0.5))]}))
     }
+}
+
+/// Compared key: the `sdStaticStep` latch (ND-3: `SmFilletSolver::ComputePointValues`'
+/// function static, fixed by the first call in a process) after the case.
+pub(super) const POINT_STEP: &str = "fillet_point_step";
+
+/// Runs a case's C++ calls in a fresh child process, so `sdStaticStep` starts unlatched
+/// as on a first call whatever ran before, and returns the record with the step the case
+/// left latched there (`1e-5` when it latched nothing). The step is a compared output
+/// only ([`POINT_STEP`]); the Rust side never sees it.
+pub(super) fn fresh_cpp(
+    case: impl FnOnce() -> Result<Vec<f64>, solidcore_ffi::FfiError>,
+) -> Result<(Vec<f64>, f64), solidcore_ffi::FfiError> {
+    solidcore_ffi::units::blend_fillet_solver_p4::with_fresh_static_step(case)
+}
+
+/// The Rust side's [`Kernel::fillet_point_step`] after a case run on a fresh kernel,
+/// read as the C++ probe reads `sdStaticStep`: the probe's finite-difference crossing
+/// point latches `1e-5` when nothing has.
+pub(super) fn rust_point_step(k: &Kernel) -> f64 {
+    k.fillet_point_step.get().unwrap_or(1.0e-5)
+}
+
+/// `out` with the case's latched step ([`POINT_STEP`]); a deferred or rejected output is
+/// returned unchanged.
+pub(super) fn with_point_step(mut out: Output, step: f64) -> Output {
+    if out.deferred.is_none() && out.rejected.is_none() {
+        out.values.insert(POINT_STEP.into(), vec![step]);
+    }
+    out
 }

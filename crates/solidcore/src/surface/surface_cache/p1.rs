@@ -307,7 +307,7 @@ pub(super) fn calculate_bounding_box(
     domain: &Extent2d,
     req: &BoundingBoxRequest<'_>,
 ) -> Result<BoundingBoxes> {
-    match surface.kind() {
+    match surface.kind_with_nurb(k)? {
         SurfaceKind::BSpline(b) => b.calculate_bounding_box(k, domain, req),
         // inherited from SmBSplineSurface, run for the derived surface (its IsKindOf
         // and virtual EvaluateNormal)
@@ -358,11 +358,27 @@ pub(super) fn calculate_bounding_box(
                 "surface.surface_p1",
             ))
         }
-        // DISPATCH GAP: OffsetSurface::calculate_bounding_box is ported, but this
-        // cache callback has no Kernel (the offset's constructor-time queries and its
-        // base box need one), and upstream forwards the basis guesses to the base, which
+        // SmOffsetSurface::CalculateBoundingBox (OffsetSurface::calculate_bounding_box)
+        // when there are no basis guesses to forward to the base.
+        SurfaceKind::OffsetSurface(o)
+            if req.pseudo_guess.is_none() && req.polar_guess.is_none() =>
+        {
+            let boxes = o.calculate_bounding_box(
+                k,
+                surface,
+                domain,
+                [req.normal, req.pseudo, req.polar],
+                req.expand_by_zone_tol,
+            )?;
+            Ok(BoundingBoxes {
+                normal: boxes.normal_box,
+                pseudo: boxes.pseudo_box,
+                polar: boxes.polar_box,
+            })
+        }
+        // DISPATCH GAP: upstream forwards the basis guesses to the base, which
         // Surface::calculate_bounding_box does not take. No UNPORTED marker: the callees
-        // are ported; the error names this callback's unit. No difftest reaches it.
+        // are ported; the error names this callback's unit.
         SurfaceKind::OffsetSurface(_) => Err(SolidError::unported(
             "SmOffsetSurface::CalculateBoundingBox from a surface cache",
             "surface.surface_cache_p1",
@@ -1650,6 +1666,37 @@ impl<O: Clone> Clone for SurfaceCache<O> {
             face_containment_done: self.face_containment_done,
             pole_memo: None,
         }
+    }
+}
+
+impl<O: Clone> SurfaceCache<O> {
+    /// A copy standing for this same cache where upstream keeps using it (the
+    /// boundary start-point search of `SmSurfaceIntersector::DoIntersection` runs on
+    /// the intersector's own caches): the surfaces and iso boundary curves are exact
+    /// evaluation copies, since [`Clone`] runs the copy constructor's knot fix-up,
+    /// which moves near-coincident knots of a fillet surface.
+    ///
+    /// # Errors
+    ///
+    /// An owned geometry chain deeper than the evaluation-copy bound.
+    pub(crate) fn clone_for_evaluation(&self) -> Result<Self> {
+        let mut c = self.clone();
+        c.surface = self.surface.clone_for_evaluation()?;
+        let mut subdivision_surfaces = Vec::new();
+        for (o, s) in &self.subdivision_surfaces {
+            subdivision_surfaces.push((o.clone(), s.clone_for_evaluation()?));
+        }
+        c.subdivision_surfaces = subdivision_surfaces;
+        c.iso_boundary_curves = match &self.iso_boundary_curves {
+            Some([a, b, cc, d]) => Some([
+                a.clone_for_evaluation()?,
+                b.clone_for_evaluation()?,
+                cc.clone_for_evaluation()?,
+                d.clone_for_evaluation()?,
+            ]),
+            None => None,
+        };
+        Ok(c)
     }
 }
 

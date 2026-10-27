@@ -376,7 +376,7 @@ impl CrvOnSurf {
         // set m_vUVDomain
         c.uv_domain = match uv_domain {
             Some(d) => d,
-            None => c.surface.natural_uv_domain(),
+            None => c.surface.natural_uv_domain_with_nurb(k)?,
         };
 
         // m_lOwnerFlag 1 or 2: Copy Curve to be deleted when SmCrvOnSurf is destructed
@@ -897,7 +897,8 @@ impl CrvOnSurf {
         }
 
         // pick a UVSpace tolerance
-        let tol_2d = EFF_ZERO * (1.0 + self.surface.natural_uv_domain().max_dimension());
+        let tol_2d =
+            EFF_ZERO * (1.0 + self.surface.natural_uv_domain_with_nurb(k)?.max_dimension());
 
         // get the UVCurve knots and multiplicities (status ignored)
         let (mut knots, mut mults) = ignored(self.uv_curve.knots(k, interval))?.unwrap_or_default();
@@ -1439,13 +1440,30 @@ impl CrvOnSurf {
     ///
     /// `SM_ERR` when nothing is owned (flag 0); those of the UV curve's trim.
     pub fn trim(&mut self, k: &Kernel, trim_interval: &mut Extent1d, mode: TrimMode) -> Result<()> {
+        self.trim_with_zone_tol(
+            k,
+            trim_interval,
+            mode,
+            crate::geom::tol::zone_tol_3d(k, crate::geom::tol::SmallTopoType::NormalSize),
+        )
+    }
+
+    /// Trims the owned UV curve with the caller-resolved owning object's tolerance.
+    pub(crate) fn trim_with_zone_tol(
+        &mut self,
+        k: &Kernel,
+        trim_interval: &mut Extent1d,
+        mode: TrimMode,
+        zone_tol_3d: f64,
+    ) -> Result<()> {
         // Don't own curve can not trim the curve
         if self.owner_flag == 0 {
             return Err(SolidError::sm_err(OP));
         }
 
         // pass the call along to the UVCurve
-        self.uv_curve.trim(k, trim_interval, mode)?;
+        self.uv_curve
+            .trim_with_zone_tol(k, trim_interval, mode, zone_tol_3d)?;
 
         // clear the knots
         if !self.need_breaks() {

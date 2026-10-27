@@ -16,11 +16,13 @@
 //! every entity of the intermediate body before `~SmBrep`. `RemoveTopoEdges` and
 //! `BooleanPostProcess` notify through local environments (their ports take none);
 //! afterwards the attributes of target edges they deleted are cleared from the
-//! session store. `do_fillet` ends with the closed-manifold check of the generic
-//! `FilletExecutive::do_fillet` (not upstream, tangency-labs/solidcore#422).
-//! `DoPiecewiseMerge` and a live-session `IntersectInsertRelate` (global merge) are not
-//! wired: no public API entry point reaches them (`SetFilletParameters` resets both
-//! flags), so they return `Unported`. No recursion.
+//! session store. With the opt-in `Kernel::fixes.fillet_refuse_non_manifold_result`
+//! `do_fillet` ends with the closed-manifold check of the generic
+//! `FilletExecutive::do_fillet` (not upstream, WR-212, tangency-labs/solidcore#422).
+//! No public API entry point reaches `DoPiecewiseMerge` or a live-session
+//! `IntersectInsertRelate` (global merge): `SetFilletParameters` resets both flags;
+//! [`FilletSession::set_do_piecewise_merge`] selects the piecewise merge after it.
+//! No recursion.
 
 use super::original_trim::OriginalSurfaceDeletion;
 use super::{invalid, FilletBody, FilletObject, FilletSession, SessionObjects};
@@ -60,7 +62,17 @@ fn target_edge(object: FilletObject) -> Result<EdgeId> {
     }
 }
 
-struct FinishAccess<'a, 'target>(&'a mut SessionObjects<'target>);
+/// The topology entity of an intersector mate (an intermediate or target object).
+const fn mate_entity(object: FilletObject) -> Option<EntityRef> {
+    match object {
+        FilletObject::Topology(_, entity) | FilletObject::IntermediateTopology(entity) => {
+            Some(entity)
+        }
+        _ => None,
+    }
+}
+
+pub(super) struct FinishAccess<'a, 'target>(pub(super) &'a mut SessionObjects<'target>);
 
 impl FinishAccess<'_, '_> {
     fn require_target(brep: FilletObject) -> Result<()> {
@@ -267,12 +279,28 @@ impl FilletFinishAccess<FilletObject> for FinishAccess<'_, '_> {
             };
             relations.vertices.push(vertex);
         }
-        if !check_all_edges {
-            // UNPORTED(blend.fillet_executive_p1): live intersector mates for BooleanPostProcess(FALSE)
-            return Err(SolidError::unported(
-                "SmMerge::BooleanPostProcess(FALSE) live mates",
-                "blend.fillet_executive_p1",
-            ));
+        // `m_vTI.GetOtherMate` of the target's edges and vertices (the FALSE edge and
+        // vertex filters and `GetCommonVertices`): only whether a mate exists is read, so
+        // each mate is recorded under its own operand-local id.
+        for edge in p1::edges(self.0.target, None)? {
+            let key = FilletObject::Topology(FilletBody::Target, EntityRef::Edge(edge));
+            if let Some(EntityRef::Edge(other)) = executive
+                .intersector
+                .other_mate(Some(key))
+                .and_then(mate_entity)
+            {
+                relations.mates.edges.record(edge, other)?;
+            }
+        }
+        for vertex in p1::vertices(self.0.target, None)? {
+            let key = FilletObject::Topology(FilletBody::Target, EntityRef::Vertex(vertex));
+            if let Some(EntityRef::Vertex(other)) = executive
+                .intersector
+                .other_mate(Some(key))
+                .and_then(mate_entity)
+            {
+                relations.mates.vertices.record(vertex, other)?;
+            }
         }
         let before = p1::edges(self.0.target, None)?;
         let result = crate::boolean::merge::p1::boolean_post_process(
@@ -385,11 +413,15 @@ impl FilletSession<'_> {
         }
         self.create_corners(k, None)?;
         self.do_filleting(k, None)?;
+        if !k.fixes.fillet_refuse_non_manifold_result {
+            return Ok(());
+        }
         self.check_closed_manifold()
     }
 
     /// The closed-manifold result check of `FilletExecutive::do_fillet` (not
-    /// upstream, tangency-labs/solidcore#422), on the live target.
+    /// upstream, opt-in `fixes.fillet_refuse_non_manifold_result`, WR-212,
+    /// tangency-labs/solidcore#422), on the live target.
     fn check_closed_manifold(&mut self) -> Result<()> {
         for edge in p1::edges(self.objects.target, None)? {
             if crate::topology::edge::is_manifold(self.objects.target, edge)? {
@@ -440,6 +472,9 @@ impl FilletSession<'_> {
             if faces < 1 {
                 return Err(failure());
             }
+            if k.fixes.fillet_refuse_crossing_rails {
+                session.refuse_crossing_rails(k)?;
+            }
             session.shrink_fillet_faces(k)?;
             let editing = session.objects.target.editing_enabled();
             session.objects.target.set_editing_enabled(true);
@@ -461,11 +496,8 @@ impl FilletSession<'_> {
             .intersector
             .set_other_brep(Some(FilletObject::IntermediateBrep));
         if self.executive.options.piecewise_merge {
-            // UNPORTED(blend.fillet_executive_p1): SmFilletExecutive::DoPiecewiseMerge
-            return Err(SolidError::unported(
-                "SmFilletExecutive::DoPiecewiseMerge",
-                "blend.fillet_executive_p1",
-            ));
+            // DoPiecewiseMerge deletes m_pFilletBrep inside its mark scope
+            return self.do_piecewise_merge(k);
         }
         // SetFilletBrepEdgeMap, then the geometry and corner insertion.
         self.insert_fillet_intersection_topology(k)?;

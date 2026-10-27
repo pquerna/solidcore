@@ -10,7 +10,8 @@
 //!
 //! Deviations: missing callees have typed call boundaries in `RecoveryOps`;
 //! their callers, mutations, cleanup and continuation are fully represented.
-//! Geometry registration uses the shared pseudo-B-rep id in the solver list. Offset
+//! The retained solver supplies its actual virtuals; base data is borrowed only at
+//! its original read/write positions. Geometry registration uses the shared pseudo-B-rep id in the solver list. Offset
 //! identities are monotonically allocated keys, never addresses. The segment
 //! walk has a checked input-derived progress budget (4 times the total interval
 //! count times (target edge-use count + 1), plus 8); a broken callee cannot
@@ -20,14 +21,15 @@
 pub(super) use super::super::p1::rails::SupportIntersection;
 use super::{
     edge, eu, ignored, p2, Brep, CurveClassification, EdgeId, EdgeuseId, EntityRef, FilletBrep,
-    FilletCornerId, FilletCornerType, FilletGeomId, FilletGeomType, FilletSolver, Kernel,
-    PointClassType, Result, RolloverOwnership, SolidError, SurfOfRevolution, OP,
+    FilletCornerId, FilletCornerType, FilletGeomId, FilletGeomType, Kernel, PointClassType, Result,
+    RolloverOwnership, SolidError, SurfOfRevolution, OP,
 };
 use crate::blend::fillet_classification::FilletClassObject;
 use crate::blend::fillet_custom_solver::{OffsetSurface, SurfaceId};
 use crate::blend::fillet_geom::p1::{
-    CliffHandle, CornerLookup, FilStatus, FilletEdgeType, FilletVertex, FilletVertexType,
+    CliffHandle, FilStatus, FilletEdgeType, FilletVertex, FilletVertexType,
 };
+use crate::blend::fillet_geom::p3::SplitCorners;
 use crate::blend::fillet_solver::p1::{FilletSolverOffsetsData, OffsetSurfaceSlot};
 use crate::curve::curve::p1::GlobalPointSolveOptions;
 use crate::curve::curve::Curve;
@@ -37,10 +39,12 @@ use crate::surface::surface::Surface;
 use crate::topology::{FaceId, Vertex, VertexId};
 
 pub(super) struct Recovery<'a> {
-    pub solver: &'a mut FilletSolver,
+    pub solver: &'a mut dyn super::super::p1::FilletSolverOps,
     pub k: &'a Kernel,
     pub target: &'a mut Brep,
     pub fillets: &'a mut FilletBrep,
+    /// The executive's corners (`m_vFilletCorners`, `GetFilletCornerOfVertex`).
+    pub corners: &'a mut dyn SplitCorners,
     pub ownership: &'a mut dyn RolloverOwnership,
 }
 
@@ -79,8 +83,14 @@ pub(super) struct SideSearch<'a> {
 // callees delegate to their owning units; only unavailable callees remain stubs.
 pub(super) trait RecoveryOps {
     fn full(&mut self, c: &mut Recovery<'_>, geom: FilletGeomId, rail: usize) -> Result<()> {
-        c.solver
-            .process_full_roll_over(c.k, c.target, c.fillets, geom, rail, c.ownership)
+        c.solver.solver_mut().process_full_roll_over(
+            c.k,
+            c.target,
+            c.fillets,
+            geom,
+            rail,
+            c.ownership,
+        )
     }
     fn convex(
         &mut self,
@@ -162,8 +172,9 @@ pub(super) trait RecoveryOps {
             geom,
             FilletGeomType::Default,
             solver_id,
-            c.solver,
+            c.solver.solver_mut(),
             c.target,
+            c.corners,
         )
     }
     fn rail_x_edge(
@@ -176,7 +187,7 @@ pub(super) trait RecoveryOps {
         side: EdgeId,
         guess: Option<Point3>,
     ) -> Result<()> {
-        super::super::p3::calc_rail_x_edge(
+        super::super::p3::calc_rail_x_edge_with_ops(
             c.solver, c.k, c.target, c.fillets, vertex, geom, which, rail, side, guess,
         )
     }
@@ -185,7 +196,7 @@ pub(super) trait RecoveryOps {
             c.k,
             c.target,
             side,
-            c.solver.tangency_tolerance,
+            c.solver.solver().tangency_tolerance,
         )
         .map(|r| r.0)
     }
@@ -216,7 +227,7 @@ pub(super) trait RecoveryOps {
         let side_face = adjacent_face.ok_or_else(|| {
             SolidError::invalid_input(OP, "CreateCliffRollOverSideFG: no adjacent face")
         })?;
-        c.solver.create_cliff_roll_over_side_fg(
+        c.solver.solver_mut().create_cliff_roll_over_side_fg(
             c.k, c.target, c.fillets, solver_id, rail, side, side_face, trim, extension,
         )
     }
@@ -229,16 +240,14 @@ pub(super) trait RecoveryOps {
         // ProcessRollOver visits this solver's own geometries, so c.solver
         // is the solver identified by geom.fillet_solver().
         let solver_id = required(c.fillets.geom(geom)?.fillet_solver())?;
-        // UNPORTED(blend.fillet_executive_p1): SmFilletExecutive::m_vFilletCorners (the
-        // rollover recovery holds no corner table; CalcRailIntEdgeuse reads the vertex's
-        // corner)
-        c.fillets.calc_rail_int_edgeuse_with_solver(
+        // CalcRailIntEdgeuse reads the vertex's corner in the executive's table
+        c.fillets.calc_rail_int_edgeuse_with_solver_ops(
             c.k,
             vertex,
             Some(geom),
-            CornerLookup::default(),
+            c.corners.lookup(),
             solver_id,
-            c.solver,
+            &mut *c.solver,
             c.target,
         )
     }
@@ -277,7 +286,7 @@ pub(super) trait RecoveryOps {
     fn trim_rails(&mut self, c: &mut Recovery<'_>, geom: FilletGeomId) -> Result<()> {
         let solver_id = required(c.fillets.geom(geom)?.fillet_solver())?;
         c.fillets
-            .trim_rail_curves_with_solver(c.k, geom, solver_id, c.solver, c.target)
+            .trim_rail_curves_with_solver(c.k, geom, solver_id, c.solver.solver(), c.target)
     }
     fn copy_offset(
         &mut self,
@@ -371,15 +380,16 @@ impl Recovery<'_> {
         required(edge::other_vertex(self.fillets.brep(), rail, Some(start))?)
     }
     fn offset_changed(&self, saved: &FilletSolverOffsetsData, which: usize) -> Result<bool> {
-        Ok(self.solver.surface(which)?.map(|s| s.key)
+        Ok(self.solver.solver().surface(which)?.map(|s| s.key)
             != get(&saved.surfaces, which)?.as_ref().map(|s| s.key))
     }
     fn new_offset_key(&self) -> Result<u64> {
         self.solver
+            .solver()
             .surfaces
             .iter()
             .flatten()
-            .chain(self.solver.detached.iter())
+            .chain(self.solver.solver().detached.iter())
             .map(|s| s.key)
             .max()
             .unwrap_or(0)
@@ -390,7 +400,6 @@ impl Recovery<'_> {
     pub(super) fn process(
         &mut self,
         id: FilletGeomId,
-        corner_type: &impl Fn(FilletCornerId) -> Result<FilletCornerType>,
         adjusted: &mut Vec<FilletCornerId>,
         ops: &mut impl RecoveryOps,
     ) -> Result<()> {
@@ -411,7 +420,7 @@ impl Recovery<'_> {
             }
             let corner = required(self.fillets.fillet_vertex(self.start(r0)?)?.fillet_corner())?;
             if !matches!(
-                corner_type(corner)?,
+                self.corners.corner_type(corner)?,
                 FilletCornerType::NByOneClosed | FilletCornerType::OneByOne
             ) {
                 return Err(SolidError::sm_err(OP));
@@ -440,7 +449,7 @@ impl Recovery<'_> {
         adjusted: &mut Vec<FilletCornerId>,
         ops: &mut impl RecoveryOps,
     ) -> Result<()> {
-        let solver_eu = required(self.solver.edgeuse(0)?)?;
+        let solver_eu = required(self.solver.solver().edgeuse(0)?)?;
         let convex = ops.convex(self, solver_eu, 10, false, 0.0)?;
         let surface = required(self.fillets.geom(id)?.fillet_surface()?)?;
         let analytic = if surface.is_kind_of(crate::surface::surface::p2::B_SPLINE_SURFACE_TYPE)? {
@@ -471,7 +480,7 @@ impl Recovery<'_> {
             })?;
             let first = rails.iter().all(|r| r.index == 0);
             let mut last = rails.iter().all(|r| r.index == r.count - 1);
-            let saved = self.solver.offsets_data()?;
+            let saved = self.solver.solver().offsets_data()?;
             let mut geom_type = FilletGeomType::Default;
             let mut hits = [SideHit::default(); 2];
             let mut adjacent = [None; 2];
@@ -496,7 +505,7 @@ impl Recovery<'_> {
                         convex,
                         corner_edgeuse: &mut corner_eu,
                         corner_vertex: &mut corner_vertex,
-                        tangency_tolerance: self.solver.tangency_tolerance,
+                        tangency_tolerance: self.solver.solver().tangency_tolerance,
                     },
                 )?;
                 *get_mut(&mut hits, which)? = hit;
@@ -520,12 +529,12 @@ impl Recovery<'_> {
                         geom_type = FilletGeomType::CliffRollover;
                     } else {
                         geom_type = FilletGeomType::TangentRollover;
-                        let mut distance = required(self.solver.surface(which)?)?
+                        let mut distance = required(self.solver.solver().surface(which)?)?
                             .surface
                             .offset_distance();
                         if hit.opposite_normals {
                             distance *= -1.0;
-                            *get_mut(&mut self.solver.orientations, which)? *= -1.0;
+                            *get_mut(&mut self.solver.solver_mut().orientations, which)? *= -1.0;
                         }
                         let base = required(self.target.face(face)?.surface.as_ref())?;
                         let mut offset = OffsetSurface::new(
@@ -537,7 +546,7 @@ impl Recovery<'_> {
                         )?;
                         offset.set_allow_extension(true);
                         let key = self.new_offset_key()?;
-                        self.solver.set_surface(
+                        self.solver.solver_mut().set_surface(
                             which,
                             Some(OffsetSurfaceSlot {
                                 key,
@@ -619,7 +628,7 @@ impl Recovery<'_> {
                 } else {
                     let geom = ops.topology_split(self, current_geom)?;
                     new_geom = Some(geom);
-                    self.solver.fillet_geoms.push(geom);
+                    self.solver.solver_mut().fillet_geoms.push(geom);
                     for (slot, rail) in new_vertices.iter_mut().zip(&rails) {
                         *slot = Some(self.end(rail.edge)?);
                     }
@@ -833,14 +842,14 @@ impl Recovery<'_> {
                         self,
                         support,
                         current_geom,
-                        self.solver.approx_tol_3d,
-                        self.solver.ang_tol_rad,
+                        self.solver.solver().approx_tol_3d,
+                        self.solver.solver().ang_tol_rad,
                     )?;
                 }
                 support_edges.clear();
                 ops.trim_rails(self, current_geom)?;
                 if geom_type == FilletGeomType::TangentRollover {
-                    self.solver.set_offsets_data(&saved)?;
+                    self.solver.solver_mut().set_offsets_data(&saved)?;
                 }
             }
             if last {

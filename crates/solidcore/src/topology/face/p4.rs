@@ -390,7 +390,12 @@ pub fn is_connected_to(b: &Brep, f: FaceId, target: Option<EntityRef>) -> Result
         EntityRef::Edge(e) => Ok(edge::faces(b, e, None)?.contains(&f)),
         EntityRef::Face(x) => Ok(x == f),
         EntityRef::Faceuse(fu) => Ok(faceuse_face(b, fu)? == Some(f)),
-        EntityRef::Loop(l) => Ok(b.loop_(l)?.face == f),
+        // `pLoop->GetFace()`: through the loop use and its face use (the port's
+        // `Loop::face` cache only where those links are missing)
+        EntityRef::Loop(l) => {
+            let cached = b.loop_(l)?.face;
+            Ok(crate::topology::integrity::derived_loop_face(b, l).unwrap_or(cached) == f)
+        }
         EntityRef::Loopuse(lu) => {
             let fu = b
                 .loopuse(lu)?
@@ -1223,7 +1228,7 @@ pub fn find_vertex_sector(
                 checked_poles = true;
                 (singularities, pole_points) = surface_singularities(k, b, f, &surface)?;
                 vertex_point = vertex::point(b, v)?;
-                surf_domain = surface.natural_uv_domain();
+                surf_domain = surface.natural_uv_domain_with_nurb(k)?;
             }
 
             // just once - get closed status
@@ -1878,7 +1883,7 @@ pub fn has_seam_problem_mut<O: LoopObject, M: CurveOnClassifyBrep<O>>(
     };
 
     // classify periodic surface and prepare for upcoming classifications
-    let uv_domain = surface.natural_uv_domain();
+    let uv_domain = surface.natural_uv_domain_with_nurb(k)?;
     let closed_c1 = |closed: Tri, val: ContinuityType| {
         closed != Tri::False && val as i32 >= ContinuityType::C1 as i32
     };

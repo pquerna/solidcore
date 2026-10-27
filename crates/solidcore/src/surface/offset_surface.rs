@@ -24,6 +24,7 @@
 //! | [`OffsetSurface::reverse`], [`OffsetSurface::split_at`], [`OffsetSurface::step_inversion`] (and `_extending`), [`OffsetSurface::swap_uv`], [`OffsetSurface::transform`], [`OffsetSurface::trim_with_domain`] | `Reverse`, `SplitAt`, `STEPInversion`, `SwapUV`, `Transform`, `TrimWithDomain` |
 //! | [`OffsetSurface::create_offset_surface`]              | `CreateOffsetSurface`                            |
 //! | [`OffsetSurface::read_from_db`]                       | `ReadFromDB`                                     |
+//! | [`OffsetSurface::write_to_db`]                        | `WriteToDB`                                      |
 //! | [`OffsetSurface::is_kind_of`], [`OffsetSurface::type_code`], [`OffsetSurface::type_string`], [`OffsetSurface::class_string`] | `IsKindOf`, `GetType`, `GetTypeString`, `GetClassString` (`SM_COMMON`) |
 //! | [`OffsetSurface::offset_distance`], [`OffsetSurface::base_surface`], [`OffsetSurface::extended_base_surface`], [`OffsetSurface::max_analytic_domain`], [`OffsetSurface::degree`] | `GetOffsetDistance`, `GetBaseSurface`, `GetExtendedBaseSurface`, `GetMaxAnalyticDomain`, `GetDegree` |
 //! | [`OffsetSurface::set_offset_distance`], [`OffsetSurface::set_allow_extension`], [`OffsetSurface::set_context`] | `SetOffsetDistance`, `SetAllowExtension`, `SetContext` |
@@ -131,7 +132,8 @@ use crate::surface::surface::p2::{
 };
 use crate::surface::surface::p7::base_evaluate_normal;
 use crate::surface::surface::{Surface, SurfaceKind};
-use crate::topology::database_io::{DatabaseReader, FileType, InputStream};
+use crate::topology::database_io::{DatabaseReader, DatabaseWriter, FileType, InputStream};
+use crate::topology::geometry_write::write_surface_at;
 
 const OP: &str = "surface::offset_surface::OffsetSurface";
 const OP_NEW: &str = "surface::offset_surface::OffsetSurface::new";
@@ -401,7 +403,7 @@ impl OffsetSurface {
                     off.singularities,
                 )
             } else {
-                let domain = surface.natural_uv_domain();
+                let domain = surface.natural_uv_domain_with_nurb(k)?;
                 let u = sm_bool(surface.is_periodic(k, &domain, SurfParamType::U)?);
                 let v = sm_bool(surface.is_periodic(k, &domain, SurfParamType::V)?);
                 let s = if singularities == SS_UNKNOWN {
@@ -892,7 +894,7 @@ impl OffsetSurface {
         want: [bool; 3],
         expand_pos_boxes_by_zone_tol_3d: bool,
     ) -> Result<SurfaceBoxes> {
-        if !uv_domain.is_contained_by(&self.surface.natural_uv_domain(), EFF_ZERO) {
+        if !uv_domain.is_contained_by(&self.surface.natural_uv_domain_with_nurb(k)?, EFF_ZERO) {
             return this.base_calculate_bounding_box(k, want, expand_pos_boxes_by_zone_tol_3d);
         }
 
@@ -1116,7 +1118,7 @@ impl OffsetSurface {
         v_side: Side,
     ) -> Result<Vec3> {
         // see if domainPoint is within BaseSurface domain
-        let domain = self.surface.natural_uv_domain();
+        let domain = self.surface.natural_uv_domain_with_nurb(k)?;
         if domain.contains_point(uv, 0.0) {
             self.surface.evaluate_normal(k, uv, u_side, v_side)
         } else {
@@ -1138,7 +1140,7 @@ impl OffsetSurface {
         u_side: Side,
         v_side: Side,
     ) -> Result<Vec3> {
-        let domain = self.surface.natural_uv_domain();
+        let domain = self.surface.natural_uv_domain_with_nurb(k)?;
         if domain.contains_point(uv, 0.0) {
             return self.surface.evaluate_normal(k, uv, u_side, v_side);
         }
@@ -1825,7 +1827,7 @@ impl OffsetSurface {
     /// the evaluations and of [`Surface::trim_with_domain`].
     pub fn trim_with_domain(&mut self, k: &Kernel, trim_domain: &mut Extent2d) -> Result<()> {
         self.fold_pending_extension();
-        let base_domain = self.surface.natural_uv_domain();
+        let base_domain = self.surface.natural_uv_domain_with_nurb(k)?;
         let mut gets_bigger = false;
         if !base_domain.contains_point(trim_domain.min(), 0.0) {
             self.evaluate_point_extending(k, trim_domain.min())?;
@@ -1864,6 +1866,57 @@ impl OffsetSurface {
         let result = read_body(k, db, version);
         db.leave_nested();
         result
+    }
+
+    /// `WriteToDB`: writes the offset distance, the extension and periodicity flags
+    /// and whether there is an extended surface, then the base surface and the
+    /// extended surface (if any), each with its type header. `depth` is this
+    /// surface's nesting depth (see [`write_surface_at`]).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`write_surface_at`] for the base and extended surfaces.
+    pub fn write_to_db(&self, db: &mut DatabaseWriter, version: u64, depth: usize) -> Result<()> {
+        let ascii = db.file_type() == FileType::Ascii;
+        let distance = self.offset_distance.get();
+        let allow = i32::from(self.allow_extension);
+        self.with_current_extension(|extended| {
+            let has_extended = i32::from(extended.is_some());
+            if ascii {
+                db.out_f64(distance);
+                db.out_str(" SmOffsetSurface Offset Distance \n");
+                db.out_i64(allow.into());
+                db.out_str(" SmOffsetSurface Allow Extension \n");
+                db.out_i64(self.is_periodic_on_u.into());
+                db.out_str(" SmOffsetSurface PeriodicOnU \n");
+                db.out_i64(self.is_periodic_on_v.into());
+                db.out_str(" SmOffsetSurface PeriodicOnV \n");
+                db.out_i64(has_extended.into());
+                db.out_str(" SmOffsetSurface HasExtendedSurface \n");
+            } else {
+                db.write_double(distance);
+                db.write_boolean(allow);
+                db.write_boolean(self.is_periodic_on_u);
+                db.write_boolean(self.is_periodic_on_v);
+                db.write_boolean(has_extended);
+            }
+
+            if ascii {
+                db.out_str(" OffsetSurface->BaseSurface \n");
+            }
+            db.write_type(self.surface.type_code(), None);
+            write_surface_at(&self.surface, db, version, depth + 1)?;
+            if let Some(e) = extended {
+                if ascii {
+                    db.out_str(" OffsetSurface->ExtendedSurface \n");
+                }
+                db.write_type(e.type_code(), None);
+                write_surface_at(e, db, version, depth + 1)?;
+            } else if ascii {
+                db.out_str("Has No OffsetSurface->ExtendedSurface \n");
+            }
+            Ok(())
+        })
     }
 }
 
@@ -2285,7 +2338,7 @@ impl SurfaceEvaluate for OffsetEval<'_> {
 
     fn evaluate_normal(&self, k: &Kernel, uv: Point2, u_side: Side, v_side: Side) -> Result<Vec3> {
         // the offset's override, with this call's extension
-        let domain = self.off.surface.natural_uv_domain();
+        let domain = self.off.surface.natural_uv_domain_with_nurb(k)?;
         if domain.contains_point(uv, 0.0) {
             self.off.surface.evaluate_normal(k, uv, u_side, v_side)
         } else {

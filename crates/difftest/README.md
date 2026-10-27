@@ -429,6 +429,17 @@ ratchet waivers once the PR has merged.
 * Key sets and array lengths must match. A case with a harness error (bad
   input, panic) fails. A unit with zero cases fails.
 
+## No C++ state reaches the Rust side
+
+The harness never feeds C++ outputs or C++ process state into the Rust side;
+process-global C++ state is isolated per case (fresh child process), and any such
+latched state is compared as an output. For example, the C++ side of every
+`blend.fillet_solver_p4` and `blend.fillet_executive_p3` case runs in a forked child
+(`solidcore_ffi::isolate::fresh_process`), where `ComputePointValues`' function-static
+`sdStaticStep` (ND-3) starts unlatched; the child reads it after the case, the Rust case
+runs on a fresh `Kernel::default()`, and both latched steps are compared as
+`fillet_point_step`. A child that crashes is `SC_ERR_CHILD_CRASHED`.
+
 ## Adding a runner for unit `foo.bar` (4 new files, no shared edits)
 
 Use `_` for `.` in file names: unit `nlib.knots` → `nlib_knots`.
@@ -722,6 +733,11 @@ nice -n 10 cargo run -p difftest -- --solidcraft-cases '3526-*'        # ids (<f
   on, by name, for a case that needs an opt-in fix of an upstream defect (for example
   `434-*`: `sweep_frame_on_planar_path_normal`, `cover_refuses_folded_continuation`);
   without it the case runs pinned SMLib behaviour.
+* **Known refusal** (`refused_by`, optional): for a case the kernel refuses on purpose,
+  the `issue` that tracks it, the `step` id that fails and text its `error` contains. Only
+  that step failing with that error defers the case on the issue; any other error stays
+  an `ERROR`, and the deferral keeps the full error text (for example
+  `324-*/round_4_over_hole`, tangency-labs/solidcore#422).
 * **Expectations** (`expect`): `lumps` (bounded regions; `0` = nothing left), `volume`
   (`value`, absolute `tol`, the `formula` it came from), `cylinder_faces_max`,
   `sheet_corner` (signed end distances and flat-pattern invariants).

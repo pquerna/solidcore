@@ -34,7 +34,15 @@
 //! make upstream dereference null or free the harness's objects. To tell a default patch
 //! that reaches `MakeFaceBrep` from one that returns a status before it, the shim runs
 //! `MakeAnalyticCornerSurface`'s fits and the Coons patch's `CreateCornerBlend` on
-//! copies first. The model's fillet geometries have a solver (a base solver with the
+//! copies first. Its `SER` / `NER` exits (read as `TRUE`) add no surface, so the
+//! `MakeFaceBrep` after them copies the edges' curves only when the corner already had one
+//! surface (a planar corner's exit leaves the edge it was recomputing without a curve).
+//! Every refused case was checked by running the C++ natively with the pre-check bypassed,
+//! one process per case: each crashed in upstream (`SIGSEGV` in `SmFilletCorner::Create`,
+//! `MakeAnalyticCornerSurface`, `AdjustTopology`, `AdjustConcaveCornerTopology`,
+//! `AdjustTangentCorner`) except the tangent split's call through a solver-less geometry
+//! (`GetFilletSolver()->SplitFilletGeomAtSideEdge`: a member call on a null pointer,
+//! undefined, though the non-virtual callee returns a status before it reads `this`). The model's fillet geometries have a solver (a base solver with the
 //! generator of a cross-section kind, `geom_solvers`) only in generated patch and geometry
 //! cases; elsewhere none, and the paths that ask a geometry for its solver (the `NxN`
 //! candidate search past its first cross section, the closed Nx1 and Nx2 tangent splits,
@@ -60,7 +68,7 @@ use solidcore::kernel::Kernel;
 use solidcore::math::EFF_ZERO_RAD;
 use solidcore::surface::surface::{Surface, SurfaceKind};
 use solidcore::topology::edgeuse::p1 as eu1;
-use solidcore::topology::{Brep, EdgeuseId, FaceId, VertexId, VertexuseId};
+use solidcore::topology::{Brep, EdgeuseId, FaceId, VertexId};
 use solidcore::SolidError;
 use solidcore_ffi::units::blend_fillet_corner_p3::{self as ffi, Op};
 use solidcore_ffi::units::topology_edgeuse_p1 as ffi1;
@@ -880,7 +888,6 @@ fn corner_rust_status_gs(
     c.topology_adjusted = ci.adjusted;
     c.set_back_dist = ci.setback;
 
-    let mut surfaces: BTreeMap<VertexuseId, [Option<Surface>; 2]> = BTreeMap::new();
     for t in &ci.tsects {
         let eu = rm.edgeuse(t.e, t.which)?;
         let vu = rm
@@ -924,7 +931,17 @@ fn corner_rust_status_gs(
                 _ => Ok(None),
             }
         };
-        surfaces.insert(vu, [srf(&rm, t.s0)?, srf(&rm, t.s1)?]);
+        let user = |s: Option<Surface>| {
+            s.map(|s| {
+                solidcore::intersect::surface_intersector::p1::UserSurface(std::sync::Arc::new(s))
+            })
+        };
+        let user_pointer = [user(srf(&rm, t.s0)?), user(srf(&rm, t.s1)?)];
+        rm.fb
+            .fillet_vertexuse_mut(vu)
+            .map_err(h)?
+            .tsect_pnt_mut()
+            .user_pointer = user_pointer;
     }
 
     for &[e, f] in &ci.orig_faces {
@@ -982,7 +999,6 @@ fn corner_rust_status_gs(
             exec: &mut exec,
             // the shim exports `this` as this id
             corner: Some(FilletCornerId(THIS_CORNER)),
-            tsect_surfaces: &surfaces,
             // the model's geometries have a solver only where the case gives one
             solvers: &mut solvers,
             fillet: Some(fillet_env(&mut fillet_brep, &mut records, &mut attributes)),

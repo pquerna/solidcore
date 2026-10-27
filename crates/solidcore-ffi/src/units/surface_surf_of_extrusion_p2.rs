@@ -22,6 +22,8 @@
 //! * [`is_nurb`]: the source status (`0` for an inline NURB), the statuses of the
 //!   `SwapUV` and `Reparameterize` edits asked for, then the result: `0 found
 //!   [state]`, or the failing status upstream returns as its boolean.
+//! * [`lazy`]: as [`is_nurb`] up to `0 found had_nurb`, then the outputs of an `SmSurface`
+//!   [`Query`] run on the recognised surface before anything has made its lazy NURB.
 //!
 //! The wrappers accept only what upstream handles without undefined behaviour: built
 //! surfaces as `surface.surf_of_extrusion_p1` accepts them; records that the strict
@@ -279,6 +281,137 @@ impl Op {
 
 /// `OP_IS_NURB`.
 const OP_IS_NURB: i32 = 5;
+/// `OP_LAZY`.
+const OP_LAZY: i32 = 7;
+
+/// Largest derivative order of a [`Query::EvalSimple`].
+pub const MAX_LAZY_DERIV: usize = 4;
+
+/// An `SmSurface` query [`lazy`] runs on a recognised surface before its NURB exists.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Query {
+    /// `EvaluateSimple(uv, hu, hv, u_left, v_left, FALSE)`.
+    EvalSimple {
+        /// The UV point.
+        uv: [f64; 2],
+        /// Highest U derivative.
+        hu: usize,
+        /// Highest V derivative.
+        hv: usize,
+        /// `bUFromLeft`.
+        u_left: bool,
+        /// `bVFromLeft`.
+        v_left: bool,
+    },
+    /// `EvaluateSimple(uv, 1, 1, u_left, v_left, FALSE)` (the Rust side's first-derivative
+    /// form).
+    EvalFirst {
+        /// The UV point.
+        uv: [f64; 2],
+        /// `bUFromLeft`.
+        u_left: bool,
+        /// `bVFromLeft`.
+        v_left: bool,
+    },
+    /// `CalculateBoundingBox(domain, &box, ..., expand)` (the axis-aligned box).
+    BBox {
+        /// The domain.
+        dom: [f64; 4],
+        /// `bExpandPosBoxesByZoneTol3d`.
+        expand: bool,
+    },
+    /// `IsDegeneratePoint(tol, domain)`.
+    DegenPoint {
+        /// `d3DTol`.
+        tol: f64,
+        /// `pUVDomain`.
+        dom: Option<[f64; 4]>,
+    },
+    /// `IsDegenerateCurve(ang, domain, tol)`.
+    DegenCurve {
+        /// `dAngleTolDeg`.
+        ang: f64,
+        /// `pOptUVDomain`.
+        dom: Option<[f64; 4]>,
+        /// `dOpt3DTol`.
+        tol: f64,
+    },
+    /// `CreateExtendedSurface(ctx, [dir,] dist, cont, e)`.
+    Extend {
+        /// `eExtDirection` (`SmSurfParamType` code); `None` for the overload without it.
+        dir: Option<u8>,
+        /// `dDist`.
+        dist: f64,
+        /// `SmContinuityType` code.
+        cont: u8,
+    },
+    /// `IsPlanar(tol, &point, &normal, &deviation)`.
+    Planar {
+        /// `dTol3d`.
+        tol: f64,
+    },
+    /// `GetNumberControlPoints(dir)`.
+    NumCpts {
+        /// `SmSurfParamType` code (`0..=9`).
+        dir: u8,
+    },
+    /// `IsBilinear()`.
+    Bilinear,
+    /// `IsParallelToVector(v)`.
+    Parallel {
+        /// The vector.
+        v: [f64; 3],
+    },
+    /// `GetKnots(dir, knots, &mults, ivl)`.
+    Knots {
+        /// `SmSurfParamType` code (`0..=9`).
+        dir: u8,
+        /// `pOptIvl` (`[min, max]`, ordered).
+        ivl: Option<[f64; 2]>,
+    },
+    /// `sm_CrossedSeamOrPole(s, prev, curr, domain)` (the shim's copy of the file-local
+    /// helper).
+    Seam {
+        /// `crPrevUV`.
+        prev: [f64; 2],
+        /// `crCurrUV`.
+        curr: [f64; 2],
+        /// `crDomain`.
+        dom: [f64; 4],
+    },
+    /// `FindTessellationSplits(dir, domain, chord, angle, max_side, splits, diagonals)`.
+    TessSplits {
+        /// `SM_SP_U` (0) or `SM_SP_V` (1).
+        dir: u8,
+        /// `crUVDomain`.
+        dom: [f64; 4],
+        /// `dChordHeightTolerance`.
+        chord: f64,
+        /// `dAngleTolDeg` (`0` or `1..=90` in magnitude).
+        angle: f64,
+        /// `dMaximumSideLength` (`<= 0`, or at least `1` and the net's size over it at
+        /// most `1e5`).
+        max_side: f64,
+        /// `bCheckDiagonals`.
+        diagonals: bool,
+    },
+}
+
+/// The largest `|x / w|`, `|y / w|` or `|z / w|` of an inline test NURB with positive
+/// weights (its iso curves stay in that box); `None` otherwise.
+fn test_net_size(test: &TestSurf) -> Option<f64> {
+    let TestSource::Raw(n) = &test.source else {
+        return None;
+    };
+    if test.perturb.is_some() || n.cpts.iter().any(|c| c[3].is_nan() || c[3] <= 0.0) {
+        return None;
+    }
+    Some(n.cpts.iter().fold(0.0_f64, |m, c| {
+        m.max((c[0] / c[3]).abs())
+            .max((c[1] / c[3]).abs())
+            .max((c[2] / c[3]).abs())
+    }))
+}
 
 /// A built surface whose extrusion vector's squared length overflows.
 fn vector_overflows(src: &Src) -> bool {
@@ -656,4 +789,164 @@ pub fn is_nurb(test: &TestSurf, scale: f64) -> Result<Vec<f64>, FfiError> {
     finite(&[scale], "tolerance scale")?;
     e.o.push(scale);
     call(OP_IS_NURB, &e.o, &e.bytes)
+}
+
+/// Runs `IsNurbSurfaceSurfOfExtrusion(test, scale)` and, when it recognises the surface,
+/// `query` on it through the `SmSurface` virtuals before anything has made its NURB;
+/// returns the shim's record: as [`is_nurb`] up to `0 1 had_nurb`, then the query's
+/// outputs. `EvalSimple`, `EvalFirst`: status, then on success the `(hu + 1) (hv + 1)`
+/// derivatives `x y z` (U order major). `BBox`: status, then on success the box corners.
+/// `DegenPoint`, `DegenCurve`: the flag. `Extend`: status, then on success the new
+/// surface's type, whether it has a NURB and that NURB (`p q n+1 m+1 cpts(x y z w) nu U nv
+/// V`). `Planar`: the flag, point, normal and deviation. `NumCpts`: the count.
+/// `Bilinear`, `Parallel`, `Seam`: the flag. `Knots`: status, then on success `n knots m
+/// mults`. `TessSplits`: status, then on success `n splits`.
+///
+/// # Errors
+///
+/// [`FfiError::InvalidArgument`] for input the shim must not see (as [`is_nurb`], plus a
+/// non-finite query value, an unordered domain, a derivative order above
+/// [`MAX_LAZY_DERIV`], a non-positive extension distance, or an enumerator outside its
+/// range); [`FfiError::Status`] for a shim failure.
+pub fn lazy(test: &TestSurf, scale: f64, query: &Query) -> Result<Vec<f64>, FfiError> {
+    let mut e = Enc {
+        o: Vec::new(),
+        bytes: Vec::new(),
+    };
+    e.test(test)?;
+    finite(&[scale], "tolerance scale")?;
+    e.o.push(scale);
+    let opt_dom = |o: &mut Vec<f64>, d: Option<[f64; 4]>| -> Result<(), FfiError> {
+        if let Some(d) = d {
+            domain(d, false, "query domain")?;
+        }
+        o.push(flag(d.is_some()));
+        o.extend(d.unwrap_or([0.0; 4]));
+        Ok(())
+    };
+    let o = &mut e.o;
+    match query {
+        Query::EvalSimple {
+            uv,
+            hu,
+            hv,
+            u_left,
+            v_left,
+        } => {
+            finite(uv, "evaluation point")?;
+            if *hu > MAX_LAZY_DERIV || *hv > MAX_LAZY_DERIV {
+                return Err(bad("derivative order too large"));
+            }
+            o.push(0.0);
+            o.extend_from_slice(uv);
+            o.extend([*hu as f64, *hv as f64, flag(*u_left), flag(*v_left)]);
+        }
+        Query::EvalFirst { uv, u_left, v_left } => {
+            finite(uv, "evaluation point")?;
+            o.push(1.0);
+            o.extend_from_slice(uv);
+            o.extend([1.0, 1.0, flag(*u_left), flag(*v_left)]);
+        }
+        Query::BBox { dom, expand } => {
+            domain(*dom, false, "box domain")?;
+            o.push(2.0);
+            o.extend_from_slice(dom);
+            o.push(flag(*expand));
+        }
+        Query::DegenPoint { tol, dom } => {
+            finite(&[*tol], "degenerate tolerance")?;
+            o.extend([3.0, *tol]);
+            opt_dom(o, *dom)?;
+        }
+        Query::DegenCurve { ang, dom, tol } => {
+            finite(&[*ang, *tol], "degenerate tolerances")?;
+            o.extend([4.0, *ang]);
+            opt_dom(o, *dom)?;
+            o.push(*tol);
+        }
+        Query::Extend { dir, dist, cont } => {
+            finite(&[*dist], "extension distance")?;
+            if *dist <= 0.0 {
+                return Err(bad("extension distance not positive"));
+            }
+            if dir.is_some_and(|d| d > 8) || *cont > 13 {
+                return Err(bad("extension enumerator out of range"));
+            }
+            o.extend([
+                if dir.is_some() { 6.0 } else { 5.0 },
+                f64::from(dir.unwrap_or(0)),
+                *dist,
+                f64::from(*cont),
+            ]);
+        }
+        Query::Planar { tol } => {
+            finite(&[*tol], "planar tolerance")?;
+            o.extend([7.0, *tol]);
+        }
+        Query::NumCpts { dir } => {
+            if *dir > 9 {
+                return Err(bad("parameter type out of range"));
+            }
+            o.extend([8.0, f64::from(*dir)]);
+        }
+        Query::Bilinear => o.push(9.0),
+        Query::Parallel { v } => {
+            finite(v, "parallel vector")?;
+            o.push(10.0);
+            o.extend_from_slice(v);
+        }
+        Query::Knots { dir, ivl } => {
+            if *dir > 9 {
+                return Err(bad("parameter type out of range"));
+            }
+            if let Some([a, b]) = ivl {
+                finite(&[*a, *b], "knot interval")?;
+                if a > b {
+                    return Err(bad("knot interval not ordered"));
+                }
+            }
+            let [a, b] = ivl.unwrap_or([0.0; 2]);
+            o.extend([11.0, f64::from(*dir), flag(ivl.is_some()), a, b]);
+        }
+        Query::Seam { prev, curr, dom } => {
+            finite(prev, "seam point")?;
+            finite(curr, "seam point")?;
+            domain(*dom, false, "seam domain")?;
+            o.push(12.0);
+            o.extend_from_slice(prev);
+            o.extend_from_slice(curr);
+            o.extend_from_slice(dom);
+        }
+        Query::TessSplits {
+            dir,
+            dom,
+            chord,
+            angle,
+            max_side,
+            diagonals,
+        } => {
+            finite(&[*chord, *angle, *max_side], "tessellation controls")?;
+            domain(*dom, false, "tessellation domain")?;
+            if *dir > 1 {
+                return Err(bad("tessellation direction out of range"));
+            }
+            if *angle != 0.0 && !(1.0..=90.0).contains(&angle.abs()) {
+                return Err(bad("tessellation angle out of range"));
+            }
+            // `FindTessellationSplits` converts `max_length / max_side + 1` to ULONG: for
+            // all-degenerate isos (`max_length = -1`) and `0 < max_side < 1` that is
+            // undefined, and a large count allocates that many splits
+            if *max_side > 0.0 {
+                let size = test_net_size(test)
+                    .ok_or_else(|| bad("tessellation needs an inline positive-weight net"))?;
+                if *max_side < 1.0 || size / *max_side > 1e5 {
+                    return Err(bad("tessellation maximum side out of range"));
+                }
+            }
+            o.extend([13.0, f64::from(*dir)]);
+            o.extend_from_slice(dom);
+            o.extend([*chord, *angle, *max_side, flag(*diagonals)]);
+        }
+    }
+    call(OP_LAZY, &e.o, &e.bytes)
 }

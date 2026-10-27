@@ -2,7 +2,7 @@
 
 use super::super::{
     invalid, AttributeHandle, AttributeStore, Brep, EdgeId, EntityRef, ErrorInfo, FaceId,
-    FilletBody, FilletBrep, FilletCorner, FilletObject, FilletSession, Kernel, Result,
+    FilletBody, FilletBrep, FilletCorner, FilletObject, FilletSession, Kernel, Result, SecondBase,
     SessionObjects, SolidError, SolverObject,
 };
 use super::geometry::{InsertionBody, InsertionGeometry, InsertionNotifications, SurfaceBinding};
@@ -11,13 +11,38 @@ use super::{
 };
 use crate::blend::fillet_executive::p3::{FilletExecutive, TopologyInsertionAccess};
 use crate::blend::fillet_geom::p1::FilletErrorType;
-use crate::blend::fillet_geom::p1::{FilletGeomId, FilletSurfaceStorage};
+use crate::blend::fillet_geom::p1::{FilletGeomId, FilletSolverId, FilletSurfaceStorage};
 use crate::blend::fillet_geom::p4::{IntersectionFaceRole, IntersectionTopologyContext};
 use crate::blend::fillet_solver::p1::FilletSolver;
+use crate::blend::fillet_solver::p2::SolverErrorObject;
 use crate::boolean::topology_intersector::{p1::TopologyIntersector, p3::CurveOnSurfaces};
 use crate::geom::{attribute::ObjectKey, context::Context, object::ObjectRef};
 use crate::topology::{brep::p3::topology_ref, edgeuse, topology::Topology, BrepId};
 use std::collections::BTreeMap;
+
+/// The fillet surface `SmFilletGeom::GetFilletSurface()` names during insertion: the
+/// surface of the fillet B-rep face that took it over, or, when no face took it over,
+/// the geometry's own surface. Upstream both are one `SmSurface*`; a surface no face
+/// owns is only ever registered (`RegisterExistingSSI`, a pair no face loop queries)
+/// and named in a merge error note.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum InsertionSurface {
+    /// The surface in a fillet B-rep face's slot.
+    Face(SurfaceBinding),
+    /// The surface the geometry still owns (`FilletSurfaceStorage::Owned`).
+    Owned(FilletGeomId),
+}
+impl InsertionSurface {
+    /// The object upstream's surface pointer stands for in SSI registrations and
+    /// error notes. The geometry's own surface is named as the geometry's fillet
+    /// surface, which no face's current surface ever equals.
+    fn handle(self) -> FilletObject {
+        match self {
+            Self::Face(binding) => FilletObject::Surface(binding),
+            Self::Owned(g) => FilletObject::SolverError(SolverErrorObject::FilletSurface(g)),
+        }
+    }
+}
 
 /// Captured actual Curve slot and its issued identity in this Session.
 /// A replacement or relocation is an explicit capability boundary.
@@ -42,6 +67,11 @@ pub(super) struct LiveGeometryInsertion<'a> {
     pub(super) error: &'a mut ErrorInfo<FilletObject>,
     pub(super) edge_attribute: AttributeHandle,
     pub(super) target_serial: u64,
+    /// A surface/surface fillet's second base B-rep, its identity and its own
+    /// intersector (lent to the second rails' merges by `with_rail_base`).
+    pub(super) second_base: Option<(&'a mut Brep, u64, &'a mut TopologyIntersector<FilletObject>)>,
+    /// The body the current merge's base face is recorded as in error notes.
+    pub(super) base_label: FilletBody,
 }
 impl LiveGeometryInsertion<'_> {
     pub(super) fn capture_managed_surface(
@@ -136,6 +166,11 @@ impl LiveGeometryInsertion<'_> {
         marker: &FaceMarker,
         face: FaceId,
     ) -> Result<()> {
+        let base_side = if self.base_label == FilletBody::SecondBase {
+            Some(1)
+        } else {
+            self.second_base.as_ref().map(|_| 0)
+        };
         let mut access = TargetTopologyChanges::new(
             self.target_serial,
             target,
@@ -143,7 +178,8 @@ impl LiveGeometryInsertion<'_> {
             self.attributes,
             self.solvers,
             self.corners,
-        )?;
+        )?
+        .with_base_side(base_side);
         crate::blend::fillet_executive::topology_changes::update_topology_changes(
             self.k,
             self.solver_order,
@@ -162,18 +198,30 @@ impl LiveGeometryInsertion<'_> {
         if let Some(binding) = surface {
             binding.resolve_in_body(self.intermediate)?;
         }
+        self.register_bound_handle(target, face, surface.map(SurfaceBinding::face_surface))
+    }
+    /// [`Self::register_bound_intersection`] with the other surface already named by
+    /// its face-surface handle (that of a destroyed face for a dangling upstream
+    /// pointer, which no face loop queries).
+    pub(super) fn register_bound_handle(
+        &mut self,
+        target: &mut Brep,
+        face: FaceId,
+        other: Option<FilletObject>,
+    ) -> Result<()> {
         let actual = if target.face(face)?.surface.is_some() {
-            Some(FilletObject::Surface(SurfaceBinding::capture_in_body(
-                self.context,
-                target,
-                InsertionBody::Target,
-                face,
-            )?))
+            Some(
+                SurfaceBinding::capture_in_body(self.context, target, InsertionBody::Target, face)?
+                    .face_surface(),
+            )
         } else {
             None
         };
-        self.ti
-            .register_empty_ssi(actual, surface.copied().map(FilletObject::Surface));
+        // The table is keyed by the handles IntersectInsertRelate's face loop
+        // queries (`CheckIfHaveExistingSSI(pFace->GetSurface(), ..)`): the faces'
+        // current surfaces, so a registered pair is found by a later global or
+        // piecewise merge.
+        self.ti.register_empty_ssi(actual, other);
         Ok(())
     }
     fn merge_actual_curve(
@@ -263,7 +311,7 @@ impl LiveGeometryInsertion<'_> {
 }
 impl IntersectionTopologyContext for LiveGeometryInsertion<'_> {
     type FaceMarker = FaceMarker;
-    type SurfaceBinding = SurfaceBinding;
+    type SurfaceBinding = InsertionSurface;
     fn kernel(&self) -> &Kernel {
         self.k
     }
@@ -274,18 +322,14 @@ impl IntersectionTopologyContext for LiveGeometryInsertion<'_> {
         &mut self,
         pseudo: &FilletBrep,
         g: FilletGeomId,
-    ) -> Result<Option<SurfaceBinding>> {
+    ) -> Result<Option<InsertionSurface>> {
         let Some(storage) = pseudo.geom(g)?.fillet_surface.as_ref() else {
             return Ok(None);
         };
         let (body, face) = match storage {
             FilletSurfaceStorage::ManagedFace { body, face } => (*body, *face),
-            FilletSurfaceStorage::Owned(_) => {
-                return Err(SolidError::unported(
-                    "SmFilletGeom owned insertion Surface",
-                    "blend.fillet_executive_p1",
-                ))
-            }
+            // `GetFilletSurface()` returns the geometry's surface whoever owns it.
+            FilletSurfaceStorage::Owned(_) => return Ok(Some(InsertionSurface::Owned(g))),
         };
         let serial = self
             .intermediate
@@ -294,7 +338,9 @@ impl IntersectionTopologyContext for LiveGeometryInsertion<'_> {
         if body != topology_ref(serial, EntityRef::Brep(BrepId::from_index(0))) {
             return Err(invalid("fillet Surface belongs to foreign body"));
         }
-        self.capture_managed_surface(face)
+        Ok(self
+            .capture_managed_surface(face)?
+            .map(InsertionSurface::Face))
     }
     fn attribute_edges(&self) -> Result<Vec<EdgeId>> {
         edge_attribute_users(self.attributes, self.edge_attribute, self.intermediate)
@@ -306,6 +352,18 @@ impl IntersectionTopologyContext for LiveGeometryInsertion<'_> {
         role: IntersectionFaceRole,
         body: impl FnOnce(&mut Self, &mut Brep, &FaceMarker) -> Result<T>,
     ) -> Result<T> {
+        if role == IntersectionFaceRole::Side && self.second_base.is_some() {
+            // Only a surface/surface fillet has a second base B-rep, and its side edges
+            // are `SmFilletGeom::CreateEndCurve`'s cross sections, made without an
+            // original face (`UpdateSplitFace` only replaces a face equal to the split
+            // one): upstream's side loop `continue`s on `!pFace` before this point.
+            // The edge fillets' cliff and corner side edges that carry one are never
+            // in such a session, so a face here is a broken session, not a B-rep the
+            // native loop would merge into.
+            return Err(invalid(
+                "side edge with an original face in a two-B-rep (surface/surface) session",
+            ));
+        }
         self.marker_scope(
             target,
             face,
@@ -316,6 +374,37 @@ impl IntersectionTopologyContext for LiveGeometryInsertion<'_> {
             role == IntersectionFaceRole::Rail,
             body,
         )
+    }
+    fn with_rail_base<T>(
+        &mut self,
+        target: &mut Brep,
+        solver: FilletSolverId,
+        side: usize,
+        body: impl FnOnce(&mut Self, &mut Brep) -> Result<T>,
+    ) -> Result<T> {
+        // Only a surface/surface solver's second rail lies on the second base B-rep.
+        let second_rail = side == 1
+            && matches!(
+                self.solvers.get(solver.0 as usize),
+                Some(Some(SolverObject::SurfaceSurface(_)))
+            );
+        if !second_rail {
+            return body(self, target);
+        }
+        let Some((second, serial, intersector)) = self.second_base.take() else {
+            return body(self, target);
+        };
+        // The second base B-rep takes the target's place for this rail: its own
+        // identity domain and intersector, its topology recorded as the second base's.
+        std::mem::swap(self.ti, intersector);
+        let target_serial = std::mem::replace(&mut self.target_serial, serial);
+        self.base_label = FilletBody::SecondBase;
+        let result = body(self, second);
+        self.base_label = FilletBody::Target;
+        self.target_serial = target_serial;
+        std::mem::swap(self.ti, intersector);
+        self.second_base = Some((second, serial, intersector));
+        result
     }
     fn managed_edge_tolerance(&self, edge: EdgeId) -> Result<f64> {
         Ok(self.intermediate.edge(edge)?.tolerance)
@@ -362,9 +451,19 @@ impl IntersectionTopologyContext for LiveGeometryInsertion<'_> {
         _pseudo: &FilletBrep,
         target: &mut Brep,
         face: FaceId,
-        surface: &Option<SurfaceBinding>,
+        surface: &Option<InsertionSurface>,
     ) -> Result<()> {
-        self.register_bound_intersection(target, face, surface.as_ref())
+        match surface {
+            Some(InsertionSurface::Face(binding)) => {
+                self.register_bound_intersection(target, face, Some(binding))
+            }
+            // `RegisterExistingSSI(pBaseFace->GetSurface(), pFilletSurface, ..)` with a
+            // surface no face owns: stored, never matched by a face loop's query.
+            Some(owned @ InsertionSurface::Owned(_)) => {
+                self.register_bound_handle(target, face, Some(owned.handle()))
+            }
+            None => self.register_bound_intersection(target, face, None),
+        }
     }
     fn record_bad_merge(
         &mut self,
@@ -374,13 +473,14 @@ impl IntersectionTopologyContext for LiveGeometryInsertion<'_> {
         _target: &Brep,
         face: FaceId,
         rail: EdgeId,
-        surface: &Option<SurfaceBinding>,
+        surface: &Option<InsertionSurface>,
     ) -> Result<()> {
-        if let Some(binding) = surface {
+        if let Some(InsertionSurface::Face(binding)) = surface {
             binding.resolve_in_body(self.intermediate)?;
         }
-        self.error.note_merge_error(FilletErrorType::BadMerge,pseudo.geom(g)?.status(),filleted.map(|e|FilletObject::Topology(FilletBody::Target,EntityRef::Edge(e))),
-            Some(FilletObject::Topology(FilletBody::Target,EntityRef::Face(face))),Some(FilletObject::Topology(FilletBody::Pseudo,EntityRef::Edge(rail))),surface.map(FilletObject::Surface),
+        let base = self.base_label;
+        self.error.note_merge_error(FilletErrorType::BadMerge,pseudo.geom(g)?.status(),filleted.map(|e|FilletObject::Topology(base,EntityRef::Edge(e))),
+            Some(FilletObject::Topology(base,EntityRef::Face(face))),Some(FilletObject::Topology(FilletBody::Pseudo,EntityRef::Edge(rail))),surface.map(InsertionSurface::handle),
             Some("SmFilletGeom::InsertIntersectionTopology(): Failure to merge fillet rail curve into side face of Target Brep"));
         Ok(())
     }
@@ -424,6 +524,15 @@ impl LiveInsertionAccess<'_, '_> {
             error: &mut executive.error,
             edge_attribute,
             target_serial: self.objects.target_serial,
+            second_base: match self.objects.second_base.as_mut() {
+                Some(SecondBase {
+                    body,
+                    serial,
+                    intersector: Some(intersector),
+                }) => Some((&mut **body, *serial, intersector)),
+                _ => None,
+            },
+            base_label: FilletBody::Target,
         };
         body(&mut context, &mut self.objects.pseudo, self.objects.target)
     }
@@ -499,6 +608,42 @@ impl FilletSession<'_> {
         let result = body(self, k);
         k.context.set_doing_boolean(prior);
         result
+    }
+    /// One retained corner's `InsertIntersectionTopology` on the executive's
+    /// intersector and the actual bodies, without the fillet B-rep edge map
+    /// (`DoPiecewiseMerge` inserts each corner this way before relating its surfaces).
+    /// # Errors
+    /// Original corner insertion errors or a genuine missing live capability.
+    pub(in crate::blend::fillet_executive::session) fn insert_corner_topology(
+        &mut self,
+        k: &mut Kernel,
+        corner: FilletObject,
+    ) -> Result<()> {
+        Context::with_notification_context(k, |k, context| {
+            LiveInsertionAccess {
+                objects: &mut self.objects,
+                context,
+            }
+            .insertion_corner_topology(k, corner, &mut self.executive)
+        })?
+    }
+    /// One retained geometry's `InsertIntersectionTopology` on the executive's
+    /// intersector and the actual bodies, without the fillet B-rep edge map
+    /// (`DoSurfaceFilleting` inserts each geometry with a fillet surface this way).
+    /// # Errors
+    /// Original geometry insertion errors or a genuine missing live capability.
+    pub(in crate::blend::fillet_executive::session) fn insert_geometry_topology(
+        &mut self,
+        k: &mut Kernel,
+        geom: FilletObject,
+    ) -> Result<()> {
+        Context::with_notification_context(k, |k, context| {
+            LiveInsertionAccess {
+                objects: &mut self.objects,
+                context,
+            }
+            .insertion_geom_topology(k, geom, &mut self.executive)
+        })?
     }
     /// Insert all retained geometry and corner topology through the shared native
     /// order. Target editing is restored on every result.
@@ -710,5 +855,88 @@ mod tests {
                 "native endrib edge has no owned UV trims: {edge:?}"
             );
         }
+    }
+    #[test]
+    fn geometry_owned_fillet_surface_is_registered_under_its_own_handle() {
+        // `GetFilletSurface()` names the geometry's surface whoever owns it; one no
+        // face took over is registered with each base face and never matched.
+        let mut k = Kernel::default();
+        let mut target = crate::primitive::api_primitives::create_box(
+            &mut k,
+            Point3::new(0.0, 0.0, 0.0),
+            10.0,
+            20.0,
+            30.0,
+        )
+        .unwrap();
+        let edge = target.edges().ids().next().unwrap();
+        let mut session = FilletSession::new(&mut k, &mut target).unwrap();
+        session
+            .prepare_constant_radius_edges(&mut k, &[edge], 0.5, 1, 1, 1.0)
+            .unwrap();
+        session.create_corners(&k, None).unwrap();
+        let result = session.with_filleting_context(&mut k, |session, k| {
+            session.create_fillet_brep(k, None)?;
+            session.shrink_fillet_faces(k)?;
+            let g = FilletGeomId(0);
+            let Some(FilletSurfaceStorage::ManagedFace { face, .. }) =
+                session.objects.pseudo.geom(g)?.fillet_surface
+            else {
+                panic!("the fillet face took over the surface");
+            };
+            let intermediate = session.objects.intermediate.as_ref().unwrap();
+            let copy = intermediate.face(face)?.surface.clone().unwrap();
+            session.objects.pseudo.geom_mut(g)?.fillet_surface =
+                Some(FilletSurfaceStorage::Owned(Box::new(copy)));
+            session.insert_fillet_intersection_topology(k)?;
+            Ok(g)
+        });
+        let g = result.unwrap();
+        let owned = FilletObject::SolverError(SolverErrorObject::FilletSurface(g));
+        let table = session.executive.intersector.intersection_table().unwrap();
+        assert!(table.other_surfaces.contains(&Some(owned)));
+    }
+    #[test]
+    fn shrink_resolves_the_fillet_surface_owner_face_in_the_fillet_brep() {
+        use crate::blend::fillet_executive::p3::FaceShrinkAccess;
+        let mut k = Kernel::default();
+        let mut target = crate::primitive::api_primitives::create_box(
+            &mut k,
+            Point3::new(0.0, 0.0, 0.0),
+            10.0,
+            20.0,
+            30.0,
+        )
+        .unwrap();
+        let edge = target.edges().ids().next().unwrap();
+        let mut session = FilletSession::new(&mut k, &mut target).unwrap();
+        session
+            .prepare_constant_radius_edges(&mut k, &[edge], 0.5, 1, 1, 1.0)
+            .unwrap();
+        session.create_corners(&k, None).unwrap();
+        session
+            .with_filleting_context(&mut k, |session, k| session.create_fillet_brep(k, None))
+            .unwrap();
+        let g = FilletGeomId(0);
+        let Some(FilletSurfaceStorage::ManagedFace { face, .. }) =
+            session.objects.pseudo.geom(g).unwrap().fillet_surface
+        else {
+            panic!("the fillet face took over the surface");
+        };
+        let geom = FilletObject::Geometry(g);
+        let own = Some(FilletObject::IntermediateTopology(EntityRef::Face(face)));
+        assert_eq!(session.objects.shrink_geometry_face(geom).unwrap(), own);
+        // A surface the geometry holds whose owner is a fillet B-rep face (not the
+        // geometry's managed one) resolves to that face, as `GetFace()` does.
+        let intermediate = session.objects.intermediate.as_ref().unwrap();
+        let mut copy = intermediate.face(face).unwrap().surface.clone().unwrap();
+        let owner = session
+            .objects
+            .intermediate_identity(EntityRef::Face(face))
+            .unwrap();
+        copy.set_owner(Some(owner));
+        session.objects.pseudo.geom_mut(g).unwrap().fillet_surface =
+            Some(FilletSurfaceStorage::Owned(Box::new(copy)));
+        assert_eq!(session.objects.shrink_geometry_face(geom).unwrap(), own);
     }
 }

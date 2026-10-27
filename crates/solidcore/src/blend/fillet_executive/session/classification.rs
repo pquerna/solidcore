@@ -13,16 +13,33 @@ use crate::topology::{Brep, BrepId, EdgeId, EdgeuseId, FaceId, LoopId, VertexId,
 
 /// Each body is borrowed from the same live session during the classification loan.
 /// No indexed/legacy handles are accepted by this production provider.
+/// `second` is a surface/surface fillet's second base B-rep when it is not the
+/// target; `classified` names the body whose face is being classified (the target
+/// outside a second rail's classification).
 pub(super) struct Objects<'a> {
     pub target: &'a Brep,
     pub pseudo: &'a Brep,
+    pub second: Option<&'a Brep>,
+    pub classified: FilletBody,
 }
 
-impl Objects<'_> {
+impl<'a> Objects<'a> {
+    /// The target and pseudo bodies, classifying a target face.
+    pub(super) fn new(target: &'a Brep, pseudo: &'a Brep) -> Self {
+        Self {
+            target,
+            pseudo,
+            second: None,
+            classified: FilletBody::Target,
+        }
+    }
+
     fn body(&self, body: FilletBody) -> &Brep {
         match body {
             FilletBody::Target => self.target,
             FilletBody::Pseudo => self.pseudo,
+            // Second-base handles are only issued with a second base present.
+            FilletBody::SecondBase => self.second.unwrap_or(self.target),
         }
     }
 
@@ -31,6 +48,8 @@ impl Objects<'_> {
             Some(FilletBody::Target)
         } else if std::ptr::eq(brep, self.pseudo) {
             Some(FilletBody::Pseudo)
+        } else if self.second.is_some_and(|second| std::ptr::eq(brep, second)) {
+            Some(FilletBody::SecondBase)
         } else {
             None
         }
@@ -85,7 +104,7 @@ impl ClassGeometry<FilletClassObject> for Objects<'_> {
         Some((self.body(body), entity))
     }
     fn topology_handle(&self, entity: EntityRef) -> Option<FilletClassObject> {
-        Some(FilletClassObject::Topology(FilletBody::Target, entity))
+        Some(FilletClassObject::Topology(self.classified, entity))
     }
     fn topology_handle_in(&self, brep: &Brep, entity: EntityRef) -> Option<FilletClassObject> {
         Some(FilletClassObject::Topology(self.body_of(brep)?, entity))
@@ -99,7 +118,10 @@ impl ClassGeometry<FilletClassObject> for Objects<'_> {
         ))
     }
     fn owner_entity(&self, owner: ObjectRef) -> Option<(&Brep, EntityRef)> {
-        for brep in [self.target, self.pseudo] {
+        for brep in [Some(self.target), Some(self.pseudo), self.second]
+            .into_iter()
+            .flatten()
+        {
             let Some(serial) = brep.notify_serial() else {
                 continue;
             };
@@ -116,33 +138,35 @@ impl ClassGeometry<FilletClassObject> for Objects<'_> {
 
 impl CurveOnClassifyObjects<FilletClassObject> for Objects<'_> {
     fn face(&self, id: FaceId) -> FilletClassObject {
-        FilletClassObject::Topology(FilletBody::Target, EntityRef::Face(id))
+        FilletClassObject::Topology(self.classified, EntityRef::Face(id))
     }
     fn vertex(&self, id: VertexId) -> FilletClassObject {
-        FilletClassObject::Topology(FilletBody::Target, EntityRef::Vertex(id))
+        FilletClassObject::Topology(self.classified, EntityRef::Vertex(id))
     }
     fn edge(&self, id: EdgeId) -> FilletClassObject {
-        FilletClassObject::Topology(FilletBody::Target, EntityRef::Edge(id))
+        FilletClassObject::Topology(self.classified, EntityRef::Edge(id))
     }
     fn vertexuse(&self, id: VertexuseId) -> FilletClassObject {
-        FilletClassObject::Topology(FilletBody::Target, EntityRef::Vertexuse(id))
+        FilletClassObject::Topology(self.classified, EntityRef::Vertexuse(id))
     }
     fn edgeuse(&self, id: EdgeuseId) -> FilletClassObject {
-        FilletClassObject::Topology(FilletBody::Target, EntityRef::Edgeuse(id))
+        FilletClassObject::Topology(self.classified, EntityRef::Edgeuse(id))
     }
     fn edge_curve(&self, id: EdgeId) -> FilletClassObject {
-        FilletClassObject::Curve(FilletBody::Target, id)
+        FilletClassObject::Curve(self.classified, id)
     }
     fn trim_curve(&self, id: EdgeuseId) -> FilletClassObject {
-        FilletClassObject::TrimCurve(FilletBody::Target, id)
+        FilletClassObject::TrimCurve(self.classified, id)
     }
     fn face_surface(&self, id: FaceId) -> Option<FilletClassObject> {
-        self.target.face(id).ok()?.surface.as_ref()?;
-        Some(FilletClassObject::Surface(FilletBody::Target, id))
+        self.body(self.classified).face(id).ok()?.surface.as_ref()?;
+        Some(FilletClassObject::Surface(self.classified, id))
     }
     fn loop_id(&self, object: FilletClassObject) -> Option<LoopId> {
         match object {
-            FilletClassObject::Topology(FilletBody::Target, EntityRef::Loop(id)) => Some(id),
+            FilletClassObject::Topology(body, EntityRef::Loop(id)) if body == self.classified => {
+                Some(id)
+            }
             _ => None,
         }
     }
@@ -171,7 +195,7 @@ impl crate::blend::fillet_solver::p5::RailClassificationContext for Context<'_> 
     ) -> crate::error::Result<()> {
         let mut cache = crate::query::face::p2::CurveOnClassifyCache::default();
         let result = {
-            let objects = Objects { target, pseudo };
+            let objects = Objects::new(target, pseudo);
             crate::query::face::p2::curve_on_classify_cached(
                 k, target, face, &objects, true, cc, true, false, true, &mut cache,
             )
@@ -190,30 +214,8 @@ impl crate::blend::fillet_solver::p5::RailClassificationContext for Context<'_> 
             .map(crate::blend::fillet_corner::p3::FilletCorner::corner_type)
             .ok_or_else(|| super::invalid("rollover corner is not live in this session"))
     }
-}
-
-/// Issued pseudo-B-rep identity for new recovery curves. Notification routing is
-/// deliberately unavailable until the recovery API supplies the actual curve key.
-pub(super) struct Ownership {
-    pub serial: u64,
-    pub brep: ObjectRef,
-}
-impl crate::blend::fillet_solver::p1::RailOwnership for Ownership {
-    fn edge_owner(&self, edge: EdgeId) -> crate::error::Result<(ObjectRef, Option<ObjectRef>)> {
-        Ok((
-            crate::topology::brep::p3::topology_ref(self.serial, EntityRef::Edge(edge)),
-            Some(self.brep),
-        ))
-    }
-    fn owner_changed(
-        &mut self,
-        _: crate::curve::curve::p2::OwnerChange,
-    ) -> crate::error::Result<()> {
-        // UNPORTED(blend.fillet_solver_p5): ProcessRollOver retained curve notification context.
-        Err(crate::error::SolidError::unported(
-            "SmFilletSolver::ProcessRollOver (actual curve notification context)",
-            "blend.fillet_solver_p5",
-        ))
+    fn corners(&self) -> crate::blend::fillet_geom::p1::CornerLookup<'_> {
+        crate::blend::fillet_geom::p1::CornerLookup::table(self.corners)
     }
 }
 
@@ -231,10 +233,7 @@ mod tests {
         let target_edge = target.edges().ids().next().unwrap();
         let pseudo_edge = pseudo.edges().ids().next().unwrap();
         assert_eq!(target_edge, pseudo_edge);
-        let objects = Objects {
-            target: &target,
-            pseudo: &pseudo,
-        };
+        let objects = Objects::new(&target, &pseudo);
         let source = FilletClassObject::Curve(FilletBody::Pseudo, pseudo_edge);
         let boundary = objects.edge_curve(target_edge);
         assert_ne!(source, boundary);
@@ -299,5 +298,104 @@ mod tests {
         assert!(objects
             .topology_handle_in(&foreign, EntityRef::Edge(foreign_edge))
             .is_none());
+    }
+    #[test]
+    fn actual_box_rail_crossing_retains_concrete_solver_virtuals() {
+        use super::super::{live_solver_ops, FilletObject, FilletSession};
+        use crate::blend::fillet_geom::p1::{FilStatus, FilletVertexType};
+        use crate::blend::fillet_solver::p3::{calc_rail_x_edge, calc_rail_x_edge_with_ops};
+        use crate::topology::edgeuse::p1 as eu;
+
+        let mut k = Kernel::default();
+        let mut target = create_box(&mut k, Point3::ZERO, 10., 20., 30.).unwrap();
+        let edge = target.edges().ids().next().unwrap();
+        let mut session = FilletSession::new(&mut k, &mut target).unwrap();
+        session
+            .prepare_constant_radius_edges(&mut k, &[edge], 0.5, 1, 1, 1.)
+            .unwrap();
+        session.create_corners(&k, None).unwrap();
+        session.process_smooth_edge_sequences(&mut k).unwrap();
+        session.create_corner_vertices(&mut k).unwrap();
+        session.adjust_corner_topology(&mut k).unwrap();
+        session.calculate_solver_geometry(&mut k).unwrap();
+        let FilletObject::Solver(id) = session.executive.solvers[0] else {
+            panic!("actual solver")
+        };
+        let objects = &mut session.objects;
+        let vertex = objects.corners[0].vertices[0];
+        assert_eq!(
+            objects
+                .pseudo
+                .fillet_vertex(vertex)
+                .unwrap()
+                .fillet_vertex_type(),
+            FilletVertexType::RailXEdgeuse
+        );
+        let Some(EntityRef::Edgeuse(side_use)) = objects
+            .pseudo
+            .fillet_vertex(vertex)
+            .unwrap()
+            .point_class_object()
+        else {
+            panic!("actual side use")
+        };
+        let side = eu::edge(objects.target, side_use).unwrap().unwrap();
+        let solver = objects.solvers[id.0 as usize].as_mut().unwrap();
+        let geom = solver.base().first_fillet_geom().unwrap();
+        let which = solver
+            .base()
+            .find_index_of_rail_x_side_edgeuse(objects.target, side_use)
+            .unwrap();
+        let rail = objects.pseudo.geom(geom).unwrap().rail(which).unwrap();
+        let expected = objects.pseudo.vertex_point(vertex).unwrap();
+        let base = calc_rail_x_edge(
+            solver.base_mut(),
+            &k,
+            objects.target,
+            &mut objects.pseudo,
+            vertex,
+            geom,
+            which,
+            rail,
+            side,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                base,
+                crate::error::SolidError::Upstream {
+                    code: 1001,
+                    operation: "blend::fillet_solver::p1",
+                    ..
+                }
+            ),
+            "{base:?}"
+        );
+        objects.pseudo.brep_mut().vertex_mut(vertex).unwrap().point = Point3::UNDEF;
+        objects
+            .pseudo
+            .fillet_vertex_mut(vertex)
+            .unwrap()
+            .set_status(FilStatus::Unprocessed);
+        calc_rail_x_edge_with_ops(
+            live_solver_ops(solver),
+            &k,
+            objects.target,
+            &mut objects.pseudo,
+            vertex,
+            geom,
+            which,
+            rail,
+            side,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            objects.pseudo.fillet_vertex(vertex).unwrap().status(),
+            FilStatus::Processed
+        );
+        let actual = objects.pseudo.vertex_point(vertex).unwrap();
+        assert!(actual.distance(expected) < 1e-9, "{actual:?} {expected:?}");
     }
 }

@@ -862,9 +862,7 @@ mod tests {
             assert_eq!(a.degenerate, b.degenerate);
         }
         assert!(budget.consumed() > 0);
-        assert!(
-            budget.admitted_bytes() >= bounded.retained_bytes() - size_of::<EdgeSet>()
-        );
+        assert!(budget.admitted_bytes() >= bounded.retained_bytes() - size_of::<EdgeSet>());
         let retained = bounded.retained_bytes();
         assert!(bounded.vertex_index.retained_buffer_bytes() > 0);
         assert!(bounded.index.retained_buffer_bytes() > 0);

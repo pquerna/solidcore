@@ -329,7 +329,7 @@ impl FaceState {
         budget.checkpoint()?;
         let surface = surface_of(b, f)?;
         let sense = outward_sense(b, f)?;
-        let natural = surface.natural_uv_domain();
+        let natural = surface.natural_uv_domain_with_nurb(k)?;
         let mut domain = b.face(f)?.uv_domain;
         if !(domain.u_min() < domain.u_max() && domain.v_min() < domain.v_max()) {
             domain = natural;

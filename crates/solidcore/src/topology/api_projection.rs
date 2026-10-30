@@ -280,11 +280,9 @@ pub fn project_curve_onto_brep(
         return Err(status(SM_ERR_INVALID_INPUT));
     };
 
-    // Upstream passes the SmBSplineCurve itself as an SmCurve; an exact copy keeps its
-    // knots and control points bit for bit.
-    let curve = Curve::new(CurveKind::BSpline(curve.clone_exact()));
-
     // The kernel resets its output array. Keep caller-owned curves out of it.
+    // (`CreateParallelProjectionCurves` takes the curve as an SmCurve)
+    let curve = Curve::from(curve.clone());
     let projected = create_parallel_projection_curves(
         k,
         brep,

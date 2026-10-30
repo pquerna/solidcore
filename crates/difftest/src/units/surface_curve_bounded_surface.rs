@@ -597,7 +597,7 @@ fn side(left: bool) -> Side {
 /// The `SmStatus` of a Rust error; `-1` for one upstream cannot return.
 fn status(e: &SolidError) -> f64 {
     match e {
-        SolidError::InvalidInput { .. } => 1007.0,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.0,
         SolidError::Upstream { code, .. } => f64::from(*code),
         _ => -1.0,
     }
@@ -781,7 +781,7 @@ fn rust_surface_op(k: &Kernel, op: &OpIn, this: &CbsIn) -> Result<Run, HarnessEr
             Ok(())
         }),
         OpIn::Queries { types } => record(|o| {
-            push_dom(o, &s.natural_uv_domain());
+            push_dom(o, &s.natural_uv_domain_with_nurb(k)?);
             push_dom(o, &s.step_uv_domain());
             o.push(s.degree(SurfParamType::U) as f64);
             o.push(s.degree(SurfParamType::V) as f64);

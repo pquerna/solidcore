@@ -3,7 +3,7 @@
 //!
 //! C++: `solidcore_ffi::units::query_loop` (upstream `source/SMLib/src/SmLoop.cpp`) on a
 //! one-face B-rep built with `SmBrepConstructor`: real `SmPlane`, `SmBSplineSurface` and
-//! `SmSurfOfRevolution` faces, `SmLine`, `SmCircle` and `SmBSplineCurve` edges, explicit
+//! `SmSurfOfRevolution` faces, `SmLine`, `SmCircle`, `SmBSplineCurve` and `SmHermiteCurve` edges, explicit
 //! 2D B-spline UV trim curves and explicit face / edge zone tolerances. Rust:
 //! `solidcore::query::r#loop::contains_uv_point` on a one-face `Brep` built from the same
 //! data (the loop walks the B-rep, which it may edit where it creates UV trim curves).
@@ -25,6 +25,7 @@ use serde_json::Value;
 
 use solidcore::curve::curve::Curve;
 use solidcore::curve::ellipse::{Ellipse, EllipseOptions};
+use solidcore::curve::hermite_curve::HermiteCurve;
 use solidcore::curve::line::Line;
 use solidcore::geom::extent1d::Extent1d;
 use solidcore::geom::extent2d::Extent2d;
@@ -89,6 +90,15 @@ enum CurveIn {
         r: f64,
     },
     Bspline(NurbIn),
+    /// `SmHermiteCurve(p1, d1, p2, d2, 3)` (a curve kind without a NURB: its curve cache
+    /// measures the distance of its cubic spans, so the tree depends on the edge's
+    /// tolerance).
+    Hermite {
+        p1: [f64; 3],
+        d1: [f64; 3],
+        p2: [f64; 3],
+        d2: [f64; 3],
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +249,12 @@ fn ffi_case(i: &Inputs) -> ffi::Case {
                         r: *r,
                     },
                     CurveIn::Bspline(n) => ffi::Curve3::BSpline(ffi_nurb(n)),
+                    CurveIn::Hermite { p1, d1, p2, d2 } => ffi::Curve3::Hermite {
+                        p1: *p1,
+                        d1: *d1,
+                        p2: *p2,
+                        d2: *d2,
+                    },
                 },
                 interval: e.interval,
                 tol: e.tol,
@@ -320,6 +336,13 @@ fn rust_curve(k: &Kernel, c: &CurveIn) -> Result<Curve, HarnessError> {
         CurveIn::Line { a, b } => Ok(Curve::from(Line::from_points(v3(*a), v3(*b), 3))),
         CurveIn::Circle { c, x, y, d, r } => rust_circle(k, *c, *x, *y, *d, *r),
         CurveIn::Bspline(n) => rust_nurb(n, 3),
+        CurveIn::Hermite { p1, d1, p2, d2 } => Ok(Curve::from(HermiteCurve::new(
+            v3(*p1),
+            v3(*d1),
+            v3(*p2),
+            v3(*d2),
+            3,
+        ))),
     }
 }
 
@@ -392,7 +415,7 @@ fn rust_brep(
     let err = |e: SolidError| harness(format!("brep: {e}"));
     let lu = LoopuseId::from_index(0);
     let n = u32::try_from(i.edgeuses.len()).map_err(|_| harness("edge uses"))?;
-    let uv_domain = surface.natural_uv_domain();
+    let uv_domain = surface.natural_uv_domain_with_nurb(k).map_err(|e| HarnessError::new(e.to_string()))?;
     let mut b = Brep::new();
     b.add_region_record(Region {
         in_brep: true,
@@ -979,7 +1002,8 @@ fn gen_case(rng: &mut Rng) -> Option<Inputs> {
     let surface_in = gen_surface(rng, gs);
     let surface = rust_surface(&k, &surface_in).ok()??;
     let plane = matches!(surface_in, SurfIn::Plane { .. });
-    let dom = surface.natural_uv_domain();
+    // (runner helper that does not return Result)
+    let dom = surface.natural_uv_domain_if_built();
     let (lo, hi) = (dom.min(), dom.max());
     let (w, h) = (hi.x - lo.x, hi.y - lo.y);
     if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {

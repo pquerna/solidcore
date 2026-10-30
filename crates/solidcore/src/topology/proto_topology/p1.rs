@@ -159,7 +159,8 @@
 //! - **Callees in units not ported yet** return [`SolidError::Unported`](crate::SolidError):
 //!   `SmBrep::GetTolerance` (`topology.brep_p1`) in the manager's fallback tolerance,
 //!   `SmFace::GetEdges` (`topology.face_p4`) for edges sharing a face in
-//!   `sm_FindEDOnDegenFace`, and part 5's `SmBrep::Transform` reaches `SmBrep::Notify` (`topology.brep_p2`).
+//!   `sm_FindEDOnDegenFace` (unreachable, see the degenerate-face branch above), and
+//!   part 5's `SmBrep::Transform` reaches `SmBrep::Notify` (`topology.brep_p2`).
 //!   `SmProtoVertex::ContainsPoint` / `DistanceTo` (unit `query.face_p2`) are
 //!   [`crate::query::face::p2`]'s.
 //! - **Copy map.** `SetAt` takes two objects and `GetAt` of an object without an entry
@@ -215,7 +216,7 @@ mod tests {
     /// A store of owning objects keyed by index.
     #[derive(Default)]
     struct Store {
-        recs: BTreeMap<ObjectKey, Topology>,
+        recs: crate::topology::topology::NotifyRecords,
         lists: BTreeMap<ObjectKey, OwningTopology>,
     }
 
@@ -706,8 +707,10 @@ mod tests {
         assert!(deleted.is_empty());
         assert!(m.proto_vertex(v0).is_none());
         assert!(m.proto_vertex(v1).is_some());
-        // the deleted proto vertex is cleared from the end of the unlisted proto edge
-        assert_eq!(m.proto_edge(pe).unwrap().end_proto_vertex(), None);
+        // v1.0.1's ~SmProtoTopologyManager (3fd5b95) empties the listed proto vertices'
+        // edge lists before deleting them, so the deleted vertex no longer clears itself
+        // from the unlisted proto edge: its ends stay as they were
+        assert_eq!(m.proto_edge(pe).unwrap().end_proto_vertex(), Some(v0));
         assert_eq!(m.proto_edge(pe).unwrap().start_proto_vertex(), Some(v1));
     }
 

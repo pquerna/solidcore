@@ -320,9 +320,9 @@ impl FilletSession<'_> {
         let tol = (fillet_radius1.abs() + fillet_radius2.abs()) / 1000.0;
         let sect = off1.global_surface_intersect(
             k,
-            &off1.natural_uv_domain(),
+            &off1.natural_uv_domain_with_nurb(k)?,
             &off2,
-            &off2.natural_uv_domain(),
+            &off2.natural_uv_domain_with_nurb(k)?,
             use_surface_edges,
             Some(tol),
             None,
@@ -515,7 +515,7 @@ impl FilletSession<'_> {
             };
             let geoms = self.objects.solver(id)?.base().fillet_geoms();
             for geom in geoms {
-                if self.objects.pseudo.geom(geom)?.fillet_surface()?.is_none() {
+                if !self.objects.pseudo.geom(geom)?.has_fillet_surface() {
                     continue;
                 }
                 self.objects.faces_make_face(

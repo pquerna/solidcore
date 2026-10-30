@@ -12,6 +12,7 @@
 //! | [`CrvDirOnFaceType`]                                   | `SmCrvDirOnFaceType`                             |
 //! | [`TouchData`]                                          | `SmTouchData`                                    |
 //! | [`get_connected_touches`]                              | `SmTouchData::GetConnectedTouches`               |
+//! | [`remove_non_crossings`]                               | `SmTouchData::RemoveNonCrossings`                |
 //! | [`get_winding_count`]                                  | `SmTouchData::GetWindingCount`                   |
 //! | [`CurveInterval`]                                      | `SmCurveInterval`                                |
 //! | [`CurveInterval::new`], [`CurveInterval::with_interval`] | `SmCurveInterval(ctx, owner)`, `SmCurveInterval(ivl, ctx, owner)` |
@@ -160,7 +161,8 @@ use crate::nurbs::b_spline_curve::BSplineCurve;
 use crate::nurbs::b_spline_surface_n_lib::p2::{EvaluateFlags, OrientType};
 use crate::surface::surface::p1::map_to_2d_on_curve;
 use crate::surface::surface::p2::surface_cache;
-use crate::surface::surface::{Surface, SurfaceKind};
+use crate::surface::surface::Surface;
+use crate::surface::surface_point_solve::p2::with_out_of_bounds_enabled;
 use crate::EntityRef;
 
 const OP_CC: &str = "intersect::curve_class::p1::CurveClassification";
@@ -225,12 +227,15 @@ pub enum CrvDirOnFaceType {
     Out = 4,
     /// `SM_CD_LAMINA`: out of the surface over a lamina boundary.
     Lamina = 5,
-    /// `SM_CD_SEAM`: out of the surface over a seam.
+    /// `SM_CD_SEAM`: leaves a seam side bounded by an edge use.
     Seam = 6,
     /// `SM_CD_POLE`: out of the surface over a pole marked by a vertex.
     Pole = 7,
     /// `SM_CD_POLE_NO_VERTEX`: out of the surface over a pole without a vertex.
     PoleNoVertex = 8,
+    /// `SM_CD_SEAM_NO_EDGEUSE`: leaves a seam side without a bounding edge use (a 3D
+    /// edge may still exist on the opposite periodic side).
+    SeamNoEdgeuse = 9,
 }
 
 impl CrvDirOnFaceType {
@@ -253,6 +258,7 @@ impl CrvDirOnFaceType {
             6 => Self::Seam,
             7 => Self::Pole,
             8 => Self::PoleNoVertex,
+            9 => Self::SeamNoEdgeuse,
             _ => return None,
         })
     }
@@ -291,6 +297,100 @@ pub fn get_connected_touches<O: PartialEq + Copy>(
         .filter(|t| t.connected_to == connected_to)
         .copied()
         .collect()
+}
+
+/// `SM_ERR_ASSERT_FAILURE` (`SmMessages.h`).
+const SM_ERR_ASSERT_FAILURE: i32 = 1005;
+
+/// Filters a consumer's working touch list to transverse crossings
+/// (`SmTouchData::RemoveNonCrossings`): the end directions are normalised (a pole or
+/// lamina end is [`CrvDirOnFaceType::Out`]; an unused seam image,
+/// [`CrvDirOnFaceType::SeamNoEdgeuse`], takes its inward neighbour's direction), each
+/// `X/ON ... ON/Y` run is joined into `X/Y`, and every arrive/depart pair with the same
+/// direction on both sides (same-side tangencies, struts, cracks, coincident touches)
+/// is removed. The original encounter list is the caller's to keep.
+///
+/// # Errors
+///
+/// `SM_ERR_ASSERT_FAILURE` for an odd-length list (`AERN`).
+pub fn remove_non_crossings<O: Copy>(touches: &mut Vec<TouchData<O>>) -> Result<()> {
+    let mut count = touches.len();
+    if count == 0 {
+        return Ok(());
+    }
+    if count % 2 != 0 {
+        return Err(SolidError::Upstream {
+            operation: "intersect::curve_class::remove_non_crossings",
+            code: SM_ERR_ASSERT_FAILURE,
+            entity: None,
+        });
+    }
+    let at = |touches: &[TouchData<O>], i: usize| -> Result<TouchData<O>> {
+        touches.get(i).copied().ok_or_else(|| {
+            SolidError::invalid_input(
+                "intersect::curve_class::remove_non_crossings",
+                "touch index out of range",
+            )
+        })
+    };
+
+    let put = |touches: &mut Vec<TouchData<O>>, i: usize, t: TouchData<O>| {
+        if let Some(slot) = touches.get_mut(i) {
+            *slot = t;
+        }
+    };
+
+    // Normalize endpoint directions: poles/lamina are outside, while an unused
+    // seam image matches its inward neighbor and does not create a crossing.
+    for end in 0..2 {
+        let index = if end == 0 { 0 } else { count - 1 };
+        let neighbour = if end == 0 { 1 } else { count - 2 };
+        let dir = at(touches, index)?.loop_dir;
+        let new_dir = match dir {
+            CrvDirOnFaceType::Pole | CrvDirOnFaceType::PoleNoVertex | CrvDirOnFaceType::Lamina => {
+                CrvDirOnFaceType::Out
+            }
+            CrvDirOnFaceType::SeamNoEdgeuse => at(touches, neighbour)?.loop_dir,
+            other => other,
+        };
+        if let Some(t) = touches.get_mut(index) {
+            t.loop_dir = new_dir;
+        }
+    }
+
+    // Join X/ON ... ON/Y into X/Y without counting the coincident interval.
+    let mut write = 1;
+    let mut read = 1;
+    while read + 1 < count {
+        let (a, b) = (at(touches, read)?, at(touches, read + 1)?);
+        if a.loop_dir != CrvDirOnFaceType::On && b.loop_dir != CrvDirOnFaceType::On {
+            put(touches, write, a);
+            write += 1;
+            put(touches, write, b);
+            write += 1;
+        }
+        read += 2;
+    }
+    let last = at(touches, count - 1)?;
+    put(touches, write, last);
+    write += 1;
+    count = write;
+    write = 0;
+    // Keep only arrival/departure changes; discard same-side tangencies,
+    // struts, cracks, and entirely coincident touches.
+    let mut read = 0;
+    while read < count {
+        let (a, b) = (at(touches, read)?, at(touches, read + 1)?);
+        if a.loop_dir != b.loop_dir {
+            put(touches, write, a);
+            write += 1;
+            put(touches, write, b);
+            write += 1;
+        }
+        read += 2;
+    }
+    touches.truncate(write);
+    Ok(())
 }
 
 /// The winding count of a single loop's touch list (`SmTouchData::GetWindingCount`):
@@ -1249,55 +1349,21 @@ fn surface_zone_tol_3d(k: &Kernel, surface: &Surface) -> Result<f64> {
 
 // ---- static helpers -----------------------------------------------------------------------
 
-/// A copy of `surface` evaluating out of bounds when it is an `SmBSplineSurface` kind
-/// (`SmTemporaryChangeValue<SmBoolean>(GetOutOfBoundsEnabled(), TRUE)`).
-pub(super) fn out_of_bounds(surface: &Surface) -> Cow<'_, Surface> {
-    match surface.kind() {
-        SurfaceKind::BSpline(s) => {
-            let mut s = s.clone();
-            *s.out_of_bounds_enabled_mut() = true;
-            Cow::Owned(Surface::from(s))
-        }
-        SurfaceKind::Plane(p) => {
-            let mut p = p.copy();
-            *p.out_of_bounds_enabled_mut() = true;
-            Cow::Owned(Surface::from(p))
-        }
-        SurfaceKind::Cone(s) => {
-            // the SmBSplineSurface base flag only (not SetOutOfBoundsEnabled)
-            let mut c = s.as_ref().clone();
-            *c.rev.base_mut().out_of_bounds_enabled_mut() = true;
-            Cow::Owned(Surface::from(c))
-        }
-        SurfaceKind::Sphere(s) => {
-            // the SmBSplineSurface base flag only (not SetOutOfBoundsEnabled)
-            let mut c = s.as_ref().clone();
-            *c.base.base_mut().out_of_bounds_enabled_mut() = true;
-            Cow::Owned(Surface::from(c))
-        }
-        SurfaceKind::Torus(s) => {
-            // the SmBSplineSurface base flag only (not SetOutOfBoundsEnabled)
-            let mut c = s.as_ref().clone();
-            *c.base.base_mut().out_of_bounds_enabled_mut() = true;
-            Cow::Owned(Surface::from(c))
-        }
-        SurfaceKind::SurfOfRevolution(s) => {
-            // the SmBSplineSurface base flag only (not SetOutOfBoundsEnabled)
-            let mut s = s.as_ref().clone();
-            *s.base_mut().out_of_bounds_enabled_mut() = true;
-            Cow::Owned(Surface::from(s))
-        }
-        SurfaceKind::SurfOfExtrusion(s) => {
-            // the SmBSplineSurface base flag only (not SetOutOfBoundsEnabled)
-            let mut s = s.as_ref().clone();
-            *s.base_mut().out_of_bounds_enabled_mut() = true;
-            Cow::Owned(Surface::from(s))
-        }
-        SurfaceKind::CurveBounded(_)
-        | SurfaceKind::Step(_)
-        | SurfaceKind::OffsetSurface(_)
-        | SurfaceKind::SrfInVolume(_) => Cow::Borrowed(surface),
-    }
+/// `surface` evaluating out of bounds when it is an `SmBSplineSurface` kind
+/// (`SmTemporaryChangeValue<SmBoolean>(GetOutOfBoundsEnabled(), TRUE)`): upstream changes
+/// the flag on the surface itself, so this is an evaluation copy with the flag set
+/// ([`with_out_of_bounds_enabled`]: knots exactly as they are, owner kept), not the copy
+/// constructor, whose knot fix-up can move near-coincident knots; the surface itself
+/// when nothing changes.
+///
+/// # Errors
+///
+/// Those of [`Surface::clone_for_evaluation`] (a geometry graph nested too deep).
+pub(super) fn out_of_bounds(surface: &Surface) -> Result<Cow<'_, Surface>> {
+    Ok(match with_out_of_bounds_enabled(surface)? {
+        Some(copy) => Cow::Owned(copy),
+        None => Cow::Borrowed(surface),
+    })
 }
 
 /// `SmSurface::Evaluate(uv, 1, 1, TRUE, TRUE, TRUE, vals)` (status ignored upstream):
@@ -1422,8 +1488,8 @@ pub fn set_xsect_curve_through_point(
 
     // temporarily allow out of bound evaluations for surface[0], surface[1]
     let (orig0, orig1) = (*s0, *s1);
-    let s0 = out_of_bounds(orig0);
-    let s1 = out_of_bounds(orig1);
+    let s0 = out_of_bounds(orig0)?;
+    let s1 = out_of_bounds(orig1)?;
 
     // evaluate each surface at the given intersection parameter points
     let (ok0, mut surf_val0) = surface_evaluate_11(k, &s0, uv0)?;
@@ -1514,16 +1580,17 @@ pub fn set_xsect_curve_through_point(
     // insert throughPoint=p3DPoint (tangent=sXSectTangent3d) at dParam into pSrcCurve3d
     if let Some(bs) = bspline_part_mut(src_curve) {
         let uv_opts: Vec<Option<Vec2>> = uv_points.iter().copied().map(Some).collect();
-        // the surfaces as evaluated here (copies; evaluation does not use the owner)
+        // the surfaces as evaluated here (upstream passes the surfaces themselves, the
+        // first two with out-of-bounds evaluation on): evaluation copies, exact knots
         let evaluators: Vec<Surface> = surfaces
             .iter()
             .enumerate()
             .map(|(i, s)| match i {
-                0 => s0.as_ref().clone(),
-                1 => s1.as_ref().clone(),
-                _ => (*s).clone(),
+                0 => s0.as_ref().clone_for_evaluation(),
+                1 => s1.as_ref().clone_for_evaluation(),
+                _ => s.clone_for_evaluation(),
             })
-            .collect();
+            .collect::<Result<_>>()?;
         let mut new_param = out.param;
         let r = bs.set_intersection_curve_through_point(
             k,
@@ -1647,8 +1714,8 @@ pub fn set_xsect_edge_through_point_in(
     };
 
     // temporarily allow out of bound evaluations for surface[0], surface[1]
-    let s0 = out_of_bounds(orig0);
-    let s1 = out_of_bounds(orig1);
+    let s0 = out_of_bounds(orig0)?;
+    let s1 = out_of_bounds(orig1)?;
     let (_, mut surf_val0) = surface_evaluate_11(k, &s0, uv0)?;
     let (_, mut surf_val1) = surface_evaluate_11(k, &s1, uv1)?;
 
@@ -2005,6 +2072,9 @@ pub fn get_cci_geometry_in<'g, O: ClassObject, G: ClassGeometry<O>>(
         out.emate = geometry.topology_intersector_mate(ti, edge).ok_or(
             // UNPORTED(boolean.topology_intersector_p1): SmTopologyIntersector::GetOtherMate
             // (an adapter that cannot reach the intersector behind its handle)
+            // Proof (unreachable): only if topology_intersector() is Some and the adapter
+            // returns no mate; the library ClassGeometry impls resolve it; 0 hits in the
+            // green difftest sweep.
             SolidError::unported(
                 "SmTopologyIntersector::GetOtherMate",
                 "boolean.topology_intersector_p1",
@@ -2096,6 +2166,8 @@ fn cci_edge_of<O: ClassObject>(
         )),
         // UNPORTED(topology.edge): SmEdge::GetFaces (an adapter that cannot resolve the
         // edge handle to its B-rep)
+        // Proof (unreachable): the library ClassGeometry impls resolve the edge handle
+        // (topology_entity/_mut); 0 hits in the green difftest sweep.
         None => Err(SolidError::unported("SmEdge::GetFaces", "topology.edge")),
     }
 }
@@ -2161,6 +2233,8 @@ pub fn apply_point_solution<O, S: Copy>(
     if input.edge.is_some() {
         // this entry point has no B-rep for the edge ([`apply_point_solution_in`] has)
         // UNPORTED(topology.edge): SmEdge::GetCurve
+        // Proof (unreachable): B-rep-less entry point; library callers use the `_in` twin,
+        // only difftest and a unit test call this one; 0 hits in the green difftest sweep.
         return Err(SolidError::unported("SmEdge::GetCurve", "topology.edge"));
     }
     apply_point_solution_impl(
@@ -2682,6 +2756,9 @@ pub fn compute_face_point_class<O: ClassObject>(
 ) -> Result<()> {
     let _ = (point, src_zone_tol_3d, face, point_class);
     // UNPORTED(topology.face_p2): SmFace::GetSurface
+    // Proof (unreachable): trait default of FaceQueries::compute_face_point_class; the
+    // B-rep-backed impl uses compute_face_point_class_in; 0 hits in the green difftest
+    // sweep.
     Err(SolidError::unported(
         "SmFace::GetSurface",
         "topology.face_p2",
@@ -2929,11 +3006,10 @@ fn surface_approximate_size(k: &Kernel, surface: &Surface) -> Result<Vec2> {
 /// `SmSurface::GlobalPointSolve(domain, SM_SO_MINIMIZE, point, 0.001 * |size|, &maxDrop,
 /// SM_SR_SINGLE, sols)` over the natural domain (`maxDrop` is `1.0`): the gap and UV
 /// point of the first solution, if any. The status is ignored (`SmCurveClass.cpp:1045`
-/// checks only the solution count), so a failed solve is an empty result. Upstream's
-/// temporary switch-off of the surface cache's point test (`m_bPointTestEnabled`,
-/// `:1040`) is moot here: the solver builds no cache for a surface that owns no face,
-/// and a face-owned one is `Unported` in the solver (`UNPORTED(query.face_p2)`; the
-/// switch must be added with it).
+/// checks only the solution count), so a failed solve is an empty result. Upstream
+/// switches the surface cache's point test off for the solve (`m_bPointTestEnabled`,
+/// `:1040`), so its solutions are not classified against a face's trim boundaries
+/// ([`Surface::global_point_solve_point_test_off`]).
 fn surface_global_point_solve(
     k: &Kernel,
     surface: &Surface,
@@ -2942,7 +3018,7 @@ fn surface_global_point_solve(
 ) -> Result<Option<(f64, Point2)>> {
     let tol = 0.001 * size.length();
     let solutions = ignored(
-        surface.global_point_solve::<crate::surface::surface::p4::NoObject>(
+        surface.global_point_solve_point_test_off::<crate::surface::surface::p4::NoObject>(
             k,
             Some(crate::surface::surface::p4::NoObject),
             &surface.natural_uv_domain_with_nurb(k)?,

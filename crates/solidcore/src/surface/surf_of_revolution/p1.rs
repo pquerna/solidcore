@@ -72,6 +72,10 @@
 //!   that [`SolidError::Unported`] always propagates and a failure whose output
 //!   upstream would read uninitialised (a failed generator or surface evaluation, a
 //!   failed iso curve in `RebuildPolarConverter`) is returned.
+//! - **`RebuildPolarConverter`** makes a missing NURB first, as its upstream
+//!   `GetNaturalUVDomain` does (a lazy surface that is transformed or edited gets its
+//!   NURB there); called from `MakeNurbWithSweepParams` it does not, which bounds the
+//!   recursion upstream would enter if that NURB were missing.
 //! - **Unported callees.** `ConvertUVFromNURBSToSTEP` without exact polar conversion
 //!   needs `SmSTEPSurface` (unit `surface.surface_p1`), which returns
 //!   [`SolidError::Unported`].
@@ -651,7 +655,7 @@ impl SurfOfRevolution {
         self.base.nurb = tmp.nurb;
 
         // Set up the Polar conversion - create a sweep isoParametric curve
-        ignore_status(self.rebuild_polar_converter(k, iso))?;
+        ignore_status(self.rebuild_polar_converter_from(k, iso, false))?;
         Ok(())
     }
 
@@ -683,7 +687,27 @@ impl SurfOfRevolution {
         k: &Kernel,
         iso: SweepIsoFn<'_>,
     ) -> Result<()> {
-        // Try the beginning of the curve if possible
+        self.rebuild_polar_converter_from(k, iso, true)
+    }
+
+    /// [`Self::rebuild_polar_converter`]; `make_nurb` says whether a missing NURB is
+    /// made first, as upstream's `GetNaturalUVDomain` does
+    /// (`GetOrCreateGwNurbPointer` calls the virtual `MakeNurb`, the
+    /// `MakeNurbWithSweepParams` of `iso`'s class, which rebuilds the converter itself;
+    /// its status is ignored). [`Self::make_nurb_with_sweep_params_using`] passes
+    /// `false`: it has just stored its NURB, and upstream would recurse without bound
+    /// if that NURB were missing.
+    fn rebuild_polar_converter_from(
+        &mut self,
+        k: &Kernel,
+        iso: SweepIsoFn<'_>,
+        make_nurb: bool,
+    ) -> Result<()> {
+        // Try the beginning of the curve if possible (GetNaturalUVDomain makes a missing
+        // NURB)
+        if make_nurb && self.base.gw_nurb().is_none() {
+            ignore_status(self.make_nurb_with_sweep_params_using(k, None, iso))?;
+        }
         let nurb_domain = self.base.natural_uv_domain();
         let nurb_min_uv = nurb_domain.min();
         self.polar.set_polar_conversion_possible(false);
@@ -1257,7 +1281,7 @@ impl SurfOfRevolution {
                 )?,
             );
             let point_3d = self.base.evaluate_point(nurbs_uv)?;
-            let domain = step_surface.natural_uv_domain();
+            let domain = step_surface.natural_uv_domain_with_nurb(k)?;
             // Always set output (the status is ignored): LocalPointSolve leaves a default
             // solution when it fails.
             let (u, v) = match ignored(step_surface.local_point_solve::<()>(
@@ -1526,10 +1550,36 @@ impl SurfOfRevolution {
         iso: SweepIsoFn<'_>,
     ) -> Result<(bool, SurfaceIntersection)> {
         let mut out = SurfaceIntersection::default();
+        let more = self.intersect_with_plane_owned_using_into(
+            k,
+            plane,
+            plane_owner,
+            other_uv_domain,
+            approx_tol_3d,
+            iso,
+            &mut out,
+        )?;
+        Ok((more, out))
+    }
+
+    /// [`Self::intersect_with_plane_owned_using`] into `out` (reset first). On an error
+    /// `out` keeps what was appended before it, as upstream leaves its output arrays.
+    #[allow(clippy::too_many_lines)] // one upstream function
+    pub(crate) fn intersect_with_plane_owned_using_into(
+        &self,
+        k: &Kernel,
+        plane: &Plane,
+        plane_owner: PlaneOwner,
+        other_uv_domain: &Extent2d,
+        approx_tol_3d: Option<f64>,
+        iso: SweepIsoFn<'_>,
+        out: &mut SurfaceIntersection,
+    ) -> Result<bool> {
+        *out = SurfaceIntersection::default();
 
         // use general intersection for nonPlanar generators
         if !self.planar_generator {
-            return Ok((true, out));
+            return Ok(true);
         }
 
         // plane and RevolutionSurface locals
@@ -1552,8 +1602,6 @@ impl SurfOfRevolution {
                 .map(|(_, p)| p)
                 .unwrap_or_default();
         plane_pbox.expand_absolute(tol);
-
-        let mut types: Vec<TsectCurveType> = Vec::new();
 
         // The curve pieces of `crv` inside the plane domain when its pseudo box meets
         // the plane's (statuses ignored).
@@ -1581,7 +1629,7 @@ impl SurfOfRevolution {
             let vec_between = self.position.origin() - plane_origin;
             let dist_plane_to_center = vec_between.dot(plane_normal);
             if dist_plane_to_center.abs() > tol {
-                return Ok((true, SurfaceIntersection::default()));
+                return Ok(true);
             }
 
             let start_ang_rad = self.start_angle_deg() * PI / 180.0;
@@ -1617,7 +1665,7 @@ impl SurfOfRevolution {
                     }
                     for c in trim(&Curve::from(crv), &plane_pbox)? {
                         out.curves_3d.push(c);
-                        types.push(TsectCurveType::Crossing);
+                        out.curve_types.push(TsectCurveType::Crossing);
                     }
                 }
             }
@@ -1666,8 +1714,7 @@ impl SurfOfRevolution {
                     // empties only the 3D curves: the curve types found so far stay)
                     if d2.length() < EFF_ZERO_SQRT {
                         out.curves_3d.clear();
-                        out.curve_types = types;
-                        return Ok((true, out));
+                        return Ok(true);
                     }
                 }
 
@@ -1678,7 +1725,7 @@ impl SurfOfRevolution {
                 let crv = iso(self, k, surf_param, iso_param)?;
                 for c in trim(&crv, &plane_pbox)? {
                     out.curves_3d.push(c);
-                    types.push(if is_tangent {
+                    out.curve_types.push(if is_tangent {
                         TsectCurveType::Tangent
                     } else {
                         TsectCurveType::Crossing
@@ -1688,10 +1735,11 @@ impl SurfOfRevolution {
         }
         // Plane cuts RevolutionSurface at an angle
         else {
-            return Ok((true, SurfaceIntersection::default()));
+            return Ok(true);
         }
 
-        for (c, t) in out.curves_3d.iter().zip(types.iter_mut()) {
+        // (the curve types are appended with the curves, as upstream's)
+        for (c, t) in out.curves_3d.iter().zip(out.curve_types.iter_mut()) {
             out.surface1_uv_curves.push(None);
             out.surface2_uv_curves.push(None);
             if c.is_degenerate(k, EFF_ZERO, None)? {
@@ -1699,8 +1747,7 @@ impl SurfOfRevolution {
             }
             out.deviations.push(0.0);
         }
-        out.curve_types = types;
-        Ok((false, out))
+        Ok(false)
     }
 
     /// Rotates `point` about the axis onto the start (X/Z) half plane and returns the

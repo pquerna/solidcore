@@ -276,7 +276,13 @@ fn owning_face_tolerance(b: &Brep, f: FaceId, s: &Surface) -> Result<Option<f64>
 }
 
 /// `pSurface->IsPlanar(dTol3d)` of face `f`'s surface.
-fn surface_is_planar(k: &Kernel, b: &Brep, f: FaceId, s: &Surface, tol_3d: f64) -> Result<bool> {
+pub(crate) fn surface_is_planar(
+    k: &Kernel,
+    b: &Brep,
+    f: FaceId,
+    s: &Surface,
+    tol_3d: f64,
+) -> Result<bool> {
     let base = match s.kind_with_nurb(k)? {
         SurfaceKind::BSpline(bs) => Some(bs),
         SurfaceKind::SurfOfRevolution(r) => Some(r.base()),
@@ -298,12 +304,13 @@ fn surface_is_planar(k: &Kernel, b: &Brep, f: FaceId, s: &Surface, tol_3d: f64) 
             expand_by_zone_tol: false,
             expand_tolerance: None,
         };
-        let pseudo = ignored(bs.calculate_bounding_box(k, &s.natural_uv_domain(), &req))?
-            .and_then(|r| r.pseudo)
-            .map_or_else(PseudoBox::new, |mut p| {
-                p.expand_absolute(face_tol);
-                p
-            });
+        let pseudo =
+            ignored(bs.calculate_bounding_box(k, &s.natural_uv_domain_with_nurb(k)?, &req))?
+                .and_then(|r| r.pseudo)
+                .map_or_else(PseudoBox::new, |mut p| {
+                    p.expand_absolute(face_tol);
+                    p
+                });
         return Ok(pseudo.is_planar(tol_3d).is_planar);
     }
     Ok(s.is_planar(k, tol_3d)?.is_planar)
@@ -311,7 +318,7 @@ fn surface_is_planar(k: &Kernel, b: &Brep, f: FaceId, s: &Surface, tol_3d: f64) 
 
 /// `pSurface->CalculateBoundingBox(crUVDomain, &sBox)` (axis-aligned box only, expanded
 /// by the zone tolerance) of face `f`'s surface.
-fn surface_bounding_box(
+pub(crate) fn surface_bounding_box(
     k: &Kernel,
     b: &Brep,
     f: FaceId,
@@ -585,6 +592,23 @@ impl<'b, O: LoopObject> LoopObjectCurves<'b, O> {
     #[must_use]
     pub fn classify_uv_curve(&self) -> Option<&Curve> {
         self.uv_curve.as_ref().map(|(_, c)| c)
+    }
+
+    /// The same handles and classification curves resolved against `b`, a copy of the
+    /// B-rep these were made for (same ids) that holds what the classification's lazy
+    /// queries left on it: the UV trim curves and tolerances upstream's later queries
+    /// read from the one B-rep.
+    #[must_use]
+    pub(crate) fn rebind(self, b: &Brep) -> LoopObjectCurves<'_, O> {
+        LoopObjectCurves {
+            b,
+            f: self.f,
+            face: self.face,
+            surface: self.surface,
+            curve_handles: self.curve_handles,
+            curve: self.curve,
+            uv_curve: self.uv_curve,
+        }
     }
 
     /// The handle of `t`; [`Self::new`] checked that `O` names topology, so the face
@@ -995,6 +1019,8 @@ pub(crate) fn find_and_classify_loop_bisector_cached<O: LoopObject + PartialEq>(
     let mut sp = [Vec3::UNDEF; 2];
     let mut ends = [Vec3::UNDEF; 2];
     let mut uv1 = Vec2::UNDEF;
+    let mut start_uv = Vec2::UNDEF;
+    let mut end_uv = Vec2::UNDEF;
 
     // get pLoop->Edgeuses for the Target Loop (guarantees UVTrimLine XSects the TgtLoop)
     let tgt_lu = b
@@ -1241,8 +1267,8 @@ pub(crate) fn find_and_classify_loop_bisector_cached<O: LoopObject + PartialEq>(
             {
                 trim_interval = ivl;
             }
-            let start_uv = surf_uv_domain.clamp_point(uv0 + uv_dir * trim_interval.min());
-            let end_uv = surf_uv_domain.clamp_point(uv0 + uv_dir * trim_interval.max());
+            start_uv = surf_uv_domain.clamp_point(uv0 + uv_dir * trim_interval.min());
+            end_uv = surf_uv_domain.clamp_point(uv0 + uv_dir * trim_interval.max());
 
             let uv_trim_line = Line::from_points(
                 Point3::new(start_uv.x, start_uv.y, 0.0),
@@ -1375,6 +1401,11 @@ pub(crate) fn find_and_classify_loop_bisector_cached<O: LoopObject + PartialEq>(
             break;
         }
     } // end iter ii, every Loop->edge looking for a good UVTrimCurve Loop bisector
+
+    // Classify the actual endpoints, including circumferential samples on a singly
+    // periodic surface. Surface periodicity alone does not identify them.
+    out.start_on_seam = surface.is_on_seam(k, start_uv, None)?.on_seam;
+    out.stop_on_seam = surface.is_on_seam(k, end_uv, None)?.on_seam;
 
     // set remaining output
     out.has_curve = has_curve;
@@ -1997,7 +2028,7 @@ pub fn sector_classify_curve_on(
     };
 
     // Some surface info:
-    let srf_domain = face_surface(b, f, OP_SECTOR)?.natural_uv_domain();
+    let srf_domain = face_surface(b, f, OP_SECTOR)?.natural_uv_domain_with_nurb(k)?;
     let lu1 = eu1::loopuse(b, cp_eu1)?.ok_or_else(|| null(OP_SECTOR, "edge use not in a loop"))?;
     let loop1 = b
         .loopuse(lu1)?

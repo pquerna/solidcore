@@ -445,7 +445,7 @@ fn dump_surface(o: &mut Vec<f64>, s: &BSplineSurface) {
 /// The `SmStatus` of a Rust error; `-1` for one upstream cannot return.
 fn status(e: &SolidError) -> f64 {
     match e {
-        SolidError::InvalidInput { .. } => 1007.0,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.0,
         SolidError::Upstream { code, .. } => f64::from(*code),
         _ => -1.0,
     }
@@ -515,7 +515,7 @@ fn rust(i: &Inputs) -> Result<Output, HarnessError> {
             ) {
                 Ok(surface) => {
                     o.extend([0.0, 1.0, flag(surface.owner().is_none())]);
-                    let domain = surface.natural_uv_domain();
+                    let domain = surface.natural_uv_domain_with_nurb(&k).map_err(|e| HarnessError::new(e.to_string()))?;
                     o.extend([
                         domain.min().x,
                         domain.min().y,

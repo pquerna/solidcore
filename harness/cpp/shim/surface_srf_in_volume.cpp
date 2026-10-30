@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // difftest shim for unit `surface.srf_in_volume`: the SmSrfInVolume members owned by the unit
 // (source/SMLib/src/SmSrfInVolume.cpp, source/SMLib/inc/SmSrfInVolume.h), called through
-// SmSrfInVolume / SmSurface on objects built from an SmBSplineSurface or SmPlane base surface
-// and a chain of SmTransform / SmTwistVolume / SmUnbendVolume / plain SmVolume maps.
+// SmSrfInVolume / SmSurface on objects built from an SmBSplineSurface, SmPlane or SmCylinder base
+// surface and a chain of SmTransform / SmTwistVolume / SmUnbendVolume / plain SmVolume maps.
 //
 // One entry point, sc_surface_srf_in_volume_eval(op, in, n_in, out, cap, out_len). Layouts are
 // documented in crates/solidcore-ffi/src/units/surface_srf_in_volume.rs, which validates every
@@ -12,9 +12,11 @@
 
 #include "StdAfx.h"
 #include <SmAxis2Placement.h>
+#include <cmath>
 #include <SmBendVolume.h>
 #include <SmBSplineSurface.h>
 #include <SmContext.h>
+#include <SmCylinder.h>
 #include <SmDatabaseIO.h>
 #include <SmExtent1d.h>
 #include <SmExtent2d.h>
@@ -67,6 +69,7 @@ enum : int32_t
     OP_SET_VOLUME = 17,
     OP_MIRROR = 18,
     OP_EXACT = 19,
+    OP_COPY_CTOR = 20, // the copy constructor: SmSrfInVolume(const SmSrfInVolume&)
     OP_READ_DB = 40,  // static: SmSrfInVolume::ReadFromDB
     OP_WRITE_DB = 41, // generator helper: WriteToDB of the object
 };
@@ -222,7 +225,10 @@ void put_volume(std::vector<double>& o, const SmVolume* v)
 // ---- surfaces -------------------------------------------------------------------------
 
 // A surface block: `0 oob form n m p q r s cpts(x y z w) u v` (SmBSplineSurface(gw_SURFACE*,
-// FALSE, NULL)) or `1 O[3] N[3]` (SmPlane(O, N)).
+// FALSE, NULL)), `1 O[3] N[3]` (SmPlane(O, N)) or `2 O[3] X[3] Y[3] r start end h swap inside`
+// (SmCylinder(O, X, Y, r, start, end, h, swap, inside, FALSE) + MakeNurb, status ignored: the
+// ffi wrapper admits only inputs it succeeds on); `3 ...` is kind 0 with the given knots written
+// back over the surface's own NURB after construction.
 SmSurface* read_surface(Rd& rd, const SmContext& ctx)
 {
     int64_t kind = rd.idx();
@@ -231,6 +237,21 @@ SmSurface* read_surface(Rd& rd, const SmContext& ctx)
         SmPoint3d o = rd.vec();
         SmVector3d n = rd.vec();
         return new (ctx) SmPlane(o, n, &ctx);
+    }
+    if (kind == 2)
+    {
+        SmPoint3d o = rd.vec();
+        SmVector3d x = rd.vec();
+        SmVector3d y = rd.vec();
+        double r = rd.num();
+        double a0 = rd.num();
+        double a1 = rd.num();
+        double h = rd.num();
+        SmBoolean swap = rd.bflag();
+        SmBoolean inside = rd.bflag();
+        SmCylinder* c = new (ctx) SmCylinder(o, x, y, r, a0, a1, h, swap, inside, FALSE, &ctx);
+        c->MakeNurb();
+        return c;
     }
     bool oob = rd.flag();
     SmBSplineSurfaceForm form = (SmBSplineSurfaceForm)rd.idx();
@@ -254,6 +275,16 @@ SmSurface* read_surface(Rd& rd, const SmContext& ctx)
     for (gw_INDEX i = 0; i <= s; i++)
         sur->knv->U[i] = rd.num();
     SmBSplineSurface* b = new (ctx) SmBSplineSurface(sur, FALSE, NULL);
+    if (kind == 3)
+    {
+        // write the given knots back over the fixed-up NURB
+        gw_SURFACE* own = b->GetGwNurbPointer();
+        int64_t at = rd.at - (int64_t)(r + 1) - (int64_t)(s + 1);
+        for (gw_INDEX i = 0; i <= r; i++)
+            own->knu->U[i] = rd.in[at++];
+        for (gw_INDEX i = 0; i <= s; i++)
+            own->knv->U[i] = rd.in[at++];
+    }
     b->GetOutOfBoundsEnabled() = oob ? TRUE : FALSE;
     b->SetBSplineSurfaceForm(form);
     return b;
@@ -298,6 +329,47 @@ void put_surface(std::vector<double>& o, const SmSurface* srf)
         o.push_back(sur->knu->U[i]);
     for (gw_INDEX i = 0; i <= ss; i++)
         o.push_back(sur->knv->U[i]);
+}
+
+// What an exact result evaluates to: `dom[4] finite` and, when the natural domain is
+// finite, `st P[3] st N[3]` (EvaluatePoint, EvaluateNormal(uv, TRUE, TRUE)) at the 3 x 3
+// grid of fractions 0, 0.5, 1 of each interval.
+void put_exact_eval(std::vector<double>& o, const SmSurface* srf)
+{
+    SmExtent2d d = srf->GetNaturalUVDomain();
+    double c[4] = {d.GetUMin(), d.GetVMin(), d.GetUMax(), d.GetVMax()};
+    bool finite = true;
+    for (double x : c)
+    {
+        o.push_back(x);
+        finite = finite && std::isfinite(x) && std::fabs(x) < 1.0e12;
+    }
+    o.push_back(flg(finite));
+    if (!finite)
+        return;
+    for (int i = 0; i <= 2; i++)
+        for (int j = 0; j <= 2; j++)
+        {
+            SmPoint2d uv(d.GetUInterval().Evaluate(0.5 * i), d.GetVInterval().Evaluate(0.5 * j));
+            SmPoint3d p;
+            SmStatus s = srf->EvaluatePoint(uv, p);
+            o.push_back(st(s));
+            if (s == SM_SUCCESS)
+            {
+                o.push_back(p.x);
+                o.push_back(p.y);
+                o.push_back(p.z);
+            }
+            SmVector3d n;
+            s = srf->EvaluateNormal(uv, TRUE, TRUE, n);
+            o.push_back(st(s));
+            if (s == SM_SUCCESS)
+            {
+                o.push_back(n.x);
+                o.push_back(n.y);
+                o.push_back(n.z);
+            }
+        }
 }
 
 // Full state: owner_flag in_param surface volume.
@@ -566,6 +638,26 @@ void siv_op(int32_t op, Rd& rd, const SmContext& ctx, Built& bb, std::vector<dou
         }
         break;
     }
+    case OP_COPY_CTOR:
+    {
+        // SmSrfInVolume(const SmSrfInVolume&): shares a part the original does not own,
+        // copies an owned one, and copies the volume whenever the original owns either
+        // part (also for owner flag 1, whose result does not own that copied volume);
+        // the owner flag becomes 1, 2, 3 or 0 from what the original owns.
+        SmSrfInVolume* cc = new (ctx) SmSrfInVolume(*c);
+        o.push_back(0.0);
+        put_state(o, cc);
+        o.push_back((*c == *(SmSurface*)cc) ? 1.0 : 0.0);
+        // the copy deletes what it owns; free a copied part it does not own
+        SmSurface* csur = cc->GetSurface();
+        SmVolume* cvol = cc->GetVolume();
+        if (csur != c->GetSurface() && cc->OwnsSurface() == FALSE)
+            delete csur;
+        if (cvol != c->GetVolume() && cc->OwnsVolume() == FALSE)
+            delete cvol;
+        delete cc;
+        break;
+    }
     case OP_EQUAL:
     {
         bool self_cmp = rd.flag();
@@ -646,7 +738,10 @@ void siv_op(int32_t op, Rd& rd, const SmContext& ctx, Built& bb, std::vector<dou
         {
             o.push_back(flg(b != NULL));
             if (b != NULL)
+            {
                 put_surface(o, b);
+                put_exact_eval(o, b);
+            }
         }
         delete b;
         break;

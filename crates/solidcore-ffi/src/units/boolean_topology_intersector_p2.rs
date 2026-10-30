@@ -23,7 +23,7 @@
 //! | 49 | `FixupSplitVertexPair`      | `index cc cc`            | `status changed ccf ccf` |
 //! | 50 | `EdgeEdgeIntersect`         | `n h* n h* manifold ignore` | `status n h*(split1) n_new1 n h*(split2) n_new2 n_verts max min` |
 //! | 51 | `EdgeFaceCoincidence`       | `n h* n h* ignore nesting` | `status n h*(imprinted) n h*(processed) n_new n h*(split) max min` |
-//! | 52 | `CloseIntersectionLoop`     | `h`                      | `status made_new_topology n h*` (the other mate of each edge of the vertex) |
+//! | 52 | `CloseIntersectionLoop`     | `h`                      | `status made_new_topology dv de n h*` (the deleted vertex and edge counts, then the other mate of each edge of the vertex) |
 //!
 //! `ccf` is `n (a b pcf pcf pcf)*`. Ops 42 to 44 and 47 to 52 emit their outputs only
 //! on a success status. Ops 42 to 44, 47 and 50 to 52 may change topology (52 through
@@ -45,9 +45,9 @@
 //! are not vertices where upstream dereferences them, edges of a vertex without
 //! curve, faces without surface, 46 without the maps reaching `Relate`'s insert, 52's
 //! edges without curve, vertices or (the B-rep vertex's) primary edge use) and
-//! answers `-2`; it also answers `-2` for a 47 whose manager teardown would read a
-//! freed proto edge (UB-175: the shim runs a verbatim copy of
-//! `IntersectInsertRelate` that unlinks the stale entries first).
+//! answers `-2`; it also answers `-2` for a 47 whose failed imprint may have edited a
+//! B-rep (UB-242: the shim runs a verbatim copy of `IntersectInsertRelate` that stops
+//! there).
 //!
 //! 49 checks the index against both classifications only: upstream bounds its
 //! `index + 1` writes by the B-rep classification's size, so with a shorter other

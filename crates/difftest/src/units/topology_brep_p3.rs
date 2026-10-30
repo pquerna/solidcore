@@ -4,17 +4,19 @@
 //! The C++ side builds a real `SmBrep` per call with the shared topology fixture (an
 //! upstream `.smb` file, a wire edge, a one-face B-rep or the `my_test_topology` wire
 //! network), normalised as the `topology.brep_p2` shim does, and runs one member of the
-//! unit (the constructors and `SmApiBrepCopy` too). The Rust side imports the graph
-//! the `topology.brep_p2` shim exports for the same input (the `topology.vertexuse`
-//! importer), restores what the import cannot carry (the B-rep tolerance, infinite
-//! region, region list head, editing flag, each vertex's vertex use order, the
-//! geometry owners and each face's upward face use), runs the port and writes the
-//! same output layout (`out`).
+//! unit (the constructors and `SmApiBrepCopy` too). The Rust side builds a wire edge,
+//! face or network source itself ([`crate::own_builder`] under the `topology.brep_p2`
+//! shim's conventions; the normalisation only replaces analytic geometry, which these
+//! sources lack). For an `.smb` file it imports the graph the `topology.brep_p2` shim
+//! exports for the same input (the `topology.vertexuse` importer), restores what the
+//! import cannot carry (the B-rep tolerance, infinite region, region list head, editing
+//! flag, each vertex's vertex use order, the geometry owners and each face's upward
+//! face use). It runs the port and writes the same output layout (`out`).
 //!
 //! Entity selectors are taken modulo the matching entity count (`-1` selects null);
 //! an op that needs an entity the B-rep lacks is skipped on both sides (`no target`).
-//! `Merge` / `CopyVertices` target a second build of the same B-rep (a second import
-//! on the Rust side), whose objects the Rust side notifies under identities of their
+//! `Merge` / `CopyVertices` target a second build of the same B-rep (a second build
+//! or import on the Rust side), whose objects the Rust side notifies under identities of their
 //! own ([`source_key_of`]). `DeleteFace` always passes a deleted list
 //! (`pOptDeletedEdgesVertices`); the header default `NULL` only skips its `Add`s and
 //! is not compared. `CopyVertices` also appends the source and existing destination
@@ -24,13 +26,14 @@
 //! `Orient` outputs three values ([`split_orient`]): `out` (status, flag, face domains
 //! and upward face uses, counts), `swapped` (each face's `SmFace::SwapUV` `POST_EDIT`
 //! count, from that side's own tracker events) and `tracker` (the tracker's lists and
-//! events). `out` and `swapped` are always compared. A side whose events show a swap
-//! leaves out `tracker`: upstream the surface's own `SwapUV` notifies `SM_NO_PRE_EDIT` /
-//! `SM_NO_POST_EDIT` on the surface (`SmBSplineSurface::SwapUV` through `SetCanonical`,
-//! `SmBSplineSurface.cpp:4585`/`:4592`; `SmOffsetSurface` through its base surface;
-//! `SmSrfInVolume` itself), which the tracker records and turns into a `Chg` of the
-//! owning face, and a Rust `Surface` has no notification identity yet to send it under.
-//! A swap on one side only differs in `swapped` (and in `tracker`'s presence).
+//! events), all compared. A swap's surface edit is in `tracker`: upstream the surface's
+//! own `SwapUV` notifies `SM_NO_PRE_EDIT` / `SM_NO_POST_EDIT` on the surface
+//! (`SmBSplineSurface::SwapUV` through `SetCanonical`, `SmBSplineSurface.cpp:4585`/`:4592`;
+//! `SmOffsetSurface` through its base surface; `SmSrfInVolume` itself), which the
+//! tracker records and turns into a `Chg` of the owning face. The Rust side issues each
+//! pre-op face surface its identity on the tracked context with the face as its owner,
+//! and the port's `SwapUV` (`face::p1::swap_uv_with_notifications`) sends the surface's
+//! notifications under it; a surface is other geometry (`-30 n`) on both sides.
 
 use std::collections::BTreeMap;
 
@@ -368,6 +371,24 @@ fn key_of(e: EntityRef) -> ObjectRef {
     }
 }
 
+/// The entity a [`key_of`] key names (`None` for another key).
+fn entity_of_key(key: ObjectKey) -> Option<EntityRef> {
+    let i = u32::try_from((key.0 & 0xffff_ffff).checked_sub(1)?).ok()?;
+    Some(match key.0 >> 32 {
+        1 => EntityRef::Region(RegionId::from_index(i)),
+        2 => EntityRef::Shell(ShellId::from_index(i)),
+        3 => EntityRef::Faceuse(FaceuseId::from_index(i)),
+        4 => EntityRef::Face(FaceId::from_index(i)),
+        5 => EntityRef::Loopuse(LoopuseId::from_index(i)),
+        6 => EntityRef::Loop(LoopId::from_index(i)),
+        7 => EntityRef::Edgeuse(EdgeuseId::from_index(i)),
+        8 => EntityRef::Edge(EdgeId::from_index(i)),
+        9 => EntityRef::Vertexuse(VertexuseId::from_index(i)),
+        10 => EntityRef::Vertex(VertexId::from_index(i)),
+        _ => return None,
+    })
+}
+
 /// The identity of the source B-rep's entities in a copy or merge into another B-rep
 /// (its ids overlap the destination's, which are notified under [`key_of`]).
 fn source_key_of(e: EntityRef) -> ObjectRef {
@@ -464,6 +485,49 @@ fn rust_brep(path: &str, h: &[f64], c: &[usize; 10]) -> Result<Brep, HarnessErro
         }
     }
     Ok(b)
+}
+
+/// The shim's build conventions (`sc_topology_fixture.h` as the `topology.brep_p2`
+/// shim, whose export this runner reads, uses it: the face, edge and vertex lists
+/// registered before the traversal, `GetVertexEdgeGap` in the `init_gaps` walk), with
+/// the geometry owned under the arena identities [`rust_brep`] gives it.
+const CONVENTIONS: crate::own_builder::Conventions<'static> = crate::own_builder::Conventions {
+    prefix_lists: true,
+    vertex_edge_gaps: true,
+    vertex_lists_last: false,
+    ..crate::own_builder::Conventions::EDGEUSE_GRAPH
+};
+
+/// The Rust B-rep of the case and its entity counts, or the build failure's output:
+/// shim-built sources are built by the Rust kernel ([`crate::own_builder`], the
+/// shim's `editing` flag applied after); `.smb` files are imported from the shim's
+/// export ([`rust_brep`]).
+fn own_brep(
+    k: &mut Kernel,
+    i: &Inputs,
+) -> Result<Result<(Brep, [usize; 10]), Output>, HarnessError> {
+    use crate::own_builder::{build_as, build_status, counts, Built};
+    match build_as(k, &i.brep, i.validate_only, i.init_gaps, &CONVENTIONS)? {
+        Some(Built::Brep(b)) => {
+            let mut b = *b;
+            if i.editing >= 0 {
+                b.set_editing_enabled(i.editing != 0);
+            }
+            let c = counts(&b);
+            Ok(Ok((b, c)))
+        }
+        Some(Built::Failed(e)) => match Output::unported(&e) {
+            Some(o) => Ok(Err(o)),
+            None => Ok(Err(Output::new().values("out", vec![-1.0, build_status(&e)]))),
+        },
+        None => {
+            let (path, h, c) = match prepare(i)? {
+                Ok(x) => x,
+                Err(o) => return Ok(Err(o)),
+            };
+            Ok(Ok((rust_brep(&path, &h, &c)?, c)))
+        }
+    }
 }
 
 fn rust_curve(c: &CrvIn) -> Result<BSplineCurve, HarnessError> {
@@ -1189,6 +1253,14 @@ fn run_rust_op(
             owners.push((c, key_of(EntityRef::Edge(e))));
         }
     }
+    // and each face's surface (upstream SetCanonical notifies the surface itself, its
+    // GetOwner() the face; the tracker lists name it as other geometry)
+    let faces: Vec<FaceId> = b.faces().ids().collect();
+    for f in faces {
+        if let Some(s) = must(bp3::face_surface_identity(&mut ctx, b, f))? {
+            owners.push((s, key_of(EntityRef::Face(f))));
+        }
+    }
     // (arena lengths in the walk's kind order: an imported B-rep's ids are its walk
     // indices, and an op only appends)
     let pre = [
@@ -1210,11 +1282,17 @@ fn run_rust_op(
     ctx.set_user_notify_callback(Some(Box::new(recorder)));
     let mut tracker =
         TrackTopologyChanges::new(Some(BrepId::from_index(0)), 7, true, Some(&mut ctx));
-    // Execute's owner walk: each pre-op curve's GetOwner() is its edge
+    // Execute's owner walk: each pre-op curve's GetOwner() is its edge, each pre-op
+    // surface's its face
     tracker.set_owner_metadata(owners.into_iter().map(|(c, e)| (c.key, Some(e))).collect());
     let r = run_rust_op_in(k, b, second, op, a, Some(&mut ctx));
+    // the shim's StopTracking before put_tracker: 1.0.1 records the completed edit's
+    // dependencies (RecordDependencies) on the tracker's lists
+    let recorded =
+        tracker.stop_tracking_with_brep(Some(&mut ctx), b, &entity_of_key, &|e| key_of(e).key);
     let lists = tracker.lists();
     tracker.finish(Some(&mut ctx));
+    must(recorded)?;
     drop(must(ctx.take_notify_lease())?);
     let mut out = r?;
     let geometry_seen = seen
@@ -1275,9 +1353,8 @@ fn run_rust_op(
 }
 
 /// An `Orient` output (either side) from its trailer: `out` before the tracker,
-/// `swapped` (each face's `SwapUV` count) and, unless that side swapped a face,
-/// `tracker` (see the module docs). An output without a trailer (a B-rep that did not
-/// build) stays whole in `out`.
+/// `swapped` (each face's `SwapUV` count) and `tracker` (see the module docs). An
+/// output without a trailer (a B-rep that did not build) stays whole in `out`.
 fn split_orient(v: Vec<f64>) -> Output {
     let trailer = match v.as_slice() {
         [.., n, at] if *n >= 0.0 && *at >= 0.0 => Some((*n as usize, *at as usize)),
@@ -1294,12 +1371,10 @@ fn split_orient(v: Vec<f64>) -> Output {
     v.truncate(body);
     let swapped = v.split_off(swaps_at);
     let tracker = v.split_off(at);
-    let o = Output::new().values("out", v);
-    if swapped.iter().all(|&x| x == 0.0) {
-        o.values("swapped", swapped).values("tracker", tracker)
-    } else {
-        o.values("swapped", swapped)
-    }
+    Output::new()
+        .values("out", v)
+        .values("swapped", swapped)
+        .values("tracker", tracker)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1318,7 +1393,7 @@ fn run_rust_op_in(
             .ok_or_else(|| Fail::Harness(harness("args too short")))
     };
     // (the edits seed every object's SmTopology record the caller keeps none for)
-    let mut records = BTreeMap::new();
+    let mut records = solidcore::topology::topology::NotifyRecords::new();
     let mut attrs = AttributeStore::default();
     let mut env = NotifyEnv {
         records: &mut records,
@@ -1522,7 +1597,9 @@ fn run_rust_op_in(
                 let s = must(b.face(f))?.surface.as_ref();
                 out.push(s.map_or(-1.0, |x| x.type_code() as f64));
                 if let (Some(_), Some(s)) = (offset, s) {
-                    let d = s.natural_uv_domain();
+                    let d = s
+                        .natural_uv_domain_with_nurb(k)
+                        .map_err(|e| HarnessError::new(e.to_string()))?;
                     out.extend([d.min().x, d.min().y, d.max().x, d.max().y]);
                 }
             }
@@ -1554,16 +1631,17 @@ fn run_rust(i: &Inputs) -> Result<Output, HarnessError> {
             Err(Fail::Harness(e)) => Err(e),
         };
     }
-    let (path, h, c) = match prepare(i)? {
+    let (mut b, c) = match own_brep(&mut k, i)? {
         Ok(x) => x,
         Err(o) => return Ok(o),
     };
     let Some((_, args)) = op_args(&i.op, &c)? else {
         return Ok(Output::err("no target"));
     };
-    let mut b = rust_brep(&path, &h, &c)?;
     let mut second = match i.op {
-        OpIn::Merge { .. } | OpIn::CopyVertices { .. } => Some(rust_brep(&path, &h, &c)?),
+        OpIn::Merge { .. } | OpIn::CopyVertices { .. } => Some(own_brep(&mut k, i)?.map_err(
+            |_| harness("the second build of the B-rep failed where the first did not"),
+        )?.0),
         _ => None,
     };
     match run_rust_op(&mut k, &mut b, second.as_mut(), &i.op, &args) {

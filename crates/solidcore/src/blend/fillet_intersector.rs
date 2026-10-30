@@ -699,7 +699,8 @@ impl crate::blend::fillet_solver::curve_blend_sih::SmoothingSolver for ConstantR
     fn base_natural_uv_domain(&self, rail: usize) -> Result<Extent2d> {
         Ok(own_offset_surface(&self.solver, rail)?
             .base_surface()
-            .natural_uv_domain())
+            // (kernel-free: a lazy analytic answers its NURB-less base's empty domain)
+            .natural_uv_domain_if_built())
     }
 
     fn rail_surface(&self, rail: usize) -> Result<Surface> {
@@ -1307,6 +1308,16 @@ impl<'s, 't, O: SolutionObject + 't, G: Clone> FilletIntersector<'s, 't, O, G> {
 
         // stop criteria: next point stepsize is zero
         if next_tsp.crv_deriv().length_squared() < EFF_ZERO_SQ {
+            return Ok(out);
+        }
+
+        // (not upstream, `fixes.fillet_trace_rejects_short_step`, WR-503) a point far short of the
+        // step is another root of the equations, not the next point of this trace
+        if k.fixes.fillet_trace_rejects_short_step
+            && !step.clipped
+            && tsect.crv_pos().distance(next_tsp.crv_pos()) < 0.5 * step_size.abs()
+        {
+            demote_singularity(next_tsp);
             return Ok(out);
         }
 
@@ -2655,7 +2666,12 @@ mod tests {
             .unwrap();
         assert!(pseudo.geom(g).unwrap().center_line_curve().is_some());
         s.set_fillet_surface(&mut pseudo, &g, None).unwrap();
-        assert!(pseudo.geom(g).unwrap().fillet_surface().unwrap().is_none());
+        assert!(pseudo
+            .geom(g)
+            .unwrap()
+            .fillet_surface(None)
+            .unwrap()
+            .is_none());
         // a geometry without rails: upstream dereferences NULL
         assert!(matches!(
             s.set_rail_curve(&mut pseudo, &g, 0, line.clone())

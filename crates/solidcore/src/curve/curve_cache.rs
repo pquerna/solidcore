@@ -64,10 +64,11 @@
 //!   and the local solve of `sm_ComputeConstants`' distance sampling) the port keeps
 //!   upstream's values (the previous ones or [`Vec3::UNDEF`] for a never-written
 //!   `SmVector3d`), except [`SolidError::Unported`], which is always propagated.
-//! - **Tolerance.** `SmTol::GetApproxTol3d(const SmObject*)` of the curve is the
-//!   system value for a curve without owner; a curve with an owner needs its edge's
-//!   tolerance (`SmTol::GetZoneTol3d(const SmObject*)`; `topology::edge::tolerance` is
-//!   ported but needs the owning `Brep`, which the cache does not hold) and returns
+//! - **Tolerance.** `SmTol::GetApproxTol3d(const SmObject*)` of the curve is half
+//!   the zone tolerance of the edge whose shape the curve defines, else half the
+//!   system value. The edge's tolerance needs the owning `Brep`, which the cache does
+//!   not hold: the builder resolves it ([`CurveCache::set_owner_zone_tol_3d`],
+//!   `make_curve_cache_with_zone_tol`); an owned curve without it returns
 //!   [`SolidError::Unported`].
 //! - **Co-port.** `SmFindCurveDistanceExtremaEFO::Evaluate` (unit `curve.curve_p4`,
 //!   called by every tessellation) is ported here as the [`EvalFunction`]
@@ -319,6 +320,10 @@ pub struct CurveCache<O> {
     parents: Vec<BezierAux1d>,
     /// The tessellation controls.
     opts: CurveCacheOptions,
+    /// `SmTol::GetZoneTol3d(&m_crCurve)` resolved by the caller: the tolerance of the
+    /// edge whose shape the curve defines (see the module deviations). `None` for a
+    /// curve that defines no edge's shape.
+    owner_zone_tol_3d: Option<f64>,
 }
 
 /// Outputs of [`compute_constants`] (`sm_ComputeConstants`). When a tolerance is
@@ -357,6 +362,7 @@ impl<O: Copy + PartialEq> CurveCache<O> {
             spans: Vec::new(),
             parents: Vec::new(),
             opts,
+            owner_zone_tol_3d: None,
         }
     }
 
@@ -368,17 +374,22 @@ impl<O: Copy + PartialEq> CurveCache<O> {
             Some(t) => Some(t.retag_curve_tree(handle)?),
             None => None,
         };
+        let analytic = match &self.analytic {
+            Some(a) => Some(a.clone_detached().ok()?),
+            None => None,
+        };
         Some(CurveCache {
-            curve: self.curve.clone_detached(),
+            curve: self.curve.clone_detached().ok()?,
             curve_handle: handle,
             interval: self.interval,
             tree,
             continuities: self.continuities.clone(),
             tried_analytic: self.tried_analytic,
-            analytic: self.analytic.as_ref().map(Curve::clone_detached),
+            analytic,
             spans: self.spans.clone(),
             parents: self.parents.clone(),
             opts: self.opts,
+            owner_zone_tol_3d: self.owner_zone_tol_3d,
         })
     }
 
@@ -386,6 +397,14 @@ impl<O: Copy + PartialEq> CurveCache<O> {
     /// tree built afterwards.
     pub fn set_curve_handle(&mut self, handle: Option<O>) {
         self.curve_handle = handle;
+    }
+
+    /// Sets the zone tolerance of the edge whose shape the cached curve defines
+    /// (`SmTol::GetZoneTol3d(&m_crCurve)`, resolved by the caller, which holds the
+    /// B-rep): the tessellation's approximation tolerance is half of it. `None` (the
+    /// default) for a curve that defines no edge's shape.
+    pub fn set_owner_zone_tol_3d(&mut self, zone_tol_3d: Option<f64>) {
+        self.owner_zone_tol_3d = zone_tol_3d;
     }
 
     /// `SmCurveCache_TYPE` (`GetType`).
@@ -577,7 +596,7 @@ impl<O: Copy + PartialEq> CurveCache<O> {
         let ch_tol_sq = self.opts.chord_height_tolerance * self.opts.chord_height_tolerance;
         let angle_tol_deg = self.opts.angle_tol_deg;
 
-        let mut approx_tol = curve_approx_tol_3d(k, &self.curve)?;
+        let mut approx_tol = curve_approx_tol_3d(k, &self.curve, self.owner_zone_tol_3d)?;
         if approx_tol < EFF_ZERO {
             approx_tol = context_approx_tol_3d(k, Some(&k.context), SmallTopoType::NormalSize);
         }
@@ -599,7 +618,8 @@ impl<O: Copy + PartialEq> CurveCache<O> {
             }
             CurveKind::Ellipse(e) => {
                 if e.base().gw_nurb().is_none() {
-                    e.make_nurb_owned(k, owner)?;
+                    // m_crCurve's GetEdge(): the edge whose tolerance the builder gave
+                    e.make_nurb_owned_with_edge_tol(k, owner, self.owner_zone_tol_3d)?;
                 }
                 true
             }
@@ -622,6 +642,7 @@ impl<O: Copy + PartialEq> CurveCache<O> {
             | CurveKind::Offset(_)
             | CurveKind::CrvInVolume(_)
             | CurveKind::CrvOnSurf(_)
+            | CurveKind::TangentField(_)
             | CurveKind::Composite(_) => false,
         };
 
@@ -649,6 +670,7 @@ impl<O: Copy + PartialEq> CurveCache<O> {
                 | CurveKind::Offset(_)
                 | CurveKind::CrvInVolume(_)
                 | CurveKind::CrvOnSurf(_)
+                | CurveKind::TangentField(_)
                 | CurveKind::Composite(_) => None,
             };
             create_bezier_segment_block(k, nurb, &self.curve)?
@@ -701,6 +723,7 @@ impl<O: Copy + PartialEq> CurveCache<O> {
                 self.opts.off_axis_tolerance,
                 self.opts.max_3d_distance,
                 approx_tol,
+                is_bspline, // B-spline spans are exact pieces of the curve
             )?;
 
             // skip short spans - unless its the last span and no other spans have
@@ -778,6 +801,7 @@ impl<O: Copy + PartialEq> CurveCache<O> {
                     self.opts.off_axis_tolerance,
                     self.opts.max_3d_distance,
                     approx_tol,
+                    is_bspline, // B-spline spans are exact pieces of the curve
                 )?;
 
                 // skip very small curves
@@ -1143,14 +1167,24 @@ fn curve_ref<O: Copy + PartialEq>(tree: &Tree<O>, id: NodeId) -> Result<CurveSpa
     }
 }
 
-/// `SmTol::GetApproxTol3d(&curve)`: half the system zone tolerance for a curve
-/// without owner.
-fn curve_approx_tol_3d(k: &Kernel, curve: &Curve) -> Result<f64> {
+/// `SmTol::GetApproxTol3d(&m_crCurve)`: half the curve's zone tolerance, the
+/// `SmCurve` branch of `SmTol::GetZoneTol3d(const SmObject*)` (the tolerance of the
+/// edge whose shape the curve defines, else the system value). The edge's tolerance
+/// is `owner_zone_tol_3d`, resolved by the cache's builder, which holds the B-rep.
+///
+/// # Errors
+///
+/// [`SolidError::Unported`] for a curve with an owner and no resolved tolerance: the
+/// owner may be (or lead to) an edge whose tolerance only the B-rep holds.
+fn curve_approx_tol_3d(k: &Kernel, curve: &Curve, owner_zone_tol_3d: Option<f64>) -> Result<f64> {
+    if let Some(zone_tol_3d) = owner_zone_tol_3d {
+        return Ok(0.5 * zone_tol_3d);
+    }
     if curve.owner().is_some() {
-        // DISPATCH GAP: SmTol::GetZoneTol3d(const SmObject*) (geom.tol, green) on an opaque handle. Every
-        // arm it dispatches to is ported (topology::{vertex, edge, face::p2, edgeuse::p1}::tolerance,
-        // Brep::tolerance) but each takes `&Brep` and none is in scope here; wire once this code
-        // receives the owning B-rep
+        // DISPATCH GAP: SmTol::GetZoneTol3d(const SmObject*) (geom.tol, green) on a curve
+        // whose owner the builder did not resolve (the edge's tolerance needs the
+        // `&Brep`). make_curve_cache_with_zone_tol resolves it; a direct build over an
+        // owned curve (Curve::length_base) stops here
         return Err(SolidError::Unported {
             upstream: "SmTol::GetZoneTol3d(const SmObject*)",
             unit: "geom.tol",
@@ -1202,8 +1236,9 @@ pub fn bezier_polygon(leaf_beziers: &[Nurb], left: usize, right: usize) -> Resul
 /// the polygon exceeds (`sm_ComputeConstants`): base line length (`d3d_tol`),
 /// chord height (`ch_tol_sq`), turning angle (`angle_tol_deg`; note that upstream
 /// also stops at the first non-zero angle when this tolerance is zero), off-axis
-/// size (`off_axis_tol`); then the sampled distance between `bez` and `original`
-/// against `approx_tol`.
+/// size (`off_axis_tol`); then, unless `exact_span` (`bez` is an exact piece of
+/// `original`, a B-spline, so the check would only measure rounding differences), the
+/// sampled distance between `bez` and `original` against `approx_tol`.
 ///
 /// # Errors
 ///
@@ -1220,6 +1255,7 @@ pub fn compute_constants(
     off_axis_tol: f64,
     d3d_tol: f64,
     approx_tol: f64,
+    exact_span: bool,
 ) -> Result<SpanConstants> {
     let mut out = SpanConstants::default();
 
@@ -1354,6 +1390,13 @@ pub fn compute_constants(
     // set output
     out.max_chord_height_squared = max_segment_ch_sq;
     out.max_turning_angle_deg = total_angle * 180.0 / PI;
+
+    // The distance check below bounds the error of a span that approximates a
+    // non-B-spline curve. A span cut from a B-spline curve is an exact piece of it: the
+    // check would only measure rounding differences, so skip it.
+    if exact_span {
+        return Ok(out);
+    }
 
     let mut efo = FindCurveDistanceExtrema::new(k, bez, original, interval, 10.0 * EFF_ZERO);
     let mut solver = LocalSolve1d::with_interval(interval, false);

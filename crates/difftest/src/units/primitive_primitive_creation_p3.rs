@@ -148,7 +148,7 @@ fn ruled(data: &[f64]) -> Result<Vec<f64>> {
     out.push(f64::from(result.is_ok()));
     if let Ok((surface, map)) = result {
         let surface = Surface::from(surface);
-        let domain = surface.natural_uv_domain();
+        let domain = surface.natural_uv_domain_with_nurb(&k)?;
         out.extend([
             domain.min().x,
             domain.min().y,
@@ -177,10 +177,7 @@ fn ruled(data: &[f64]) -> Result<Vec<f64>> {
 #[cfg(test)]
 struct EmptyModel {
     k: Kernel,
-    notification_records: std::collections::BTreeMap<
-        solidcore::geom::attribute::ObjectKey,
-        solidcore::topology::topology::Topology,
-    >,
+    notification_records: solidcore::topology::topology::NotifyRecords,
     notification_attributes: solidcore::geom::attribute::AttributeStore,
     // `SmAObject` tag attributes of the swept topology (none on the fresh B-rep).
     tags: std::collections::BTreeMap<SweepEntity, TagData>,
@@ -219,7 +216,7 @@ impl EmptyModel {
         b.set_infinite_region(Some(region));
         Ok(Self {
             k: Kernel::default(),
-            notification_records: std::collections::BTreeMap::default(),
+            notification_records: solidcore::topology::topology::NotifyRecords::new(),
             notification_attributes: solidcore::geom::attribute::AttributeStore::default(),
             tags: std::collections::BTreeMap::default(),
             b,

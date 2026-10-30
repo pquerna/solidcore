@@ -4,6 +4,7 @@
 //! The B-reps are those of unit `topology.edgeuse_p1` (upstream `.smb` files, wire edges,
 //! faces from B-spline surfaces and real `SmPlane`s, the wire network of `prog_test`
 //! `my_test_topology`): the C++ side builds a real `SmBrep` per call, the Rust side
+//! builds a non-file source itself ([`crate::own_builder`]) and for an `.smb` file
 //! imports the graph the shim exports ([`super::topology_edgeuse_p1::import`]), and the
 //! ported functions run on both. Edge use arguments are selectors taken modulo the edge
 //! use count.
@@ -145,9 +146,38 @@ pub(super) struct Setup {
 
 type CaseSetup = (Setup, Option<ffi::PreparedBrep>);
 
+/// The case's setup. `prepare` (the C++ side) also keeps the shim's prepared B-rep;
+/// without it (the Rust side) a shim-built source is built by the Rust kernel
+/// ([`crate::own_builder`]) and only an `.smb` file's graph export is imported.
 fn setup(i: &Inputs, prepare: bool) -> Result<Result<CaseSetup, Output>, HarnessError> {
+    use crate::own_builder::{build, counts, failed_output, Built};
     let path = path_of(Some(&i.brep))?;
     let block = brep_block_of(Some(&i.brep), i.validate_only, i.init_gaps)?;
+    if !prepare {
+        let mut k = Kernel::default();
+        match build(&mut k, &i.brep, i.validate_only, i.init_gaps)? {
+            Some(Built::Brep(b)) => {
+                let brep = *b;
+                let s = sel(i.op.eu(), counts(&brep)[6]);
+                if s < 0 {
+                    return Ok(Err(Output::err("no_entity_of_that_kind")));
+                }
+                let eu = EdgeuseId::from_index(u32::try_from(s).map_err(|_| harness("index"))?);
+                return Ok(Ok((
+                    Setup {
+                        path,
+                        block,
+                        brep,
+                        eu,
+                        types: ImportTypes::default(),
+                    },
+                    None,
+                )));
+            }
+            Some(Built::Failed(e)) => return Ok(Err(failed_output(&e))),
+            None => {}
+        }
+    }
     let prepared = prepare
         .then(|| ffi::PreparedBrep::new(&path, &block))
         .transpose()
@@ -583,7 +613,7 @@ fn run_rust_op(
             let mate = eu1::mate(b, eu);
             let r = eu2::check_and_set_uv_trim_curve(&k, b, eu, curve, *adjust, rec.as_mut());
             match (r, mate) {
-                (Err(e), _) if e.is_unported() || matches!(e, SolidError::InvalidInput { .. }) => {
+                (Err(e), _) if e.is_unported() || matches!(e, SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }) => {
                     Err(e)
                 }
                 (_, Err(e)) => Err(e),
@@ -672,7 +702,7 @@ fn run_rust(i: &Inputs) -> Result<Output, HarnessError> {
                 return Ok(o);
             }
             match e {
-                SolidError::InvalidInput { .. } => Ok(Output::err("null_deref")),
+                SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => Ok(Output::err("null_deref")),
                 e => Err(harness(format!("rust: {e}"))),
             }
         }
@@ -765,11 +795,32 @@ impl UnitDiff for Runner {
     }
 
     fn run_cpp(&self, case: &Case) -> Result<Output, HarnessError> {
+        if super::topology_face_p4::level0::is_level0(case) {
+            return super::topology_face_p4::level0::run_cpp(case);
+        }
         run_cpp(&case.parse::<Inputs>()?)
     }
 
     fn run_rust(&self, case: &Case) -> Result<Output, HarnessError> {
+        if super::topology_face_p4::level0::is_level0(case) {
+            return super::topology_face_p4::level0::run_rust(case);
+        }
         run_rust(&case.parse::<Inputs>()?)
+    }
+
+    fn cases(&self, ctx: &crate::CaseContext) -> Result<Vec<Case>, HarnessError> {
+        let mut v = crate::runner::default_cases(self, ctx)?;
+        {
+            use super::topology_face_p4::level0::Level0Op;
+            let ops: Vec<Level0Op> = vec![
+            Level0Op::EdgeuseSide { smp_count: 6, periodic_u: -1, periodic_v: -1 },
+            Level0Op::EdgeuseSide { smp_count: 1, periodic_u: 1, periodic_v: 1 },
+            Level0Op::EdgeuseSide { smp_count: 0, periodic_u: 0, periodic_v: 0 },
+            Level0Op::EdgeuseSide { smp_count: 13, periodic_u: 1, periodic_v: -1 },
+        ];
+            v.extend(super::topology_face_p4::level0::cases(self.id(), &ops, 0x1419_0103, 48)?);
+        }
+        Ok(v)
     }
 
     fn generate(&self, rng: &mut Rng) -> Option<Value> {

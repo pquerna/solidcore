@@ -18,7 +18,9 @@
 //! B-rep enumeration, bounding boxes, and region classification remain calls into
 //! their unported units. `boundary_properties` exposes the integration after trim
 //! construction for callers already holding oriented trim curves. Nested integration
-//! has a fixed two-level call structure, not input-driven recursion.
+//! has a fixed two-level call structure, not input-driven recursion. With
+//! `UpstreamFixes::precise_properties_split_at_surface_knots` (WR-494) both levels split
+//! at the surface's knots, as the SolidCraft fork's tangency-labs/smlib@08d9a14 does.
 use super::{OdeIntegrator, OdeOptions};
 use crate::curve::curve::Curve;
 use crate::geom::attribute::{ids, AttributeStore, AttributeValue, ObjectKey};
@@ -31,7 +33,7 @@ use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
 use crate::query::brep::{self as qbrep, BoundingBoxOptions};
 use crate::surface::surface::Surface;
 use crate::topology::face::p2::{
-    OdeArea, PrecisePropertyLayout, PPF_ALL, PPF_AREA, PPF_AREA_FIRST_MOMENTS,
+    trim_curve_breaks, OdeArea, PrecisePropertyLayout, PPF_ALL, PPF_AREA, PPF_AREA_FIRST_MOMENTS,
 };
 use crate::topology::{edge, vertex, Brep, EdgeId, FaceId, FaceuseId, RegionId, VertexId};
 use crate::{EntityRef, Result, SolidError};
@@ -213,6 +215,7 @@ pub fn face_properties(
 ) -> Result<PreciseProperties> {
     valid_flags(flags)?;
     let trims = boundary(k, b, f)?;
+    let fbox = face_box(k, b, f)?;
     let surface = b
         .face(f)?
         .surface
@@ -223,6 +226,7 @@ pub fn face_properties(
         surface,
         &trims,
         &b.face(f)?.uv_domain,
+        &fbox,
         orientation,
         accuracy,
         origin,
@@ -239,12 +243,15 @@ fn valid_flags(flags: u64) -> Result<()> {
     }
 }
 /// Integrates the same precise face properties after oriented trim construction.
-/// `trims` must have the orientation and order returned by `CreateOrientedTrimBoundary`.
+/// `trims` must have the orientation and order returned by `CreateOrientedTrimBoundary`;
+/// `face_box` is the face's bounding box (`CalculateBoundingBox`), which sets the error
+/// scale of the volume and moment components.
 pub fn boundary_properties(
     k: &Kernel,
     surface: &Surface,
     trims: &[Curve],
     domain: &Extent2d,
+    face_box: &Extent3d,
     orientation: OrientType,
     mut accuracy: f64,
     origin: Point3,
@@ -252,12 +259,15 @@ pub fn boundary_properties(
     thickness: f64,
     flags: u64,
 ) -> Result<PreciseProperties> {
+    // the moment groups' extra length dimensions
+    const POWERS: [u32; 8] = [1, 2, 2, 2, 2, 3, 3, 3];
     valid_flags(flags)?;
     if accuracy < EFF_ZERO {
         accuracy = EFF_ZERO_SQ;
     }
     let layout = PrecisePropertyLayout::new(flags);
     let mut scale = vec![BIG_DOUBLE; layout.num_components];
+    let origin_distance = face_box.min_distance(&Extent3d::from_point(origin));
     let sign = if orientation == OrientType::Same && thickness < EFF_ZERO {
         -1.0
     } else {
@@ -265,8 +275,49 @@ pub fn boundary_properties(
     };
     let mut result = PreciseProperties::default();
     for trim in trims {
+        let area_scale = estimated_area / 10.0;
         if let Some(s) = scale.first_mut() {
-            *s = estimated_area / 10.0;
+            *s = area_scale;
+        }
+        // Scale volume and moment errors by a length per extra dimension. sqrt(area) is
+        // a tenth of the body size; grow it once the origin is farther than the body.
+        // With `fixes.precise_properties_body_length_scale` (WR-472; the SolidCraft
+        // fork's tangency-labs/smlib@073d4740) the length is the body size, ten times
+        // sqrt(area), or the origin's distance when larger: each component is then held
+        // to the area's share of its own size, where 1.0.1's tenth holds each extra power
+        // ten times tighter, below roundoff at tight accuracies.
+        let length = if k.fixes.precise_properties_body_length_scale {
+            let a = 10.0 * estimated_area.sqrt();
+            let b = origin_distance;
+            if a > b {
+                a
+            } else {
+                b
+            }
+        } else {
+            let a = estimated_area.sqrt();
+            let b = origin_distance / 10.0;
+            if a > b {
+                a
+            } else {
+                b
+            }
+        };
+        if layout.volume != 0 {
+            if let Some(s) = scale.get_mut(layout.volume - 1) {
+                *s = area_scale * length;
+            }
+        }
+        for (&index, &power) in layout.moments.iter().zip(POWERS.iter()) {
+            if index == 0 {
+                continue;
+            }
+            let moment_scale = area_scale * length.powf(f64::from(power));
+            for cc in 0..3 {
+                if let Some(s) = scale.get_mut(index - 1 + cc) {
+                    *s = moment_scale;
+                }
+            }
         }
         let eval = OdeArea {
             kernel: k,
@@ -280,49 +331,89 @@ pub fn boundary_properties(
             layout: &layout,
         };
         let ivl = trim.natural_interval();
-        let span = ivl.max() - ivl.min();
+
+        // Integrate each knot span of the natural interval separately: the RK error
+        // estimate assumes a smooth integrand, so a step across a knot can hide a large
+        // error.
+        //
+        // With `fixes.precise_properties_split_at_surface_knots` (WR-494; the SolidCraft
+        // fork's tangency-labs/smlib@08d9a14) the pieces are those between the trim
+        // curve's knots and its crossings of the surface's knot lines u = k, where the
+        // integrand's derivatives jump too.
+        let knots = if k.fixes.precise_properties_split_at_surface_knots {
+            trim_curve_breaks(k, trim, surface)?
+        } else {
+            trim.knots(k, Some(&ivl))?.0
+        };
+
+        // A coarse first Runge-Kutta step can trip the integrator's abort guard for one
+        // traversal direction, so a reversed cap loop fails where its twin succeeds. Try
+        // a span/2 first step, then fall back to finer steps.
         let mut y = vec![0.0; layout.num_components];
+        let mut span_y = vec![0.0; layout.num_components];
         let mut scratch = vec![0.0; layout.num_components + 1];
-        let mut status = Err(SolidError::sm_err(OP));
-        for divisor in [2.0, 8.0, 64.0, 512.0, 4096.0] {
-            y.fill(0.0);
-            status = OdeIntegrator::default()
-                .integrate(
-                    &mut y,
-                    ivl.min(),
-                    ivl.max(),
-                    OdeOptions {
-                        accuracy: accuracy / 10.0,
-                        initial_step: span / divisor,
-                        minimum_step: 0.0,
-                        scale: Some(&scale),
-                    },
-                    |t, _, dy| {
-                        // A zero U tangent leaves the caller's derivative array
-                        // untouched upstream. Preserve this particular stage's
-                        // values, rather than another stage's shared scratch.
-                        if let Some(unused) = scratch.first_mut() {
-                            *unused = 0.0;
-                        }
-                        for (s, d) in scratch.iter_mut().skip(1).zip(dy.iter()) {
-                            *s = *d;
-                        }
-                        eval.evaluate(k, t, &mut scratch)?;
-                        for (d, v) in dy.iter_mut().zip(scratch.iter().skip(1)) {
-                            *d = *v;
-                        }
-                        Ok(())
-                    },
-                )
-                .map(|_| ());
-            if status.is_ok() {
-                break;
+        for pair in knots.windows(2) {
+            let &[a, b] = pair else {
+                continue;
+            };
+            // (`!(dB > dA)`: also an unordered pair)
+            if k.fixes.precise_properties_split_at_surface_knots
+                && b.partial_cmp(&a) != Some(std::cmp::Ordering::Greater)
+            {
+                continue; // a crossing at a knot
             }
-            if status.as_ref().is_err_and(SolidError::is_unported) {
-                break;
+            let mut status = Err(SolidError::sm_err(OP));
+            for divisor in [2.0, 8.0, 64.0, 512.0, 4096.0] {
+                status = OdeIntegrator::default()
+                    .integrate(
+                        &mut span_y,
+                        a,
+                        b,
+                        OdeOptions {
+                            accuracy: accuracy / 10.0,
+                            initial_step: (b - a) / divisor,
+                            minimum_step: 0.0,
+                            scale: Some(&scale),
+                        },
+                        |t, _, dy| {
+                            // A zero U tangent leaves the caller's derivative array
+                            // untouched upstream. Preserve this particular stage's
+                            // values, rather than another stage's shared scratch.
+                            if let Some(unused) = scratch.first_mut() {
+                                *unused = 0.0;
+                            }
+                            for (s, d) in scratch.iter_mut().skip(1).zip(dy.iter()) {
+                                *s = *d;
+                            }
+                            eval.evaluate(k, t, &mut scratch)?;
+                            for (d, v) in dy.iter_mut().zip(scratch.iter().skip(1)) {
+                                *d = *v;
+                            }
+                            Ok(())
+                        },
+                    )
+                    // Success with no steps means the integrator skipped the span.
+                    .and_then(|counts| {
+                        if counts.good + counts.reduced == 0 {
+                            Err(SolidError::sm_err(OP))
+                        } else {
+                            Ok(())
+                        }
+                    });
+                if status.is_ok() {
+                    break;
+                }
+                if status.as_ref().is_err_and(SolidError::is_unported) {
+                    break;
+                }
+            }
+            // Propagate failure instead of dropping the boundary: a silent skip would
+            // return success with zero/partial properties.
+            status?;
+            for (total, part) in y.iter_mut().zip(span_y.iter()) {
+                *total += *part;
             }
         }
-        status?;
         let value = |index: usize| y.get(index.wrapping_sub(1)).copied().unwrap_or(0.0);
         if layout.area != 0 {
             result.area += value(layout.area);
@@ -529,25 +620,32 @@ pub fn brep_properties(
     }
     Ok(total)
 }
-/// `SmApiEdgeComputeLength` (the curve's virtual Length).
+/// `SmApiEdgeComputeLength` (the curve's virtual Length). The edge's curve is owned by
+/// the edge, so its zone tolerance (`SmTol::GetZoneTol3d(pCurve)`) is the edge's.
 pub fn edge_length(k: &Kernel, b: &Brep, e: EdgeId, accuracy: f64) -> Result<f64> {
     let c = edge::curve(b, e)?.ok_or_else(|| SolidError::sm_err(OP))?;
-    c.length(k, &edge::interval(b, e)?, accuracy)
+    let owner_zone_tol_3d = if c.owner().is_some() {
+        Some(edge::tolerance(b, e)?)
+    } else {
+        None
+    };
+    c.length_with_zone_tol(k, &edge::interval(b, e)?, accuracy, owner_zone_tol_3d)
 }
 fn area_estimate(bbox: &Extent3d) -> f64 {
     let s = bbox.size();
     let d = s.x.max(s.y).max(s.z);
     d * d / 100.0
 }
-/// `SmApiFaceComputeArea`: clamps accuracy and integrates only area.
+/// `SmApiFaceComputeArea`: rejects a non-finite accuracy and integrates only area.
 pub fn face_area(k: &Kernel, b: &mut Brep, f: FaceId, accuracy: f64) -> Result<f64> {
+    valid_api_number(accuracy)?;
     let bbox = face_box(k, b, f)?;
     Ok(face_properties(
         k,
         b,
         f,
         OrientType::Same,
-        accuracy.clamp(1e-4, 1e-1),
+        accuracy,
         bbox.mid(),
         area_estimate(&bbox),
         0.0,
@@ -556,8 +654,10 @@ pub fn face_area(k: &Kernel, b: &mut Brep, f: FaceId, accuracy: f64) -> Result<f
     .area
     .abs())
 }
-/// `SmApiFaceComputeCentroid`: one area/first-moment integration.
+/// `SmApiFaceComputeCentroid`: rejects a non-finite accuracy; one area/first-moment
+/// integration.
 pub fn face_centroid(k: &Kernel, b: &mut Brep, f: FaceId, accuracy: f64) -> Result<(f64, Point3)> {
+    valid_api_number(accuracy)?;
     let bbox = face_box(k, b, f)?;
     let origin = bbox.mid();
     let p = face_properties(
@@ -565,7 +665,7 @@ pub fn face_centroid(k: &Kernel, b: &mut Brep, f: FaceId, accuracy: f64) -> Resu
         b,
         f,
         OrientType::Same,
-        accuracy.clamp(1e-4, 1e-1),
+        accuracy,
         origin,
         area_estimate(&bbox),
         0.0,
@@ -600,7 +700,7 @@ pub fn brep_volume(
     Ok(brep_properties(
         k,
         b,
-        accuracy.clamp(1e-8, 1e-1),
+        accuracy,
         bbox.mid(),
         MassPropertyBehavior::default(),
         attributes,
@@ -626,7 +726,9 @@ fn valid_api_number(value: f64) -> Result<()> {
         Ok(())
     }
 }
-/// `SmApiBrepComputeMassProperties`, with upstream validation and accuracy clamping.
+/// `SmApiBrepComputeMassProperties`, with upstream validation: integrated once about the
+/// bounding-box midpoint, the moments then shifted to `origin` (which avoids
+/// cancellation for a distant origin).
 pub fn brep_mass_properties(
     k: &Kernel,
     b: &mut Brep,
@@ -661,11 +763,12 @@ pub fn brep_mass_properties(
     if !manifold_solid(b)? {
         return Err(SolidError::invalid_input(OP, "not a manifold solid"));
     }
+    let mid = qbrep::calculate_bounding_box(k, &mut *b, BoundingBoxOptions::default())?.mid();
     let properties = brep_properties(
         k,
         b,
-        accuracy.clamp(1e-4, 1e-1),
-        origin,
+        accuracy,
+        mid,
         MassPropertyBehavior {
             density,
             ..MassPropertyBehavior::default()
@@ -677,20 +780,38 @@ pub fn brep_mass_properties(
     if properties.mass < EFF_ZERO || properties.volume < EFF_ZERO {
         return Err(SolidError::invalid_input(OP, "nonpositive mass or volume"));
     }
-    let centroid = origin
-        + *properties
+    // [4] = static moment S about the midpoint; [7] = moments of inertia
+    // (y^2+z^2, ...); [6] = products (yz, zx, xy) as raw positive integrals.
+    let moment = |i: usize| {
+        properties
             .moments
-            .get(4)
-            .ok_or_else(|| SolidError::sm_err(OP))?
-            / properties.mass;
-    let inertia = *properties
-        .moments
-        .get(7)
-        .ok_or_else(|| SolidError::sm_err(OP))?;
-    let products = *properties
-        .moments
-        .get(6)
-        .ok_or_else(|| SolidError::sm_err(OP))?;
+            .get(i)
+            .copied()
+            .ok_or_else(|| SolidError::sm_err(OP))
+    };
+    let static_moment = moment(4)?;
+    // Shift to origin: with d = mid - origin, the integral of (a+d_a)(b+d_b) dm gains
+    // d_a S_b + d_b S_a + d_a d_b m.
+    let d = mid - origin;
+    let comp = |v: Vec3, i: usize| match i {
+        0 => v.x,
+        1 => v.y,
+        _ => v.z,
+    };
+    let mass = properties.mass;
+    let shift = |a: usize, b: usize| {
+        comp(d, a) * comp(static_moment, b)
+            + comp(d, b) * comp(static_moment, a)
+            + comp(d, a) * comp(d, b) * mass
+    };
+    let inertia = moment(7)?
+        + Vec3::new(
+            shift(1, 1) + shift(2, 2),
+            shift(0, 0) + shift(2, 2),
+            shift(0, 0) + shift(1, 1),
+        );
+    let products = moment(6)? + Vec3::new(shift(1, 2), shift(2, 0), shift(0, 1));
+    let centroid = mid + static_moment / mass;
     Ok(MassProperties {
         properties,
         centroid,

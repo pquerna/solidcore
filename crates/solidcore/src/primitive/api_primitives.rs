@@ -32,6 +32,7 @@
 //! | [`create_partial_torus`]           | `SmApiCreatePartialTorus`                             |
 //! | [`create_blend_primitive`]         | `SmApiCreateBlendPrimitive`                           |
 //! | [`create_swung_primitive`]         | `SmApiCreateSwungPrimitive`                           |
+//! | [`create_offset_profile`]          | `SmApiCreateOffsetProfile`                            |
 //!
 //! Deviations:
 //! - **Out-params.** The created surface or B-rep is the return value; on failure there
@@ -53,8 +54,12 @@
 //!   `SmPrimitiveCreation` runs on it directly (p1 methods) or through a
 //!   [`PrimitiveModel`] (p2/p3 methods, which resolve their B-rep services through it).
 //!   They stop at the first unported call inside `SmPrimitiveCreation`.
-//! - `SmApiCreateOffsetProfile`, `SmApiCreateSkinPrimitive` and
-//!   `SmApiCreateSkinFromFaces`, also in this file, belong to other units.
+//! - [`create_offset_profile`] copies the borrowed curves (`SmCurve::Copy`) as upstream
+//!   and lets [`p1::offset_profile`] own the copies; upstream's per-copy ownership
+//!   bookkeeping after a partial transfer has nothing to free in Rust. A `None` curve is
+//!   upstream's `NULL` entry.
+//! - `SmApiCreateSkinPrimitive` and `SmApiCreateSkinFromFaces`, also in this file,
+//!   belong to other units.
 //! - No recursion.
 
 use crate::curve::curve::Curve;
@@ -72,17 +77,20 @@ use crate::primitive::primitive_creation::p1::{self, PrimitiveCreation};
 use crate::surface::cone::Cone;
 use crate::surface::plane::Plane;
 use crate::surface::torus::{Torus, TorusOptions};
+use crate::sweep::topology_sweep::access::SweepAccess;
 use crate::topology::brep::p2::ArenaNotifyState;
 use crate::topology::{Brep, EdgeId, FaceId};
 
 const OP_BOX: &str = "primitive::api_primitives::create_box";
 const OP_SPHERE: &str = "primitive::api_primitives::create_sphere";
 const OP_CYLINDER: &str = "primitive::api_primitives::create_cylinder_surface";
+const OP_CYLINDER_SOLID: &str = "primitive::api_primitives::create_cylinder";
 const OP_CONE: &str = "primitive::api_primitives::create_cone";
 const OP_CONE_SURFACE: &str = "primitive::api_primitives::create_cone_surface";
 const OP_PYRAMID: &str = "primitive::api_primitives::create_pyramid";
 const OP_CYLINDRICAL_BOX: &str = "primitive::api_primitives::create_cylindrical_box";
 const OP_SPHERE_NO_POLE: &str = "primitive::api_primitives::create_sphere_no_pole";
+const OP_OFFSET_PROFILE: &str = "primitive::api_primitives::create_offset_profile";
 
 /// `SmApiIsPositiveDim`: a finite dimension (radius, length, height) above
 /// `SM_EFF_ZERO`.
@@ -222,14 +230,26 @@ pub fn create_sphere(k: &mut Kernel, origin: Point3, radius: f64) -> Result<Brep
 }
 
 /// The solid cylinder of `radius` from the base circle centred at `origin` to
-/// `height` along Z (`SmApiCreateCylinder`, `SmBrep*&` overload: [`create_cone`] with
-/// equal radii).
+/// `height` along Z (`SmApiCreateCylinder`, `SmBrep*&` overload:
+/// `CreateCylinder(height, radius, frame)`).
 ///
 /// # Errors
 ///
-/// Those of [`create_cone`].
+/// [`SolidError::InvalidInput`] unless the radius and height are finite and above
+/// `SM_EFF_ZERO`; those of [`PrimitiveCreation::create_cylinder`].
 pub fn create_cylinder(k: &mut Kernel, origin: Point3, radius: f64, height: f64) -> Result<Brep> {
-    create_cone(k, origin, radius, radius, height)
+    if !is_positive_dim(radius) || !is_positive_dim(height) {
+        return Err(SolidError::invalid_input(
+            OP_CYLINDER_SOLID,
+            "non-positive radius or height",
+        ));
+    }
+    let frame = xy_frame(origin);
+    let (mut pc, mut brep) = new_primitive(k)?;
+    pc.create_cylinder(k, &mut brep, height, radius, &frame)?;
+    // (not upstream: the port's cached topology fields, true for the caller)
+    brep.refresh_cached_topology();
+    Ok(brep)
 }
 
 /// The cylinder surface (no caps) of `radius` about the Z axis through `origin`,
@@ -635,7 +655,10 @@ fn partial_cone(
             start_angle_deg,
             end_angle_deg,
             &frame,
-        )
+        )?;
+        // CreateCone leaves edit mode on, in which face caches ignore the trim loops
+        model.set_editing(PrimitiveModel::MAIN, false)?;
+        Ok(())
     })
 }
 
@@ -852,6 +875,46 @@ pub fn create_swung_primitive(
             ZONE_TOL_3D,
         )
     })
+}
+
+/// The offset of the closed planar profile `curves` by `offset_distance`
+/// (`SmApiCreateOffsetProfile`: [`p1::offset_profile`] at `SM_ZONE_TOL_3D` on copies of
+/// the curves). `offset_type` is 1 left, 2 right, 3 both; `round_corners` rounds
+/// expanding corners (else they are extended); `shell_result` (left or right only)
+/// returns the region between the profile and its offset. The curves are not consumed.
+///
+/// # Errors
+///
+/// [`SolidError::InvalidInput`] for a `None` curve; those of the curve copies and of
+/// [`p1::offset_profile`].
+pub fn create_offset_profile(
+    k: &mut Kernel,
+    planar_curves: &[Option<&Curve>],
+    offset_distance: f64,
+    offset_type: u64,
+    round_corners: bool,
+    shell_result: bool,
+) -> Result<Brep> {
+    // OffsetProfile consumes its curve array on success, so pass private copies
+    let mut copies = Vec::new();
+    for curve in planar_curves {
+        let Some(curve) = curve else {
+            return Err(SolidError::invalid_input(OP_OFFSET_PROFILE, "null curve"));
+        };
+        copies.push(curve.copy(k)?);
+    }
+    let mut result = p1::offset_profile(
+        k,
+        &copies,
+        ZONE_TOL_3D,
+        offset_distance,
+        offset_type,
+        round_corners,
+        shell_result,
+    )?;
+    // (not upstream: the port's cached topology fields, true for the caller)
+    result.refresh_cached_topology();
+    Ok(result)
 }
 
 /// `new SmBrep()` in `k`'s context ([`crate::topology::brep::p3::new_brep`]).

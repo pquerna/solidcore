@@ -62,6 +62,11 @@
 //!   `rOrigin` is a reference into the frame those calls overwrite, so the centre check
 //!   never fires and the sphere centre is the last examined arc's (WR-103): the port
 //!   reads the current frame's origin at each use.
+//! - **Edit notifications.** `SetCanonical`'s `SM_NO_PRE_EDIT` / `SM_NO_POST_EDIT`
+//!   (`this`, `SM_NO_GET_OWNER(this)` = null) need the wrapping [`Surface`]'s identity,
+//!   so the B-spline sends them through a caller hook
+//!   ([`BSplineSurface::set_canonical_notifying`], [`BSplineSurface::swap_uv_notifying`],
+//!   used by `Surface::swap_uv_notifying`); the plain entry points notify nobody.
 //! - **`SetCanonical`** passes no domain to `CreateCanonical` (as upstream), so the
 //!   [`CanonicalSurfaceData::uv_domain`] of its argument is ignored. As upstream, only
 //!   the NURB is replaced: form and knot type stay those of the surface.
@@ -83,6 +88,7 @@ use crate::geom::axis2_placement::Axis2Placement;
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
 use crate::geom::geom_utility::p1::line_closest_point;
+use crate::geom::object::NotifyOperation;
 use crate::geom::vector2d::{Point2, Vec2};
 use crate::geom::vector3d::{Point3, Vec3};
 use crate::kernel::Kernel;
@@ -105,6 +111,10 @@ use crate::surface::surface::Surface;
 use super::p1::{
     BSplineSurface, BSplineSurfaceForm, BoundingBoxRequest, CanonicalSurfaceData, SurfParamType,
 };
+
+/// The edit notification hook of [`BSplineSurface::set_canonical_notifying`]: called
+/// with `SM_NO_PRE_EDIT` / `SM_NO_POST_EDIT` where upstream's `SetCanonical` notifies.
+pub(crate) type EditNotify<'a> = dyn FnMut(NotifyOperation) -> Result<()> + 'a;
 
 const OP_ISO: &str = "nurbs::b_spline_surface::p2::BSplineSurface::create_iso_parametric_curve";
 const OP_SPHERE: &str = "nurbs::b_spline_surface::p2::BSplineSurface::create_sphere_from_arcs";
@@ -515,6 +525,9 @@ impl BSplineSurface {
         let total_curves = arcs.len();
 
         // no work - not given exactly 3 curves
+        if total_curves == 4 && k.fixes.fillet_corner_sphere_from_four_arcs {
+            return Self::sphere_from_four_arcs(k, arcs, tol_3d);
+        }
         if total_curves != 3 {
             return Err(SolidError::sm_err(OP_SPHERE)); // Only works for 3 now
         }
@@ -681,6 +694,76 @@ impl BSplineSurface {
         Ok(SphereFromArcs {
             ccw_arcs,
             orients,
+            sphere,
+        })
+    }
+
+    /// [`Self::create_sphere_from_arcs`] for four arcs of one centre and radius that close a
+    /// loop (`Kernel::fixes.fillet_corner_sphere_from_four_arcs`; not upstream): the whole
+    /// sphere, a half-meridian revolved a turn about an axis square to the way the four arcs
+    /// face, its seam on the far side, so the poles and the seam stay clear of the loop.
+    fn sphere_from_four_arcs(k: &Kernel, arcs: &[SmCurve], tol_3d: f64) -> Result<SphereFromArcs> {
+        let err = || SolidError::sm_err(OP_SPHERE);
+        let mut centre = Point3::ZERO;
+        let mut radius = 0.0;
+        let mut towards = Vec3::ZERO;
+        let mut ends: Vec<(Point3, Point3)> = Vec::new();
+        for (i, a) in arcs.iter().enumerate() {
+            let arc = curve_is_arc(k, a, 5, tol_3d)?.ok_or_else(err)?;
+            let c = arc.frame.origin();
+            if i == 0 {
+                (centre, radius) = (c, arc.radius);
+            } else if c.distance(centre) > tol_3d || (arc.radius - radius).abs() > tol_3d {
+                return Err(err());
+            }
+            let ivl = a.natural_interval();
+            let (s, e) = (
+                a.evaluate_point(k, ivl.min())?,
+                a.evaluate_point(k, ivl.max())?,
+            );
+            towards = towards + (s - centre) + (e - centre);
+            ends.push((s, e));
+        }
+        // The arcs meet end to end (in some order and direction) and close.
+        let mut open = [false; 4];
+        for (i, (s, e)) in ends.iter().enumerate() {
+            for p in [s, e] {
+                let others = ends
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, (s2, e2))| {
+                        *j != i && (p.distance(*s2) < tol_3d || p.distance(*e2) < tol_3d)
+                    })
+                    .count();
+                if others != 1 {
+                    *open.get_mut(i).ok_or_else(err)? = true;
+                }
+            }
+        }
+        if open.iter().any(|&o| o)
+            || radius.partial_cmp(&tol_3d) != Some(core::cmp::Ordering::Greater)
+            || towards.length().partial_cmp(&tol_3d) != Some(core::cmp::Ordering::Greater)
+        {
+            return Err(err());
+        }
+        let m = towards.unitize()?;
+        // Any direction square to `m` is the axis; the seam runs the way away from the loop.
+        let helper = if m.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+        let axis = m.cross(helper).unitize()?;
+        let frame = Axis2Placement::new(centre, -m, axis);
+        let meridian = BSplineCurve::create_circle_segment(
+            3,
+            &frame,
+            radius,
+            -90.0,
+            90.0,
+            NurbCircleParam::Quadratic,
+        )?;
+        let sphere =
+            Self::create_surf_of_revolution(k, &meridian, centre, axis, 360.0, false, None)?;
+        Ok(SphereFromArcs {
+            ccw_arcs: (0..4).collect(),
+            orients: vec![OrientType::Same; 4],
             sphere,
         })
     }
@@ -1301,14 +1384,34 @@ impl BSplineSurface {
     ///
     /// The errors of [`BSplineSurface::create_canonical`] (the surface is unchanged).
     pub fn set_canonical(&mut self, data: &CanonicalSurfaceData<'_>) -> Result<()> {
+        self.set_canonical_notifying(data, &mut |_| Ok(()))
+    }
+
+    /// [`BSplineSurface::set_canonical`] sending its `Notify(SM_NO_PRE_EDIT` /
+    /// `SM_NO_POST_EDIT, this, SM_NO_GET_OWNER(this), NULL)` through `notify` around
+    /// the NURB swap (after the temporary surface is built, before the analytic
+    /// rebuild), as upstream does.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`BSplineSurface::set_canonical`] and of `notify`.
+    pub(crate) fn set_canonical_notifying(
+        &mut self,
+        data: &CanonicalSurfaceData<'_>,
+        notify: &mut EditNotify<'_>,
+    ) -> Result<()> {
         // Create a temporary one
         let tmp = Self::create_canonical(&CanonicalSurfaceData {
             uv_domain: None,
             ..*data
         })?;
 
+        notify(NotifyOperation::PreEdit)?;
+
         // Swap Nurbs with this
         self.nurb = tmp.nurb;
+
+        notify(NotifyOperation::PostEdit)?;
 
         // give analytics a chance to update their nested STEP data
         self.rebuild_step_from_nurb_parameters()
@@ -1461,8 +1564,18 @@ impl BSplineSurface {
     /// # Errors
     ///
     /// `SM_ERR_NULL_POINTER` without NURB; the errors of
-    /// [`BSplineSurface::set_canonical`].
+    /// [`BSplineSurface::set_canonical`] (the swap bit is then restored).
     pub fn swap_uv(&mut self) -> Result<()> {
+        self.swap_uv_notifying(&mut |_| Ok(()))
+    }
+
+    /// [`BSplineSurface::swap_uv`] with `SetCanonical`'s edit notifications sent
+    /// through `notify` ([`BSplineSurface::set_canonical_notifying`]).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`BSplineSurface::swap_uv`] and of `notify`.
+    pub(crate) fn swap_uv_notifying(&mut self, notify: &mut EditNotify<'_>) -> Result<()> {
         // get current surface description
         let c = self.canonical()?;
 
@@ -1476,20 +1589,27 @@ impl BSplineSurface {
         transpose(&mut cpts, num_v_cpts);
         transpose(&mut weights, num_v_cpts);
 
-        // Transpose Surface definition
-        self.set_canonical(&CanonicalSurfaceData {
-            u_degree: c.v_degree,
-            v_degree: c.u_degree,
-            control_points: &cpts,
-            form: c.form,
-            u_multiplicities: &c.v_multiplicities,
-            v_multiplicities: &c.u_multiplicities,
-            u_knots: &c.v_knots,
-            v_knots: &c.u_knots,
-            knot_type: c.knot_type,
-            weights: Some(&weights),
-            uv_domain: None,
-        })
+        // Transpose Surface definition; on failure, restore the bit
+        let status = self.set_canonical_notifying(
+            &CanonicalSurfaceData {
+                u_degree: c.v_degree,
+                v_degree: c.u_degree,
+                control_points: &cpts,
+                form: c.form,
+                u_multiplicities: &c.v_multiplicities,
+                v_multiplicities: &c.u_multiplicities,
+                u_knots: &c.v_knots,
+                v_knots: &c.u_knots,
+                knot_type: c.knot_type,
+                weights: Some(&weights),
+                uv_domain: None,
+            },
+            notify,
+        );
+        if status.is_err() {
+            self.toggle_swap_uv_bit();
+        }
+        status
     }
 
     /// Changes the natural domain to `new_step_uv_domain` (`AdjustSTEPUVDomain`):
@@ -1562,6 +1682,59 @@ mod tests {
         ];
         let r = BSplineSurface::create_sphere_from_arcs(k, &arcs, 1e-6).unwrap();
         assert_eq!(r.ccw_arcs, vec![0, 1, 2]);
+    }
+
+    /// Four great-circle arcs of radius 2 about the origin, closing a loop round +z (a corner
+    /// where four equal rounds meet), as rational quadratic arcs.
+    fn four_arcs() -> Vec<SmCurve> {
+        let (r, theta) = (2.0_f64, 40.0_f64.to_radians());
+        let u = |i: usize| {
+            let phi = std::f64::consts::FRAC_PI_2 * i as f64;
+            [
+                theta.sin() * phi.cos(),
+                theta.sin() * phi.sin(),
+                theta.cos(),
+            ]
+        };
+        (0..4)
+            .map(|i| {
+                let (a, b) = (u(i), u((i + 1) % 4));
+                let cos = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+                let c = [0, 1, 2].map(|j| r * (a[j] + b[j]) / (1.0 + cos));
+                arc3(
+                    [0, 1, 2].map(|j| r * a[j]),
+                    c,
+                    (cos.acos() / 2.0).cos(),
+                    [0, 1, 2].map(|j| r * b[j]),
+                )
+            })
+            .collect()
+    }
+
+    /// `fillet_corner_sphere_from_four_arcs`: the four arcs get the sphere they lie on, where
+    /// upstream refuses ("only works for 3 now").
+    #[test]
+    fn sphere_from_four_arcs_only_with_the_fix() {
+        let mut k = Kernel::default();
+        let arcs = four_arcs();
+        assert!(BSplineSurface::create_sphere_from_arcs(&k, &arcs, 1e-6).is_err());
+        k.fixes.fillet_corner_sphere_from_four_arcs = true;
+        let sphere = BSplineSurface::create_sphere_from_arcs(&k, &arcs, 1e-6)
+            .unwrap()
+            .sphere;
+        let surface = crate::surface::surface::Surface::from(sphere);
+        let domain = surface.natural_uv_domain_with_nurb(&k).unwrap();
+        let (lo, hi) = (domain.min(), domain.max());
+        for i in 0..=6 {
+            for j in 0..=6 {
+                let uv = Point2::new(
+                    lo.x + (hi.x - lo.x) * f64::from(i) / 6.0,
+                    lo.y + (hi.y - lo.y) * f64::from(j) / 6.0,
+                );
+                let d = surface.evaluate_point(&k, uv).unwrap().length();
+                assert!((d - 2.0).abs() < 1e-9, "{uv:?}: {d}");
+            }
+        }
     }
 
     /// A biquadratic 3 x 3 patch over `[0, 2] x [0, 1]`.
@@ -1903,14 +2076,15 @@ mod tests {
                 // Only swapped, unequal domains make Reparameterize build the NURB.
                 assert_eq!(extrusion.base().gw_nurb().is_some(), swap_uv);
             }
-            assert_eq!(copy.natural_uv_domain(), domain);
+            assert_eq!(copy.natural_uv_domain_if_built(), domain);
             for ((u, v), expected) in samples.into_iter().zip(before) {
                 let uv = domain.evaluate(u, v);
                 assert_eq!(s.evaluate_point(uv).unwrap(), expected);
                 assert!(copy.evaluate_point(k, uv).unwrap().distance(expected) < 1e-12);
             }
             if let crate::surface::surface::SurfaceKind::SurfOfExtrusion(extrusion) = copy.kind() {
-                assert_eq!(extrusion.base().gw_nurb().is_some(), swap_uv);
+                // the evaluations made the missing NURB and the extrusion keeps it
+                assert!(extrusion.base().gw_nurb().is_some());
             }
         }
     }

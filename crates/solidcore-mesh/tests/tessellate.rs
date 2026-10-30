@@ -25,6 +25,7 @@ use solidcore::topology::brep::p1 as bl;
 use solidcore::topology::brep::p10::TopologyEnv;
 use solidcore::topology::brep::p7::read_from_file;
 use solidcore::topology::database_io::FileType;
+use solidcore::topology::topology::NotifyRecords;
 use solidcore::topology::Brep;
 use solidcore::EntityRef;
 use solidcore_mesh::*;
@@ -559,7 +560,7 @@ fn read(k: &mut Kernel, rel: &str) -> Option<Brep> {
     };
     let mut b = Brep::new_with_infinite_region().ok()?;
     let mut attributes = AttributeStore::default();
-    let mut records = BTreeMap::new();
+    let mut records = NotifyRecords::new();
     let mut env = TopologyEnv {
         all_attributes: &[],
         attributes: &mut attributes,

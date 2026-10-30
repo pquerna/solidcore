@@ -863,7 +863,7 @@ mod tests {
         }
         assert!(budget.consumed() > 0);
         assert!(
-            budget.admitted_bytes() >= bounded.retained_bytes() - std::mem::size_of::<EdgeSet>()
+            budget.admitted_bytes() >= bounded.retained_bytes() - size_of::<EdgeSet>()
         );
         let retained = bounded.retained_bytes();
         assert!(bounded.vertex_index.retained_buffer_bytes() > 0);

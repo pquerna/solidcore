@@ -4537,6 +4537,77 @@ mod tests {
     }
 
     #[test]
+    fn step_owned_copies_preserve_cylinder_chart_after_source_drop() {
+        use crate::geom::axis2_placement::Axis2Placement;
+        use crate::surface::cone::Cone;
+
+        let kernel = Kernel::default();
+        for owns_surface in [false, true] {
+            let carrier =
+                Cone::create_canonical_cylinder(&kernel, &Axis2Placement::IDENTITY, 2.0).unwrap();
+            let source =
+                Surface::from(StepSurface::new(Surface::from(carrier), owns_surface).unwrap());
+            let copies = [
+                source.copy(&kernel).unwrap(),
+                source.copy_and_add_analytics(&kernel).unwrap(),
+            ];
+            drop(source);
+            for copy in copies {
+                let SurfaceKind::Step(wrapper) = copy.kind() else {
+                    panic!("copy lost the STEP wrapper");
+                };
+                assert!(wrapper.owns_surface());
+                let (position, du, dv) = copy
+                    .evaluate_1st_derivatives(&kernel, Point2::new(90.0, 3.0), false, false)
+                    .unwrap();
+                assert!((position - Point3::new(0.0, 2.0, 3.0)).length() < 1e-12);
+                assert!((du - Vec3::new(-2.0 * PI / 180.0, 0.0, 0.0)).length() < 1e-12);
+                assert!((dv - Vec3::Z).length() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn step_owned_copies_retain_nested_wrappers_and_reject_empty_carriers() {
+        let kernel = Kernel::default();
+        let source = Surface::from(
+            StepSurface::new(
+                Surface::from(StepSurface::new(bilinear(), false).unwrap()),
+                false,
+            )
+            .unwrap(),
+        );
+        let uv = Point2::new(0.25, 0.75);
+        let expected = source.evaluate_point(&kernel, uv).unwrap();
+        let copies = [
+            source.copy(&kernel).unwrap(),
+            source.copy_and_add_analytics(&kernel).unwrap(),
+        ];
+        drop(source);
+        for copy in copies {
+            let SurfaceKind::Step(outer) = copy.kind() else {
+                panic!("copy lost the outer STEP wrapper");
+            };
+            let SurfaceKind::Step(inner) = outer.surface().unwrap().kind() else {
+                panic!("copy lost the inner STEP wrapper");
+            };
+            assert!(outer.owns_surface());
+            assert!(inner.owns_surface());
+            assert_eq!(copy.evaluate_point(&kernel, uv).unwrap(), expected);
+        }
+        let empty = Surface::from(StepSurface::empty());
+        for result in [empty.copy(&kernel), empty.copy_and_add_analytics(&kernel)] {
+            assert!(matches!(
+                result,
+                Err(SolidError::Upstream {
+                    code: crate::error::SM_ERR_NULL_POINTER,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
     fn step_surface_wraps_base() {
         let k = &Kernel::default();
         let base = bilinear();

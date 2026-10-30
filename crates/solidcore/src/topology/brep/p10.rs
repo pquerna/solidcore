@@ -2770,6 +2770,47 @@ mod tests {
     }
 
     #[test]
+    fn step_owned_copy_survives_topology_construction_and_source_drop() {
+        use crate::math::Point2;
+        use crate::surface::surface::p1::StepSurface;
+        use crate::surface::surface::p2::SurfaceKind;
+
+        let kernel = Kernel::default();
+        for add_analytics in [false, true] {
+            let mut data = square(0);
+            data.surfaces[0].object =
+                Surface::from(StepSurface::new(plane_surface(), false).unwrap());
+            let brep = build(
+                &mut data,
+                MakeTopologyOptions {
+                    add_analytics,
+                    ..MakeTopologyOptions::default()
+                },
+            )
+            .unwrap();
+            drop(data);
+            let surface = brep
+                .face(FaceId::from_index(0))
+                .unwrap()
+                .surface
+                .as_ref()
+                .unwrap();
+            let SurfaceKind::Step(wrapper) = surface.kind() else {
+                panic!("topology construction lost the STEP wrapper");
+            };
+            assert!(wrapper.owns_surface());
+            assert_eq!(brep.faces().len(), 1);
+            assert_eq!(brep.edges().len(), 4);
+            assert_eq!(
+                surface
+                    .evaluate_point(&kernel, Point2::new(0.25, 0.75))
+                    .unwrap(),
+                Point3::new(0.25, 0.75, 0.0),
+            );
+        }
+    }
+
+    #[test]
     fn square_sheet_builds_a_closed_loop() {
         {
             let mf = 0;

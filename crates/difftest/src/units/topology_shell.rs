@@ -2,10 +2,15 @@
 //! `TransferChildrenTo` (incl. face-use and wire shells in one B-rep), shell type members,
 //! `RayFire` (through the B-rep's own `query::brep::BrepQuery` world), degeneracy,
 //! region ordering and filtering.
-//! Native fixtures and raw graph imports reuse the edge-use fixture protocol.
+//! Native fixtures reuse the edge-use fixture protocol: the Rust side builds a
+//! shim-built source itself ([`crate::own_builder`]) and imports only an `.smb` file's
+//! graph export.
 //! Setup failures fail the harness; topology and native integer flags compare exactly.
 
 use super::topology_edgeuse_p1::{fixture_input, import};
+
+#[path = "topology_shell/inner.rs"]
+mod inner;
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -757,12 +762,39 @@ fn rust_transfer_records(
     Ok(Output::new().ints("records", out))
 }
 
+/// The Rust B-rep of the case's fixture: a shim-built source built by the Rust kernel
+/// ([`crate::own_builder`], as `topology.edgeuse_p1` builds it), an `.smb` file
+/// imported from `topology.edgeuse_p1`'s graph export; or the deferral of an unported
+/// callee of the build.
+fn own_brep(value: &Value) -> Result<Result<solidcore::topology::Brep, Output>, HarnessError> {
+    use crate::own_builder::{build_as, Built, Conventions};
+    let mut kernel = solidcore::kernel::Kernel::default();
+    match build_as(&mut kernel, value, false, false, &Conventions::EDGEUSE_GRAPH)? {
+        Some(Built::Brep(b)) => Ok(Ok(*b)),
+        Some(Built::Failed(e)) => Output::unported(&e)
+            .map(Err)
+            .ok_or_else(|| failure(format!("native fixture build failed: {e}"))),
+        None => {
+            let (path, block) = fixture_input(value.clone())?;
+            let export =
+                crate::export_memo::export("topology_edgeuse_p1", &[&path], &block, || {
+                    graph::eval(graph::Op::Export, &path, &block)
+                })
+                .map_err(failure)?;
+            Ok(Ok(import(&export)?))
+        }
+    }
+}
+
 impl UnitDiff for Runner {
     fn id(&self) -> &'static str {
         "topology.shell"
     }
 
     fn run_cpp(&self, case: &Case) -> Result<Output, HarnessError> {
+        if inner::is_inner(case) {
+            return inner::run_cpp(case);
+        }
         let inputs: Inputs = case.parse()?;
         let (path, block) = fixture_input(inputs.brep)?;
         if let Some(filter) = inputs.region_filter {
@@ -913,14 +945,23 @@ impl UnitDiff for Runner {
         ))
     }
 
+    fn cases(&self, ctx: &crate::CaseContext) -> Result<Vec<Case>, HarnessError> {
+        let mut v = crate::runner::default_cases(self, ctx)?;
+        v.extend(inner::cases(self.id()));
+        Ok(v)
+    }
+
     fn run_rust(&self, case: &Case) -> Result<Output, HarnessError> {
+        if inner::is_inner(case) {
+            return inner::run_rust(case);
+        }
         let inputs: Inputs = case.parse()?;
-        let (path, block) = fixture_input(inputs.brep)?;
-        let export = crate::export_memo::export("topology_edgeuse_p1", &[&path], &block, || {
-            graph::eval(graph::Op::Export, &path, &block)
-        })
-        .map_err(failure)?;
-        let mut brep = import(&export)?;
+        let mut brep = match own_brep(&inputs.brep)? {
+            Ok(b) => b,
+            Err(o) => return Ok(o),
+        };
+        // the entity counts of the B-rep as built (the export header's)
+        let built_counts = crate::own_builder::counts(&brep);
         if let Some(filter) = inputs.region_filter {
             if filter.pattern > 2
                 || inputs.region_order.is_some()
@@ -1006,14 +1047,10 @@ impl UnitDiff for Runner {
                     "type probe cannot be combined with another operation",
                 ));
             }
-            let counts = graph::counts(&export)
-                .ok_or_else(|| failure("native type fixture build failed"))?;
-            return rust_type_members(&mut brep, &probe, type_probe_index(&probe, counts)?);
+            return rust_type_members(&mut brep, &probe, type_probe_index(&probe, built_counts)?);
         }
         if let Some(transfer) = inputs.transfer {
-            let counts = graph::counts(&export)
-                .ok_or_else(|| failure("native transfer fixture build failed"))?;
-            return rust_transfer_records(&mut brep, &resolve_transfer(&transfer, counts)?);
+            return rust_transfer_records(&mut brep, &resolve_transfer(&transfer, built_counts)?);
         }
         if inputs.wires {
             let mut out = vec![brep.shells().len() as i64];

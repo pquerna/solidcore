@@ -7,20 +7,22 @@
 //! `make_face` (a null surface, or a square wire loop built in the shim), `glue`
 //! (`GlueEdgesGeneral` of edge pairs of a B-rep of unit `topology.vertexuse`), `copy`
 //! (`CopyFaces` of the first faces into a new B-rep) and `merge_self`
-//! (`MergeSelfIntersectionCurves` without curves, or with UV lines on a face over a
-//! known domain: inside, crossing, along and partly along its sides; output the status,
-//! the glued edge count and the B-rep's counts after the merge). Both sides produce one record
-//! (`out`) laid out as in the ffi module; statuses are `SmStatus` values (a Rust
+//! (`MergeSelfIntersectionCurves` with and without curves, including raw-knot splines).
+//! The output includes status and topology counts, and for returned edges their used
+//! intervals, endpoint vertices, curve types, natural intervals, point samples and
+//! each edge use's UV trim type, interval and samples when present.
+//! The raw-knot plane fixtures construct their B-reps independently on each side.
+//! Both sides produce one record (`out`) laid out as in the ffi module; statuses are `SmStatus` values (a Rust
 //! `InvalidInput` is `SM_ERR_INVALID_INPUT`, `1007`).
 //!
 //! **Guards.** A `read` stream goes through the stream guard of unit `topology.brep_data`
-//! on both sides (a rejected stream is an `err("guard")` case). A modified stream whose
-//! C++ `SmBrepData` read succeeds is not run in C++: `MakeTopologyFromData` uses its
-//! cross-reference indices unchecked and crashes on some of them
-//! (`plan/upstream-issues.md` UB-164). Both sides decide this with the C++ reader; the
-//! C++ side reports `-3` and the Rust side defers to `cpp-guard:unvalidated-topology`.
-//! **Revisit when `topology.brep_p10` lands** (e.g. run the C++ read out of process): a
-//! guard-free sweep crashed in 13 of 15 files, while most such streams are safe. The other
+//! on both sides (its pure-Rust stream simulator, no C++ call; a rejected stream is an
+//! `err("guard")` case). A modified stream (not byte-identical to a shipped file) has its
+//! C++ read run in a fresh child process (`solidcore_ffi::isolate`):
+//! `MakeTopologyFromData` uses its cross-reference indices unchecked and crashes on some
+//! of them (`plan/upstream-issues/UB-164--*.md`), and a child that crashes, or runs past
+//! `READ_SECONDS`, makes the case `rejected`. The streams that survive are compared;
+//! the Rust side always runs its own read (no C++ verdict decides it). The other
 //! shim guards answer `-2` (upstream would dereference null). A `MakeFaceWithCurves` with
 //! a curve on surface, 3D curves and no UV curves that gets past its own input checks
 //! crashes upstream (`plan/upstream-issues.md` UB-165): `run_cpp` rejects it from the
@@ -31,27 +33,11 @@
 //! `cpp-guard:null-surface`
 //! (`MergeSelfIntersectionCurves` on a face without surface).
 //!
-//! **Deferred.** Every read that gets past `SmBrepData::ReadFromFile` (it now runs
-//! `MakeTopologyFromData` of `topology.brep_p10` on a B-rep with the infinite region
-//! and defers later: `sm_CheckAndFixUVTrimCurves`, analytic copies, `HealBrep`'s
-//! callees), every face made (`MakeShellVertex`, `SmFace::SetTolerance` inside
-//! `MakeFaceTopology`), every glue past its early returns, every copy
-//! (`SmBrep::SetTolerance`). Every new B-rep is the shim's `new SmBrep()`, with its void
-//! infinite region (`native_brep`). The comparisons are the read
-//! errors of damaged files, the input errors of the face makers, the null-surface status
-//! of `MakeFace`, the glue no-ops and `MergeSelfIntersectionCurves` without curves.
-//! Every `MergeSelfIntersectionCurves` with curves defers at the classification
-//! constructor's `ReSet` (`intersect.curve_class_p2`, wired in `intersect.curve_class_p4`
-//! by PR #137) for now, and after #137 at `SmSurface::DropCurve`
-//! (`intersect.surface_drop_lib_p3`): they compare only once both land. In C++ the 22
-//! built-in ones (11 shapes at two tolerances, same outcomes) take these paths: along a
-//! side (same, reversed, opposite, adjacent) glues one edge (8); along a side then
-//! crossing, and outside, are no-ops (4); inside, two curves and from a corner return
-//! `SM_ERR` after a partial imprint (6); crossing and partly along a side return `SM_ERR`
-//! with the B-rep unchanged (4).
+//! Raw-knot fixtures reject positive spans at or below `1e-12` (UB-266); their
+//! comparison does not establish that the input curves retain raw knots after copying
+//! inside the operation. No kernel clone change is implied by this coverage.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
@@ -234,6 +220,8 @@ struct SelfCurveIn {
     c3: CrvIn,
     uv1: CrvIn,
     uv2: CrvIn,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    raw_knots: bool,
 }
 
 fn flag(b: bool) -> f64 {
@@ -333,9 +321,9 @@ fn read_bytes(file: &str, damage: Option<Damage>) -> Result<Vec<u8>, HarnessErro
     Ok(bytes)
 }
 
-/// Whether the C++ `SmBrepData::ReadFromFile` (through the `topology.brep_data` shim)
-/// reads the bytes successfully: the FFI's test for not running a modified stream.
-fn cpp_brep_data_reads(bytes: &[u8]) -> Result<bool, Fail> {
+/// The `topology.brep_data` stream guard of the bytes (its pure-Rust stream simulator; no
+/// C++ call): `false` when it rejects them.
+fn guard_accepts(bytes: &[u8], upstream_file: bool) -> Result<bool, HarnessError> {
     let req = bd::Request {
         mode: bd::Mode::ReadFile,
         // every read case is ASCII: the encoder sends `binary = 0` to the FFI
@@ -346,30 +334,52 @@ fn cpp_brep_data_reads(bytes: &[u8]) -> Result<bool, Fail> {
         source: 0,
         pre: 0,
         data: bytes.to_vec(),
-        upstream_file: false,
-    };
-    let items = bd::run(&req).map_err(|e| hfail(format!("c++ brep data: {e}")))?;
-    Ok(items.first() == Some(&bd::Item::Int(0)))
-}
-
-/// The `topology.brep_data` stream guard of the bytes: `false` when it rejects them.
-fn guard_accepts(bytes: &[u8], upstream_file: bool) -> Result<bool, HarnessError> {
-    let req = bd::Request {
-        mode: bd::Mode::ReadFile,
-        binary: false,
-        version: 0,
-        dim: 0,
-        persist: false,
-        source: 0,
-        pre: 0,
-        data: bytes.to_vec(),
         upstream_file,
     };
-    match bd::run(&req) {
-        Ok(_) => Ok(true),
+    match bd::guard(&req) {
+        Ok(()) => Ok(true),
         Err(FfiError::InvalidArgument(_)) => Ok(false),
-        Err(e) => Err(harness(format!("c++ guard: {e}"))),
+        Err(e) => Err(harness(format!("guard: {e}"))),
     }
+}
+
+/// The positions of the last digit of every integer token of the topology records of an
+/// ASCII `.smb` stream (the lines from `//Region Data` up to `//Vertex Data`, comments
+/// skipped): the cross-reference indices, flags and counts.
+fn topology_index_digits(bytes: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    let mut start = 0;
+    for line in bytes.split(|&b| b == b'\n') {
+        let at = start;
+        start += line.len() + 1;
+        if line.starts_with(b"//Region Data") {
+            inside = true;
+        } else if line.starts_with(b"//Vertex Data") {
+            break;
+        }
+        if !inside || line.starts_with(b"//") {
+            continue;
+        }
+        let mut i = 0;
+        while i < line.len() {
+            if line.get(i).is_some_and(u8::is_ascii_whitespace) {
+                i += 1;
+                continue;
+            }
+            let t0 = i;
+            while i < line.len() && !line.get(i).is_some_and(u8::is_ascii_whitespace) {
+                i += 1;
+            }
+            let tok = line.get(t0..i).unwrap_or_default();
+            if tok.last().is_some_and(u8::is_ascii_digit)
+                && tok.iter().all(|&c| c.is_ascii_digit() || c == b'-')
+            {
+                out.push(at + i - 1);
+            }
+        }
+    }
+    out
 }
 
 /// A cached export with its key (the `.smb` path and the block's bits).
@@ -415,6 +425,22 @@ fn resolve(i: &Inputs) -> Result<Result<(Inputs, Option<Rc<Vec<f64>>>), Output>,
     else {
         return Ok(Ok((i.clone(), None)));
     };
+    if let Inputs::MergeSelf { face, curves, .. } = i {
+        if curves.iter().any(|c| c.raw_knots) {
+            if *face != 0
+                || !matches!(
+                    brep,
+                    BrepIn::Face {
+                        surface: shared::SrfIn::Plane { .. },
+                        ..
+                    }
+                )
+            {
+                return Err(harness("raw merge requires face 0 of a plane fixture"));
+            }
+            return Ok(Ok((i.clone(), None)));
+        }
+    }
     let ex = export_of(brep)?;
     let Some(c) = fixture::counts(&ex) else {
         return Ok(Err(Output::new().values("out", ex.to_vec())));
@@ -544,8 +570,11 @@ fn encode(i: &Inputs) -> Result<(Op, String, Vec<f64>), HarnessError> {
         } => {
             v.extend([*face as f64, *tol, curves.len() as f64]);
             for c in curves {
+                v.push(flag(c.raw_knots));
                 push_curve(&mut v, &c.c3);
+                v.push(flag(c.raw_knots));
                 push_curve(&mut v, &c.uv1);
+                v.push(flag(c.raw_knots));
                 push_curve(&mut v, &c.uv2);
             }
             v.extend(brep_block(brep)?);
@@ -574,8 +603,16 @@ fn run_cpp(i: &Inputs) -> Result<Output, HarnessError> {
         ));
     }
     let (op, path, input) = encode(&r)?;
-    let out = ffi::eval(op, &path, &input).map_err(|e| harness(format!("c++: {e}")))?;
-    Ok(Output::new().values("out", out))
+    match ffi::eval(op, &path, &input) {
+        Ok(out) => Ok(Output::new().values("out", out)),
+        // a modified stream's read runs in a fresh child process (the FFI)
+        Err(FfiError::Status(solidcore_ffi::SC_ERR_CHILD_CRASHED)) => Ok(Output::rejected(
+            "UB-164: SmBrep::ReadFromFile of the modified stream crashed (or ran past \
+             READ_SECONDS) in its fresh child process: MakeTopologyFromData uses the \
+             stream's cross-reference indices unchecked",
+        )),
+        Err(e) => Err(harness(format!("c++: {e}"))),
+    }
 }
 
 /// A `MakeFaceWithCurves` that crashes upstream (`plan/upstream-issues.md` UB-165,
@@ -647,7 +684,7 @@ fn status<T>(r: &Result<T, SolidError>) -> Result<f64, Fail> {
     match r {
         Ok(_) => Ok(0.0),
         Err(SolidError::Upstream { code, .. }) => Ok(f64::from(*code)),
-        Err(SolidError::InvalidInput { .. }) => Ok(SM_ERR_INVALID_INPUT),
+        Err(SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }) => Ok(SM_ERR_INVALID_INPUT),
         Err(e) => Err(match Output::unported(e) {
             Some(o) => Fail::Deferred(Box::new(o)),
             None => hfail(format!("rust: {e}")),
@@ -663,6 +700,24 @@ fn rust_curve(c: &CrvIn) -> Result<SmCurve, HarnessError> {
         .collect();
     let cur = NlCurve::new(pw, c.p, c.u.clone()).map_err(|e| harness(format!("curve: {e}")))?;
     Ok(SmCurve::from(BSplineCurve::from_nurb(cur, c.dim, false)))
+}
+
+fn rust_self_curve(c: &CrvIn, raw: bool) -> Result<SmCurve, HarnessError> {
+    let pw = c
+        .cpts
+        .iter()
+        .map(|p| CPoint::new(p[0], p[1], p[2], p[3]))
+        .collect();
+    let cur = NlCurve::new(pw, c.p, c.u.clone()).map_err(|e| harness(format!("curve: {e}")))?;
+    let mut curve = BSplineCurve::from_nurb(cur, c.dim, false);
+    if raw {
+        curve
+            .get_or_create_gw_nurb()
+            .map_err(|e| harness(format!("curve: {e}")))?
+            .knots_mut()
+            .copy_from_slice(&c.u);
+    }
+    Ok(SmCurve::from(curve))
 }
 
 fn rust_surface(s: &SrfIn) -> Result<Surface, HarnessError> {
@@ -872,18 +927,9 @@ fn rust_record(k: &mut Kernel, i: &Inputs, ex: Option<&[f64]>) -> Record {
             rebuild,
         } => {
             let bytes = read_bytes(file, *damage)?;
-            // the C++ side does not run a modified stream its SmBrepData read accepts
-            // (MakeTopologyFromData does not validate the topology: UB-164); decided with
-            // the same C++ reader as the FFI
-            if !is_test_file(file, &bytes)? && cpp_brep_data_reads(&bytes)? {
-                return Err(Fail::Deferred(Box::new(Output::deferred(
-                    "cpp-guard:unvalidated-topology",
-                    "SmBrep::MakeTopologyFromData",
-                ))));
-            }
             // a B-rep as `new SmBrep(ctx)` makes it (with the infinite region)
             let mut b = Brep::new_with_infinite_region().map_err(hfail)?;
-            let mut records = BTreeMap::new();
+            let mut records = solidcore::topology::topology::NotifyRecords::new();
             let mut attrs = AttributeStore::default();
             let mut env = p10::TopologyEnv {
                 all_attributes: &[],
@@ -947,7 +993,7 @@ fn rust_record(k: &mut Kernel, i: &Inputs, ex: Option<&[f64]>) -> Record {
                 2 => Some(true),
                 _ => return Err(hfail("crv_on_surf code")),
             };
-            let mut records = BTreeMap::new();
+            let mut records = solidcore::topology::topology::NotifyRecords::new();
             let mut attrs = AttributeStore::default();
             let mut env = ed::NotifyEnv {
                 records: &mut records,
@@ -1002,7 +1048,7 @@ fn rust_record(k: &mut Kernel, i: &Inputs, ex: Option<&[f64]>) -> Record {
                 )
                 .map_err(defer)?;
                 let inf = b.infinite_region();
-                let mut records = BTreeMap::new();
+                let mut records = solidcore::topology::topology::NotifyRecords::new();
                 let mut attrs = AttributeStore::default();
                 let mut env = ed::NotifyEnv {
                     records: &mut records,
@@ -1099,7 +1145,7 @@ fn rust_record(k: &mut Kernel, i: &Inputs, ex: Option<&[f64]>) -> Record {
                 ))
             });
             let dom = Extent2d::from_points(Point2::new(0.0, 0.0), Point2::new(1.0, 1.0));
-            let mut records = BTreeMap::new();
+            let mut records = solidcore::topology::topology::NotifyRecords::new();
             let mut attrs = AttributeStore::default();
             let mut env = ed::NotifyEnv {
                 records: &mut records,
@@ -1154,7 +1200,7 @@ fn rust_record(k: &mut Kernel, i: &Inputs, ex: Option<&[f64]>) -> Record {
                     }
                 }
             }
-            let mut records = BTreeMap::new();
+            let mut records = solidcore::topology::topology::NotifyRecords::new();
             let mut attrs = AttributeStore::default();
             let mut env = ed::NotifyEnv {
                 records: &mut records,
@@ -1186,7 +1232,7 @@ fn rust_record(k: &mut Kernel, i: &Inputs, ex: Option<&[f64]>) -> Record {
             let (mut b, _) = shared::import(ex)?;
             let faces: Vec<FaceId> = b.faces().ids().take(*n as usize).collect();
             let (mut dest, _) = native_brep()?;
-            let mut records = BTreeMap::new();
+            let mut records = solidcore::topology::topology::NotifyRecords::new();
             let mut attrs = AttributeStore::default();
             let mut env = ed::NotifyEnv {
                 records: &mut records,
@@ -1206,18 +1252,65 @@ fn rust_record(k: &mut Kernel, i: &Inputs, ex: Option<&[f64]>) -> Record {
             Ok(o)
         }
         Inputs::MergeSelf {
-            face, tol, curves, ..
+            brep,
+            face,
+            tol,
+            curves,
         } => {
-            let ex = ex.ok_or_else(|| hfail("no export"))?;
-            let (mut b, _) = shared::import(ex)?;
-            let f = FaceId::from_index(*face as u32);
+            let (mut b, f) = if curves.iter().any(|c| c.raw_knots) {
+                let BrepIn::Face {
+                    surface: shared::SrfIn::Plane { o, n },
+                    dom,
+                } = brep
+                else {
+                    return Err(hfail("raw merge requires plane fixture"));
+                };
+                let mut b = solidcore::topology::brep::p3::new_brep(
+                    k,
+                    solidcore::geom::tol::USE_DEFAULT,
+                    solidcore::geom::tol::USE_DEFAULT,
+                )
+                .map_err(hfail)?;
+                let mut records = solidcore::topology::topology::NotifyRecords::new();
+                let mut attrs = AttributeStore::default();
+                let mut env = ed::NotifyEnv {
+                    records: &mut records,
+                    attributes: &mut attrs,
+                    context: None,
+                    key_of: &read_key_of,
+                };
+                let mut marks = solidcore::topology::topology_traverser::Marks::default();
+                let face_ref = |f| read_key_of(EntityRef::Face(f));
+                let mut fenv = solidcore::topology::brep::p8::FaceBuildEnv {
+                    env: &mut env,
+                    marks: &mut marks,
+                    this_face: &face_ref,
+                };
+                let domain = Extent2d::from_bounds(dom[0], dom[1], dom[2], dom[3]);
+                let f = solidcore::topology::brep::p8::create_face_from_surface(
+                    k,
+                    &mut b,
+                    Some(Surface::from(Plane::from_normal(
+                        Vec3::new(o[0], o[1], o[2]),
+                        Vec3::new(n[0], n[1], n[2]),
+                    ))),
+                    &domain,
+                    &mut fenv,
+                )
+                .map_err(hfail)?;
+                (b, f)
+            } else {
+                let ex = ex.ok_or_else(|| hfail("no export"))?;
+                let (b, _) = shared::import(ex)?;
+                (b, FaceId::from_index(*face as u32))
+            };
             if b.face(f).map_err(hfail)?.surface.is_none() {
                 return Err(cpp_null_deref(
                     "cpp-guard:null-surface",
                     "SmBrep::MergeSelfIntersectionCurves",
                 ));
             }
-            let mut records = BTreeMap::new();
+            let mut records = solidcore::topology::topology::NotifyRecords::new();
             let mut attrs = AttributeStore::default();
             let mut env = ed::NotifyEnv {
                 records: &mut records,
@@ -1231,9 +1324,9 @@ fn rust_record(k: &mut Kernel, i: &Inputs, ex: Option<&[f64]>) -> Record {
                 .iter()
                 .map(|c| {
                     Ok(p7::SelfIntersectionCurve {
-                        curve_3d: rust_curve(&c.c3)?,
-                        uv_curve_1: rust_curve(&c.uv1)?,
-                        uv_curve_2: rust_curve(&c.uv2)?,
+                        curve_3d: rust_self_curve(&c.c3, c.raw_knots)?,
+                        uv_curve_1: rust_self_curve(&c.uv1, c.raw_knots)?,
+                        uv_curve_2: rust_self_curve(&c.uv2, c.raw_knots)?,
                     })
                 })
                 .collect::<Result<Vec<_>, HarnessError>>()?;
@@ -1247,9 +1340,54 @@ fn rust_record(k: &mut Kernel, i: &Inputs, ex: Option<&[f64]>) -> Record {
                 &edge_curve_key,
             );
             let s = status(&r)?;
-            let n = r.map_or(0, |v| v.len());
+            let n = r.as_ref().map_or(0, Vec::len);
             let mut o = vec![0.0, s, n as f64];
             o.extend(brep_counts(&b));
+            if let Ok(edges) = r {
+                for id in edges {
+                    let edge = b.edge(id).map_err(hfail)?;
+                    o.extend([edge.interval.min(), edge.interval.max()]);
+                    let (start, end) = ed::start_end_vertices(&b, id).map_err(hfail)?;
+                    for vertex in [start, end] {
+                        o.push(flag(vertex.is_some()));
+                        if let Some(vertex) = vertex {
+                            let p = b.vertex(vertex).map_err(hfail)?.point;
+                            o.extend([p.x, p.y, p.z]);
+                        }
+                    }
+                    if let Some(curve) = &edge.curve {
+                        let natural = curve.natural_interval();
+                        o.extend([curve.type_code() as f64, natural.min(), natural.max()]);
+                        for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                            let point = curve.evaluate_point(k, edge.interval.evaluate(fraction));
+                            o.push(status(&point)?);
+                            if let Ok(p) = point {
+                                o.extend([p.x, p.y, p.z]);
+                            }
+                        }
+                    } else {
+                        o.push(-1.0);
+                    }
+                    o.push(edge.edgeuses.len() as f64);
+                    for &eu in &edge.edgeuses {
+                        let (trim, _) = solidcore::topology::edgeuse::p1::uv_trim_curve(&b, eu)
+                            .map_err(hfail)?;
+                        if let Some(trim) = trim {
+                            let natural = trim.natural_interval();
+                            o.extend([trim.type_code() as f64, natural.min(), natural.max()]);
+                            for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                                let point = trim.evaluate_point(k, natural.evaluate(fraction));
+                                o.push(status(&point)?);
+                                if let Ok(p) = point {
+                                    o.extend([p.x, p.y]);
+                                }
+                            }
+                        } else {
+                            o.push(-1.0);
+                        }
+                    }
+                }
+            }
             Ok(o)
         }
     }
@@ -1425,6 +1563,7 @@ fn self_curve(dom: [f64; 4], a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2])
         c3: line(3, at(a), at(b)),
         uv1: line(2, at(a), at(b)),
         uv2: line(2, at(c), at(d)),
+        raw_knots: false,
     }
 }
 
@@ -1565,6 +1704,43 @@ fn self_curve_cases() -> Vec<(String, Inputs)> {
                 },
             ));
         }
+    }
+    for (name, knots) in [
+        ("control", vec![0.0, 0.0, 0.3, 0.49, 0.51, 1.0, 1.0]),
+        (
+            "close",
+            vec![0.0, 0.0, 0.3, 0.5 - 1.0e-12, 0.5 + 0.5e-12, 1.0, 1.0],
+        ),
+    ] {
+        let make = |dim| CrvIn {
+            dim,
+            p: 1,
+            u: knots.clone(),
+            cpts: [0.0, 3.0, 4.9, 5.1, 10.0]
+                .into_iter()
+                .map(|x| [x, 0.0, if dim == 2 { NOZ } else { 0.0 }, NOW])
+                .collect(),
+        };
+        out.push((
+            format!("merge_self_raw_{name}"),
+            Inputs::MergeSelf {
+                brep: BrepIn::Face {
+                    surface: shared::SrfIn::Plane {
+                        o: [0.0, 0.0, 0.0],
+                        n: [0.0, 0.0, 1.0],
+                    },
+                    dom,
+                },
+                face: 0,
+                tol: 1.0e-5,
+                curves: vec![SelfCurveIn {
+                    c3: make(3),
+                    uv1: make(2),
+                    uv2: make(2),
+                    raw_knots: true,
+                }],
+            },
+        ));
     }
     out
 }
@@ -1848,19 +2024,39 @@ impl UnitDiff for Runner {
         // A missing closing side requires UV endpoint deformation, rather than
         // approximating the 3D curve on surface. Exercise both surface kinds,
         // both face orientations and distinct scales around the original case.
-        for (surface_kind, scale) in [("plane", 0.1), ("plane", 1.0),
-            ("bspline", 0.1), ("bspline", 1.0), ("bspline", 10.0)] {
+        for (surface_kind, scale) in [
+            ("plane", 0.1),
+            ("plane", 1.0),
+            ("bspline", 0.1),
+            ("bspline", 1.0),
+            ("bspline", 10.0),
+        ] {
             for orient in [1, 2] {
-                let surface = if surface_kind == "plane" { plane.clone() }
-                    else { patch(10.0 * scale) };
+                let surface = if surface_kind == "plane" {
+                    plane.clone()
+                } else {
+                    patch(10.0 * scale)
+                };
                 let curves = square(scale, scale, 8.0 * scale, true)
-                    .into_iter().take(3).collect();
-                push(&mut v, format!("face_curves_cos_gap_{surface_kind}_{scale}_orient{orient}"),
+                    .into_iter()
+                    .take(3)
+                    .collect();
+                push(
+                    &mut v,
+                    format!("face_curves_cos_gap_{surface_kind}_{scale}_orient{orient}"),
                     &Inputs::MakeFaceWithCurves {
-                        surface, dom: [0.0, 0.0, 10.0 * scale, 10.0 * scale],
-                        orient, region_null: false, crv_on_surf: 2, loops: vec![3],
-                        has3d: false, has_uv: true, curves, points: Vec::new(),
-                    })?;
+                        surface,
+                        dom: [0.0, 0.0, 10.0 * scale, 10.0 * scale],
+                        orient,
+                        region_null: false,
+                        crv_on_surf: 2,
+                        loops: vec![3],
+                        has3d: false,
+                        has_uv: true,
+                        curves,
+                        points: Vec::new(),
+                    },
+                )?;
             }
         }
         // a square too small for its lines (CreateLineSegment fails: -3 on both sides) and
@@ -1918,6 +2114,92 @@ impl UnitDiff for Runner {
                         found += 1;
                         break;
                     }
+                }
+            }
+        }
+        // modified streams the B-rep data guard accepts and Rust's B-rep data read reads
+        // (chosen from the Rust side only), so that `MakeTopologyFromData` runs on them.
+        // The C++ read runs in a fresh child process (UB-164: a crash there is rejected);
+        // the reads that survive are compared. First one digit overwritten from a
+        // quarter, a half and three quarters into each file (mostly geometry values)...
+        for file in FILES {
+            let bytes = read_bytes(file, None)?;
+            for (j, quarter) in [1usize, 2, 3].into_iter().enumerate() {
+                let start = bytes.len() * quarter / 4;
+                let mut found = None;
+                'scan: for at in start..bytes.len().min(start + 4000) {
+                    if !bytes.get(at).is_some_and(u8::is_ascii_digit) {
+                        continue;
+                    }
+                    for byte in *b"19" {
+                        let d = Damage::Overwrite { at, byte };
+                        let b2 = read_bytes(file, Some(d))?;
+                        if b2 == bytes || !guard_accepts(&b2, false)? {
+                            continue;
+                        }
+                        let reads = solidcore::topology::brep_data::BrepData::read_from_file(
+                            &k,
+                            b2,
+                            FileType::Ascii,
+                        )
+                        .is_ok();
+                        if reads {
+                            found = Some(d);
+                            break 'scan;
+                        }
+                    }
+                }
+                if let Some(d) = found {
+                    push(
+                        &mut v,
+                        format!("read_{file}_modified{j}"),
+                        &Inputs::Read {
+                            file: file.to_string(),
+                            damage: Some(d),
+                            rebuild: j == 1,
+                        },
+                    )?;
+                }
+            }
+        }
+        // ...then one integer of the topology records (a cross-reference index, flag or
+        // count: UB-164's trigger): four tokens spread over each file's topology section,
+        // their last digit made `9` (`1` where it is `9`)
+        for file in FILES {
+            let bytes = read_bytes(file, None)?;
+            let tokens = topology_index_digits(&bytes);
+            let mut j = 0;
+            for q in 1..=4usize {
+                let Some(&at) = tokens.get(tokens.len() * q / 5) else {
+                    continue;
+                };
+                let byte = if bytes.get(at) == Some(&b'9') {
+                    b'1'
+                } else {
+                    b'9'
+                };
+                let d = Damage::Overwrite { at, byte };
+                let b2 = read_bytes(file, Some(d))?;
+                if b2 == bytes || !guard_accepts(&b2, false)? {
+                    continue;
+                }
+                let reads = solidcore::topology::brep_data::BrepData::read_from_file(
+                    &k,
+                    b2,
+                    FileType::Ascii,
+                )
+                .is_ok();
+                if reads {
+                    push(
+                        &mut v,
+                        format!("read_{file}_index{j}"),
+                        &Inputs::Read {
+                            file: file.to_string(),
+                            damage: Some(d),
+                            rebuild: j % 2 == 1,
+                        },
+                    )?;
+                    j += 1;
                 }
             }
         }

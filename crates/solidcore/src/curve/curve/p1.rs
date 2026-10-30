@@ -152,7 +152,7 @@ fn first_n<const N: usize>(v: &[Vec3]) -> [Vec3; N] {
 fn status_value(e: &SolidError) -> f64 {
     match e {
         SolidError::Upstream { code, .. } => f64::from(*code),
-        SolidError::InvalidInput { .. } => 1007.0,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.0,
         _ => 1001.0,
     }
 }
@@ -452,9 +452,25 @@ impl Curve {
         match self.kind() {
             // the SmCrvOnSurf override (its cache update is lost on this copy)
             CurveKind::CrvOnSurf(c) => {
-                let mut c = c.as_ref().clone();
+                let mut c = c.clone_exact_shared();
                 let (curve, gap) =
                     c.approximate_curve(k, breaks, approx_tol_3d, opts.match_parameterization)?;
+                Ok(CurveApproximation {
+                    curve: Curve::from(curve),
+                    achieved_tol: Some(gap),
+                })
+            }
+            // the SmCrvOnSurf override on the derived object (its Evaluate approximates)
+            CurveKind::TangentField(c) => {
+                let members = c.members();
+                let mut c = c.base().clone();
+                let (curve, gap) = c.approximate_curve_as(
+                    k,
+                    breaks,
+                    approx_tol_3d,
+                    opts.match_parameterization,
+                    Some(members),
+                )?;
                 Ok(CurveApproximation {
                     curve: Curve::from(curve),
                     achieved_tol: Some(gap),
@@ -1633,6 +1649,41 @@ impl Curve {
         )
     }
 
+    /// [`Curve::global_point_solve`] for a caller that names no handles, keeping the
+    /// curve's cache in `cache` across calls as [`Curve::global_point_solve_cached`]
+    /// does. The cache names the stand-in handle of the unnamed solve (the curve with its
+    /// natural interval), so the slot must belong to this curve, unchanged since the
+    /// cache was built.
+    ///
+    /// # Errors
+    ///
+    /// As [`Curve::global_point_solve`].
+    pub(crate) fn global_point_solve_unnamed_cached<O: SolutionObject>(
+        &self,
+        k: &Kernel,
+        interval: &Extent1d,
+        op: SolverOperation,
+        test_point: Point3,
+        dist_tol: f64,
+        requested: SolutionRequested,
+        target_distance: Option<f64>,
+        cache: &mut Option<CurveCache<OperandObject>>,
+    ) -> Result<SolutionArray<O>> {
+        let ivl = self.natural_interval();
+        let inner = GlobalPointSolveOptions {
+            target_distance,
+            opt_vectors: None,
+            handle: Some(OperandObject::Curve(0, ivl)),
+            analytic_handle: Some(OperandObject::Curve(2, ivl)),
+            zone_tol_3d: None,
+        };
+        Ok(self
+            .global_point_solve_cached(
+                k, interval, op, test_point, dist_tol, requested, &inner, cache,
+            )?
+            .without_objects())
+    }
+
     /// [`Curve::global_point_solve`] keeping the curve's cache in `cache` across calls,
     /// as upstream keeps it on the curve (`GetOrCreateObjectCache`): the cache is built
     /// where the solve first needs it (with the same errors) and reused by later calls
@@ -2108,6 +2159,7 @@ impl Curve {
             | CurveKind::Offset(_)
             | CurveKind::CrvInVolume(_)
             | CurveKind::CrvOnSurf(_)
+            | CurveKind::TangentField(_)
             | CurveKind::Composite(_) => {
                 self.tessellate_base(k, interval, chord_height_tol, angle_tol_deg, min_segments)
             }

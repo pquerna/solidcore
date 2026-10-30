@@ -170,6 +170,7 @@ pub(super) fn implicit_iso(
     | SurfaceKind::SrfInVolume(_) = surface.kind()
     {
         return Ok(Curve::from(IsoCurve::from_surface(
+            k,
             surface.clone_for_evaluation()?,
             direction,
             value,
@@ -177,8 +178,10 @@ pub(super) fn implicit_iso(
             true,
         )?));
     }
+    // (`SmIsoCurve(*this, ..)` refers to the surface itself: an exact copy, not the copy
+    // constructor, whose knot fix-up can move near-coincident knots)
     Ok(Curve::from(IsoCurve::new(
-        bss(k, surface)?.copy(),
+        bss(k, surface)?.clone_exact(),
         direction,
         value,
         left,
@@ -1275,7 +1278,7 @@ mod tests {
     fn plane_splits_and_natural_boundaries() {
         let s = plane();
         let k = Kernel::default();
-        let domain = s.natural_uv_domain();
+        let domain = s.natural_uv_domain_if_built();
         for direction in [SurfParamType::U, SurfParamType::V] {
             assert_eq!(
                 s.find_tessellation_splits(&k, direction, &domain, 0.01, 10.0, 0.0, false)
@@ -1307,7 +1310,7 @@ mod tests {
             .find_tessellation_splits(
                 &k,
                 SurfParamType::U,
-                &s.natural_uv_domain(),
+                &s.natural_uv_domain_if_built(),
                 0.01,
                 0.0,
                 1e-100,

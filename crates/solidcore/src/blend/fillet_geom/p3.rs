@@ -766,8 +766,8 @@ impl FilletBrep {
         let g2 = self.geom(fillet_geom2)?;
         let fil_solver1 = context.solver(g1.fillet_solver().ok_or_else(nul)?)?;
         let fil_solver2 = context.solver(g2.fillet_solver().ok_or_else(nul)?)?;
-        let fillet_surface1 = g1.fillet_surface()?.ok_or_else(nul)?;
-        let fillet_surface2 = g2.fillet_surface()?.ok_or_else(nul)?;
+        let fillet_surface1 = g1.fillet_surface(None)?.ok_or_else(nul)?;
+        let fillet_surface2 = g2.fillet_surface(None)?.ok_or_else(nul)?;
 
         // pick appoxTol and angTol as tightest filletSolver tolerances
         let approx_tol = smos_min(fil_solver1.approx_tol_3d, fil_solver2.approx_tol_3d);
@@ -897,22 +897,30 @@ impl FilletBrep {
         // trim 3DCurve and UVTrimCurves to dropPoint parameter values
         // (SetMinMax's status is ignored: an inverted pair leaves the interval)
         let _ = trim_ivl.set_min_max(param1, param2);
+        // each Trim reads SmTol::GetZoneTol3d of the curve's holding edge (the 3D curve's
+        // owner is this edge, set by every producer with SetOwner; a UV trim curve's is
+        // its edge use, whose owner is the edge)
+        let edge_tol = super::p5::held_curve_zone_tol_3d(k, self.brep(), Some(e))?;
+        let prim_edge = self.brep().edgeuse(prim_eu)?.edge;
+        let prim_tol = super::p5::held_curve_zone_tol_3d(k, self.brep(), prim_edge)?;
+        let mate_edge = self.brep().edgeuse(mate_eu)?.edge;
+        let mate_tol = super::p5::held_curve_zone_tol_3d(k, self.brep(), mate_edge)?;
         let brep = self.brep_mut();
-        brep.edge_mut(e)?.curve.as_mut().ok_or_else(nul)?.trim(
-            k,
-            &mut trim_ivl,
-            TrimMode::Notify,
-        )?;
+        brep.edge_mut(e)?
+            .curve
+            .as_mut()
+            .ok_or_else(nul)?
+            .trim_with_zone_tol(k, &mut trim_ivl, TrimMode::Notify, edge_tol)?;
         brep.edgeuse_mut(prim_eu)?
             .uv_trim_curve
             .as_mut()
             .ok_or_else(nul)?
-            .trim(k, &mut trim_ivl, TrimMode::Notify)?;
+            .trim_with_zone_tol(k, &mut trim_ivl, TrimMode::Notify, prim_tol)?;
         brep.edgeuse_mut(mate_eu)?
             .uv_trim_curve
             .as_mut()
             .ok_or_else(nul)?
-            .trim(k, &mut trim_ivl, TrimMode::Notify)?;
+            .trim_with_zone_tol(k, &mut trim_ivl, TrimMode::Notify, mate_tol)?;
         Ok(())
     }
 
@@ -935,10 +943,8 @@ impl FilletBrep {
     /// project to exactly one curve point, or when the traced curve misses a point;
     /// [`SolidError::InvalidInput`] where upstream dereferences `NULL` (no solver, edge
     /// use, offset surface, vertex use); those of `SetupOffsetValues`, the offset
-    /// evaluation and the curve solve; [`SolidError::Unported`] for the fillet
-    /// intersector's point intersection (a DISPATCH GAP of
-    /// `intersect.surface_intersector_p4`); those of the analytic fillets'
-    /// `Unported` callees (`blend.fillet_solver_p2`).
+    /// evaluation and the curve solve; those of the analytic fillets' `Unported`
+    /// callees (`blend.fillet_solver_p2`).
     pub fn re_calc_fillet_geom(
         &mut self,
         k: &Kernel,
@@ -985,8 +991,8 @@ impl FilletBrep {
         };
         let surf1 = off(&*solver, 0)?;
         let surf2 = off(&*solver, 1)?;
-        let mut domain1 = surf1.surface.natural_uv_domain();
-        let mut domain2 = surf2.surface.natural_uv_domain();
+        let mut domain1 = surf1.surface.natural_uv_domain_with_nurb(k)?;
+        let mut domain2 = surf2.surface.natural_uv_domain_with_nurb(k)?;
         let tolerance = solver.solver().approx_tol_3d;
         let ang_tol = solver.solver().ang_tol_rad;
         let scale = ivl.length();
@@ -1240,22 +1246,25 @@ impl FilletBrep {
 
                 i_try += 1;
                 let last_tsp_idx = tsect_pnts.len().saturating_sub(1);
-                let uv_at =
-                    |fb: &Self, i: usize, s: SrfIndex| -> Result<crate::geom::vector2d::Point2> {
+                // sm_CheckSeamOn(pSurf, sTsectPnts[i]->UVPos(which), ..) takes the UV by
+                // reference: a point on a seam moves to the other side in the vertex
+                // use's own SmTsectPnt, which the next DoPointIntersection try traces
+                let on_seam =
+                    |fb: &mut Self, s: &OffsetSurface, i: usize, which: SrfIndex, closure| {
                         let vu = *tsect_pnts
                             .get(i)
                             .ok_or_else(|| invalid(OP_RECALC, "no rail-end point"))?;
-                        Ok(fb.fillet_vertexuse(vu)?.tsect_pnt().uv_pos(s))
+                        let uv = fb
+                            .fillet_vertexuse_mut(vu)?
+                            .tsect_pnt_mut()
+                            .uv_pos_mut(which);
+                        Ok::<_, SolidError>(check_seam_on(
+                            &offset_as_surface(s),
+                            uv,
+                            tolerance,
+                            closure,
+                        ))
                     };
-                let on_seam = |fb: &Self, s: &OffsetSurface, i: usize, which: SrfIndex, closure| {
-                    let mut uv = uv_at(fb, i, which)?;
-                    Ok::<_, SolidError>(check_seam_on(
-                        &offset_as_surface(s),
-                        &mut uv,
-                        tolerance,
-                        closure,
-                    ))
-                };
                 // case 1 .. 4 fall through to the next when not on a seam
                 if i_try == 1 {
                     if on_seam(self, &off(&*solver, 0)?, 0, SrfIndex::First, surf_closure1)? {
@@ -1326,6 +1335,9 @@ impl FilletBrep {
                         return Ok(own_solver);
                     }
                     // UNPORTED(blend.fillet_geom_p5): SmFilletEdge::CalcCrossSection (a neighbouring geometry's solver: ReCalcFilletGeom holds only its own)
+                    // Unreachable by construction upstream: no geometry's m_vEdges holds a cross-section
+                    // edge with a use on another solver's geometry; see
+                    // plan/findings/blend.fillet_geom_p3--calc-cross-section-neighbour-unreachable.md
                     Err(SolidError::unported(
                         "SmFilletEdge::CalcCrossSection (neighbouring geometry's solver)",
                         "blend.fillet_geom_p5",

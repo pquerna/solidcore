@@ -29,7 +29,9 @@
 //!   `OutOfBoundsEnabled` flag of the (B-spline based) surfaces is done on the surface
 //!   itself where it is `&mut` ([`Surface::cover_coincident_surface_deferring_trims`]) and on an
 //!   out-of-bounds copy where upstream changes a `const` surface
-//!   ([`Surface::local_surface_surface_intersect`]).
+//!   ([`Surface::local_surface_surface_intersect`]); that copy is an evaluation copy
+//!   (exact knots, owner kept), not the copy constructor, so it evaluates the surface
+//!   upstream evaluates.
 //! - **Ignored statuses.** Where upstream ignores the status of an evaluation its
 //!   outputs keep their previous values (initially undefined); the port does the same
 //!   and still propagates [`SolidError::Unported`].
@@ -140,6 +142,9 @@ fn surface_approx_tol_3d(
     // without it stays UNPORTED(topology.face_p2): SmFace::GetTolerance
     // (`Surface::face_zone_tol_3d`); the face props pass it through
     // `get_singularities_of_face`
+    // Proof (unreachable): a B-rep face's surface carries the face tolerance
+    // (Brep::sync_face_surface_tolerance invariant, see Surface::face_zone_tol_3d); 0 hits
+    // in the green difftest sweep.
     if let Some(zone) = surface.face_zone_tol_3d()? {
         return Ok(approx_tol3d(k, 0.5 * zone));
     }
@@ -188,13 +193,20 @@ pub(crate) fn set_out_of_bounds_enabled(surface: &mut Surface, enabled: bool) {
 
 /// A copy of `surface` that evaluates out of bounds, when it is a B-spline based
 /// surface that does not already (the `SmTemporaryChangeValue` of a `const` surface).
-fn out_of_bounds_copy(surface: &Surface) -> Option<Surface> {
+/// Upstream changes the flag on the surface itself, so this is an evaluation copy
+/// ([`Surface::clone_for_evaluation`]: knots exactly as they are, owner kept), not the
+/// copy constructor, whose knot fix-up can move near-coincident knots.
+///
+/// # Errors
+///
+/// Those of [`Surface::clone_for_evaluation`] (a geometry graph nested too deep).
+fn out_of_bounds_copy(surface: &Surface) -> Result<Option<Surface>> {
     if out_of_bounds_enabled(surface) == Some(false) {
-        let mut copy = surface.clone();
+        let mut copy = surface.clone_for_evaluation()?;
         set_out_of_bounds_enabled(&mut copy, true);
-        Some(copy)
+        Ok(Some(copy))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -1125,10 +1137,8 @@ impl Surface {
 
         // But make sure that we didn't expand it to spill outside of sBigDomain.  This
         // would happen if the domain is against the seam of a surface of revolution, for
-        // example.  (Upstream ignores the status of the intersection.)
-        if let Ok(clipped) = new_domain.intersect(&big_domain) {
-            new_domain = clipped;
-        }
+        // example.
+        new_domain = clip_to_big_domain(&new_domain, &big_domain);
 
         // Now union the projection of Other surface on our domain with our original
         // domain, and update our domain to it.
@@ -1406,9 +1416,9 @@ impl Surface {
         uv_guess3: Point2,
     ) -> Result<Option<LocalSssSolution>> {
         // temporarily enable OutOfBounds evaluations for all B-spline based surfaces
-        let copy1 = out_of_bounds_copy(self);
-        let copy2 = out_of_bounds_copy(surface2);
-        let copy3 = out_of_bounds_copy(surface3);
+        let copy1 = out_of_bounds_copy(self)?;
+        let copy2 = out_of_bounds_copy(surface2)?;
+        let copy3 = out_of_bounds_copy(surface3)?;
         let s1 = copy1.as_ref().unwrap_or(self);
         let s2 = copy2.as_ref().unwrap_or(surface2);
         let s3 = copy3.as_ref().unwrap_or(surface3);
@@ -1705,6 +1715,17 @@ fn step_inversion_in<O: SolutionObject>(
     }
 }
 
+/// `sUpdateDomain.Intersect(sBigDomain, sNewDomain)` in `CoverCoincidentSurface`:
+/// `domain` clipped to `big_domain`. Upstream ignores the status, but on disjoint
+/// extents `SmExtent2d::Intersect` has `Init()`ed its result (`SmExtent2d.cpp:414`-`418`),
+/// so the covered domain is then the uninitialised extent (and the following union
+/// leaves the surface's own STEP domain as it is).
+fn clip_to_big_domain(domain: &Extent2d, big_domain: &Extent2d) -> Extent2d {
+    domain
+        .intersect(big_domain)
+        .unwrap_or_else(|_| Extent2d::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1741,7 +1762,7 @@ mod tests {
         let mut s = Surface::from(rev);
         assert_eq!(out_of_bounds_enabled(&s), Some(false));
         assert_eq!(gen_flag(&s), Some(false));
-        let copy = out_of_bounds_copy(&s).unwrap();
+        let copy = out_of_bounds_copy(&s).unwrap().unwrap();
         assert_eq!(out_of_bounds_enabled(&copy), Some(true));
         assert_eq!(gen_flag(&copy), Some(false));
         set_out_of_bounds_enabled(&mut s, true);
@@ -1821,18 +1842,38 @@ mod tests {
         Ok(())
     }
 
-    /// Default (pinned SMLib `c9c5979`): the cover succeeds and extends the domain onto
-    /// the fold, as upstream does (WR-407).
+    /// Default (SMLib v1.0.1): the flat sheet is now planar to `SM_EFF_ZERO` (`IsPlanar`
+    /// tests the unpadded pseudo box, `SmSurface.cpp:22371` at `3fd5b95`), so
+    /// `GetMaxAnalyticDomain` expands it relatively by 100 instead of by half a span per
+    /// cubic direction. The search over that domain reaches the folded continuation and
+    /// the cover fails, changing nothing. At `c9c5979` the padded box was not planar; the
+    /// domain ended at the fold (u = 1.5) and the cover succeeded (WR-407).
     #[test]
-    fn issue_434_default_covers_across_the_fold() -> Result<()> {
+    fn issue_434_default_refuses_the_fold_of_a_planar_sheet() -> Result<()> {
         let k = Kernel::default();
         assert!(!k.fixes.cover_refuses_folded_continuation);
         let (covered, u_max) = issue_434_cover_across_a_fold(&k)?;
         assert!(
-            covered.success,
-            "upstream covers across the fold: {covered:?}"
+            !covered.success,
+            "the planar sheet's cover across the fold fails: {covered:?}"
         );
-        assert!(u_max > 1.0, "upstream extends the u domain: {u_max}");
+        assert_eq!(u_max, 1.0);
         Ok(())
+    }
+
+    #[test]
+    fn cover_clip_to_big_domain_inits_a_disjoint_domain_as_upstream() {
+        let big = Extent2d::from_bounds(0.0, 0.0, 10.0, 10.0);
+        // overlapping: the common part
+        let inside = Extent2d::from_bounds(-1.0, 2.0, 5.0, 12.0);
+        let clipped = clip_to_big_domain(&inside, &big);
+        assert_eq!(clipped, Extent2d::from_bounds(0.0, 2.0, 5.0, 10.0));
+        // disjoint: SmExtent2d::Intersect Init()s its result
+        let outside = Extent2d::from_bounds(20.0, 20.0, 30.0, 30.0);
+        let cleared = clip_to_big_domain(&outside, &big);
+        assert_eq!(cleared, Extent2d::new());
+        // the union that follows then keeps the surface's own domain
+        let orig = Extent2d::from_bounds(1.0, 1.0, 9.0, 9.0);
+        assert_eq!(orig.union(&cleared), orig);
     }
 }

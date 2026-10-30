@@ -10,6 +10,8 @@
 //! | [`PrimitiveCreation::create_box`] | `SmPrimitiveCreation::CreateBox` |
 //! | [`PrimitiveCreation::create_cylindrical_box`] | `CreateCylindricalBox` |
 //! | [`PrimitiveCreation::create_cone`] | protected `CreateCone` |
+//! | [`PrimitiveCreation::create_cylinder`] | `CreateCylinder` |
+//! | `conic_solid` (private) | static `sm_CreateConicSolid` |
 //! | [`PrimitiveCreation::create_sphere`] | protected `CreateSphere` |
 //! | [`PrimitiveCreation::create_torus`] | protected `CreateTorus` |
 //! | [`PrimitiveCreation::boolean_2d`] | `Boolean2D` |
@@ -83,7 +85,7 @@ pub enum Boolean2d {
     Merge = 4,
 }
 
-fn new_brep(k: &mut Kernel) -> Result<Brep> {
+pub(super) fn new_brep(k: &mut Kernel) -> Result<Brep> {
     crate::topology::brep::p3::new_brep(
         k,
         crate::geom::tol::USE_DEFAULT,
@@ -156,7 +158,7 @@ fn planar_face(
         )
     })
 }
-fn planar_faces(
+pub(super) fn planar_faces(
     k: &mut Kernel,
     b: &mut Brep,
     region: Option<RegionId>,
@@ -367,7 +369,7 @@ pub fn create_rectangle(
     let base = BSplineSurface::create_bilinear_surface(p00, p10, p01, p11)?;
     let plane = Surface::from(base).copy_and_add_analytics(k)?;
     let mut brep = new_brep(k)?;
-    let domain = plane.natural_uv_domain();
+    let domain = plane.natural_uv_domain_with_nurb(k)?;
     ignore_status(create_face(k, &mut brep, plane, domain))?;
     Ok(brep)
 }
@@ -569,21 +571,79 @@ impl PrimitiveCreation {
     ) -> Result<()> {
         brep.set_editing_enabled(true);
         let cone = Cone::create_canonical(k, frame, base, top, height, false, false)?;
+        self.conic_solid(k, brep, &cone, base, top)
+    }
+
+    /// Solid cylinder of `radius` and `height` on the frame (`CreateCylinder`): the
+    /// canonical cylinder bounded to `[0, 360] x [0, height]` and its planar caps. A
+    /// height below `SM_EFF_ZERO` or a failed bound is `SM_ERR`; edit mode ends
+    /// disabled on success.
+    ///
+    /// # Errors
+    ///
+    /// `SM_ERR` as above; those of the cylinder construction and of the solid.
+    pub fn create_cylinder(
+        &mut self,
+        k: &mut Kernel,
+        brep: &mut Brep,
+        height: f64,
+        radius: f64,
+        frame: &Axis2Placement,
+    ) -> Result<()> {
+        const OP: &str = "primitive::primitive_creation::p1::create_cylinder";
+        // empty entity maps - m_vMapToSame, m_vMapToHigher, m_vMapFromSame, and m_vMapFromLower
+        self.init_entity_maps();
+
+        if height < EFF_ZERO {
+            return Err(SolidError::sm_err(OP));
+        }
+
+        brep.set_editing_enabled(true);
+
+        // CreateCanonical makes an infinite cylinder; bound it to v in [0, dHeight]
+        let mut cylinder = Cone::create_canonical_cylinder(k, frame, radius)?;
+        let domain = Extent2d::from_bounds(0.0, 0.0, 360.0, height);
+        match cylinder.adjust_step_uv_domain(k, &domain) {
+            Ok(()) => {}
+            Err(e @ SolidError::Unported { .. }) => return Err(e),
+            Err(_) => return Err(SolidError::sm_err(OP)),
+        }
+
+        self.conic_solid(k, brep, &cylinder, radius, radius)?;
+
+        brep.set_editing_enabled(false);
+        Ok(())
+    }
+
+    /// `sm_CreateConicSolid`: the face of a bounded cone or cylinder surface and planar
+    /// caps at its ends (each cap's edge curve made only for a cap that is built),
+    /// stitched when a cap is made.
+    fn conic_solid(
+        &mut self,
+        k: &mut Kernel,
+        brep: &mut Brep,
+        cone: &Cone,
+        base: f64,
+        top: f64,
+    ) -> Result<()> {
         let domain = cone.rev.base().natural_uv_domain();
-        cone_face(k, brep, &cone, domain)?;
-        let base_edge = cone
-            .create_iso_parametric_curve(k, SurfParamType::V, domain.min().y, None, false)?
-            .curve;
-        let top_edge = cone
-            .create_iso_parametric_curve(k, SurfParamType::V, domain.max().y, None, false)?
-            .curve;
+        cone_face(k, brep, cone, domain)?;
         let tolerance = brep.tolerance();
+
+        // make base face
         let base_face = if base > tolerance {
+            // only make the edge curve for a cap that is built
+            let base_edge = cone
+                .create_iso_parametric_curve(k, SurfParamType::V, domain.min().y, None, false)?
+                .curve;
             planar_face(k, brep, self.region(), &[base_edge], tolerance)?
         } else {
             None
         };
         let top_face = if top > tolerance {
+            let top_edge = cone
+                .create_iso_parametric_curve(k, SurfParamType::V, domain.max().y, None, false)?
+                .curve;
             planar_face(k, brep, self.region(), &[top_edge], tolerance)?
         } else {
             None
@@ -835,6 +895,14 @@ impl PrimitiveCreation {
         let previous = k.context.doing_boolean();
         k.context.set_doing_boolean(true);
         let result = (|| {
+            // Every surface and the end cap use this unit direction and a positive
+            // length, so they meet. A negative distance sweeps against the direction.
+            let mut sweep_dir = direction.unitize()?;
+            let mut distance = distance;
+            if distance < 0.0 {
+                sweep_dir *= -1.0;
+                distance = -distance;
+            }
             let mut analytic_domain = Extent2d::from_bounds(0.0, 0.0, 1.0, distance);
             for curve in &curves {
                 let interval = match curve.kind() {
@@ -848,11 +916,11 @@ impl PrimitiveCreation {
                 let surface = if curve.is_linear(k, EFF_ZERO, false)?.linear {
                     let ends = curve.ends(k)?;
                     let tangent = (ends.end - ends.start).unitize_or_z();
-                    if tangent.dot(direction).abs() < EFF_ZERO {
+                    if tangent.dot(sweep_dir).abs() < EFF_ZERO {
                         Some(Surface::from(Plane::new(
                             ends.start,
                             tangent,
-                            direction,
+                            sweep_dir,
                             Vec2::new((ends.end - ends.start).length(), distance),
                             &Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
                         )))
@@ -863,11 +931,13 @@ impl PrimitiveCreation {
                     curve.is_arc(k, 8, brep.tolerance())?
                 {
                     let angle = end - start;
+                    // A right cylinder only fits if the cap, translated along the
+                    // sweep direction, is within tolerance of its far edge.
                     if angle < 360.0 + brep.tolerance()
                         && angle > 360.0 - brep.tolerance()
-                        && frame.z_axis().is_parallel_to(direction, 0.5)
+                        && distance * frame.z_axis().cross(sweep_dir).length() <= brep.tolerance()
                     {
-                        if direction.dot(frame.z_axis()) < 0.0 {
+                        if sweep_dir.dot(frame.z_axis()) < 0.0 {
                             frame.rotate_about_axis_at_point(
                                 180.0 * core::f64::consts::PI / 180.0,
                                 frame.origin(),
@@ -892,7 +962,7 @@ impl PrimitiveCreation {
                 };
                 let Some(surface) = surface else {
                     let copy = curve.copy(k)?;
-                    let mut extrusion = SurfOfExtrusion::create_canonical(k, copy, direction)?;
+                    let mut extrusion = SurfOfExtrusion::create_canonical(k, copy, sweep_dir)?;
                     ignore_status(extrusion.adjust_step_uv_domain(k, &analytic_domain))?;
                     let domain = extrusion.base().natural_uv_domain();
                     ignore_status(extrusion_face(k, brep, &extrusion, domain))?;
@@ -910,7 +980,7 @@ impl PrimitiveCreation {
                     brep.tolerance(),
                 ))?;
                 let mut translation = Axis2Placement::IDENTITY;
-                translation.translate(direction.unitize_or_z() * distance);
+                translation.translate(sweep_dir * distance);
                 let mut end_curves = Vec::new();
                 for curve in &curves {
                     let mut copy = curve.copy(k)?;
@@ -987,7 +1057,7 @@ impl PrimitiveCreation {
         for (rotation, index) in [(-90.0, 3), (180.0, 1)] {
             patch.rotate_at_pt(Vec3::ZERO, Vec3::X, rotation)?;
             let surface = Surface::from(BSplineSurface::from_gw_nurb(&patch));
-            let domain = surface.natural_uv_domain();
+            let domain = surface.natural_uv_domain_with_nurb(k)?;
             let mut boundary = FaceCurves {
                 curve_loops: vec![2],
                 curves_3d: Some(Vec::new()),
@@ -1338,7 +1408,7 @@ mod tests {
     #[test]
     fn boolean_2d_covers_plane_domains_before_intersection() {
         let mut k = Kernel::default();
-        let mut records = std::collections::BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = crate::geom::attribute::AttributeStore::default();
         let mut notifications = NotifyEnv {
             records: &mut records,
@@ -1390,14 +1460,14 @@ mod tests {
             .surface
             .as_ref()
             .unwrap()
-            .natural_uv_domain();
+            .natural_uv_domain_if_built();
         let covered_b = b
             .face(fb)
             .unwrap()
             .surface
             .as_ref()
             .unwrap()
-            .natural_uv_domain();
+            .natural_uv_domain_if_built();
         assert!(covered_a.min().x <= -2.0 && covered_a.min().y <= -3.0);
         assert!(covered_a.max().x >= 4.0 && covered_a.max().y >= 5.0);
         assert_eq!(covered_a, covered_b);
@@ -1413,7 +1483,7 @@ mod tests {
             (180.0, false),
         ] {
             let mut k = Kernel::default();
-            let mut records = std::collections::BTreeMap::new();
+            let mut records = crate::topology::topology::NotifyRecords::new();
             let mut attributes = crate::geom::attribute::AttributeStore::default();
             let mut notifications = NotifyEnv {
                 records: &mut records,

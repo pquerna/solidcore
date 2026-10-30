@@ -31,6 +31,7 @@
 //! | [`loop_is_connected_to`]                     | `SmLoop::IsConnectedTo`                          |
 //! | [`uv_corner_boundaries`], [`UvCorners`]      | `SmLoop::GetUVCornerBoundaries`                  |
 //! | [`calc_quad_num`]                            | `sm_CalcQuadNum` (static)                        |
+//! | [`is_loopuse_side_in_surface`], [`LoopuseSide`] | `SmLoopuse::IsLoopuseSideInSurface`           |
 //!
 //! Deviations:
 //! - **Object model.** Loops and loop uses are records in the [`Brep`]'s arenas; the
@@ -89,11 +90,11 @@
 //!   unsuccessful drop returns `SM_ERR`.
 //! - The `std::unordered_set` overloads of `GetEdges` / `GetVertices`,
 //!   `GetEdgeusesAndVertexuses`, `CalculateBoundingBox`, `GetTurningAngDeg`,
-//!   `IsLoopuseSideInSurface`, `SmLoop::GetMaxSameDimGap3d`, `IsLamina`, `IsManifold`,
+//!   `SmLoop::GetMaxSameDimGap3d`, `IsLamina`, `IsManifold`,
 //!   `IsEmbedded`, `ContainsUVPoint`, `RebuildFromEdgeCurves`, `AssertValid`, `Draw`
 //!   and `Dump` are not part of this unit.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ops::Deref;
 
 use crate::curve::curve::Curve;
@@ -995,8 +996,8 @@ pub(crate) fn notify_ref(e: EntityRef) -> ObjectRef {
 /// [`notify_ref`], as [`ArenaNotifyState`](crate::topology::brep::p2::ArenaNotifyState)
 /// does; a change of that scheme changes this decoder with it. (The heal path's
 /// tracker now decodes kernel identities, `topology::brep::p3::topology_entity`, since
-/// part 5's plain edits run under them; this inverse stays for the arena scheme's tests.)
-#[cfg(test)]
+/// part 5's plain edits run under them; this inverse also names the B-rep-owned
+/// attribute store's keys, [`Brep::attributed_entities`](crate::topology::Brep::attributed_entities).)
 pub(crate) fn entity_of_notify_key(key: ObjectKey) -> Option<EntityRef> {
     let raw = key.0.checked_sub(1)?;
     let kind = raw >> 32;
@@ -1034,7 +1035,7 @@ pub(crate) fn face_notify_data(
     operation: NotifyOperation,
     data: [Option<EntityRef>; 3],
 ) -> Result<()> {
-    let mut records = BTreeMap::new();
+    let mut records = crate::topology::topology::NotifyRecords::new();
     let mut attributes = AttributeStore::default();
     let key_of = |e: EntityRef| notify_ref(e);
     let mut env = NotifyEnv {
@@ -1055,7 +1056,7 @@ pub(crate) fn face_notify_as(
     this: ObjectRef,
     operation: NotifyOperation,
 ) -> Result<()> {
-    let mut records = BTreeMap::new();
+    let mut records = crate::topology::topology::NotifyRecords::new();
     let mut attributes = AttributeStore::default();
     let key_of = |e: EntityRef| {
         if e == EntityRef::Face(f) {
@@ -1458,6 +1459,67 @@ pub fn calc_quad_num(origin: Point3, test: Point3) -> u32 {
     } else {
         2
     }
+}
+
+/// The result of [`is_loopuse_side_in_surface`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopuseSide {
+    /// The return value: `true` when every edge use's inside side lies in the surface.
+    pub in_surface: bool,
+    /// `*pOptOnNaturalBoundary`: some edge use tested runs on a natural boundary of the
+    /// surface.
+    pub on_natural_boundary: bool,
+    /// `*pOptEdgeuseIndx`: the index of the first edge use that fails (`0` otherwise).
+    pub edgeuse_index: usize,
+}
+
+/// `SmLoopuse::IsLoopuseSideInSurface(pOptPeriodicU, pOptPeriodicV,
+/// pOptOnNaturalBoundary, pOptEdgeuseIndx)`: runs
+/// [`is_edgeuse_side_in_surface`](crate::topology::edgeuse::p2::is_edgeuse_side_in_surface)
+/// with 6 samples on the loop use's edge uses in order, stopping at the first that
+/// fails. A vertex loop use is `true`.
+///
+/// # Errors
+///
+/// Those of [`edgeuses`] and of the edge use test.
+pub fn is_loopuse_side_in_surface(
+    k: &Kernel,
+    b: &Brep,
+    lu: LoopuseId,
+    periodic_u: Option<bool>,
+    periodic_v: Option<bool>,
+) -> Result<LoopuseSide> {
+    // init return value
+    let mut out = LoopuseSide {
+        in_surface: true,
+        on_natural_boundary: false,
+        edgeuse_index: 0,
+    };
+
+    // locals
+    let smp_count = 6;
+    let edgeuses = edgeuses(b, lu, None, None)?;
+
+    // for every edgeuse - check Bounding Edge Side status
+    for (ii, &eu) in edgeuses.iter().enumerate() {
+        // check and remember Edgeuse Side status
+        let side = crate::topology::edgeuse::p2::is_edgeuse_side_in_surface(
+            k, b, eu, smp_count, periodic_u, periodic_v,
+        )?;
+        if side.on_natural_boundary {
+            out.on_natural_boundary = true;
+        }
+        out.in_surface &= side.in_surface;
+
+        // inform the public
+        if !side.in_surface {
+            out.edgeuse_index = ii;
+            break;
+        }
+    }
+
+    // all done
+    Ok(out)
 }
 
 #[cfg(test)]

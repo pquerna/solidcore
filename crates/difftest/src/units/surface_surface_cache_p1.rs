@@ -711,7 +711,7 @@ fn obj(i: i64) -> Option<i64> {
 /// The `SmStatus` of a Rust error; `-1` for one upstream cannot return.
 pub(crate) fn status(e: &SolidError) -> f64 {
     match e {
-        SolidError::InvalidInput { .. } => 1007.0,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.0,
         SolidError::Upstream { code, .. } => f64::from(*code),
         _ => -1.0,
     }
@@ -818,7 +818,8 @@ type Run = Result<Vec<f64>, SolidError>;
 /// A cache of `s` over its natural domain.
 fn cache_of(s: &BSplineSurface, dom: Option<Extent2d>) -> SurfaceCache<i64> {
     let surface = Surface::from(s.copy());
-    let d = dom.unwrap_or_else(|| surface.natural_uv_domain());
+    // (runner helper without a kernel in scope)
+    let d = dom.unwrap_or_else(|| surface.natural_uv_domain_if_built());
     let mut c = SurfaceCache::new(surface, d, SurfaceCacheOptions::default());
     c.set_surface_handle(Some(SURFACE_HANDLE));
     c

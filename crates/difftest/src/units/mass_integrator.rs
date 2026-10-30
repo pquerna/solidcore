@@ -49,7 +49,7 @@ fn output(v: Vec<f64>) -> Output {
 }
 fn status(e: &SolidError) -> f64 {
     match e {
-        SolidError::InvalidInput { .. } => 1007.0,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.0,
         SolidError::Upstream { code, .. } => f64::from(*code),
         _ => 1001.0,
     }
@@ -293,7 +293,8 @@ fn geometry_cpp(g: &Geometry) -> Result<Output, HarnessError> {
         .map(output)
         .map_err(|e| HarnessError::new(e.to_string()))
 }
-/// The shim's face surface: kind 3 is a quadratic B-spline patch, every other kind an
+/// The shim's face surface: kind 3 is a quadratic B-spline patch, kind 5 a multi-span
+/// rational quadratic patch (u knot 0.4, double v knot 0.5; #1435), every other kind an
 /// `SmPlane` over `domain` (kind 4 with rotated axes).
 fn face_surface(
     kind: i32,
@@ -330,6 +331,34 @@ fn face_surface(
                 &[0., 0., 0., 1., 1., 1.],
             )?,
         )
+    } else if kind == 5 {
+        let cp: Vec<Vec<_>> = (0..4)
+            .map(|i: i32| {
+                (0..5)
+                    .map(|j: i32| {
+                        CPoint::new(
+                            p[0] + f64::from(i) * p[3] / 3.0,
+                            p[1] + f64::from(j) * p[4] / 4.0,
+                            p[2] + f64::from(i * (3 - i) * j * (4 - j)) * 0.125,
+                            if j == 2 { 0.8 } else { 1.0 },
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        solidcore::surface::surface::Surface::from(
+            solidcore::nurbs::b_spline_surface::BSplineSurface::from_data(
+                3,
+                4,
+                2,
+                2,
+                6,
+                7,
+                &cp,
+                &[0., 0., 0., 0.4, 1., 1., 1.],
+                &[0., 0., 0., 0.5, 0.5, 1., 1., 1.],
+            )?,
+        )
     } else {
         solidcore::surface::surface::Surface::from(
             solidcore::surface::plane::Plane::new(
@@ -354,6 +383,7 @@ fn geometry_rust(g: &Geometry) -> Output {
     use solidcore::curve::curve::Curve;
     use solidcore::geom::extent1d::Extent1d;
     use solidcore::geom::extent2d::Extent2d;
+    use solidcore::geom::extent3d::Extent3d;
     use solidcore::kernel::Kernel;
     use solidcore::mass::integrator::properties as props;
     use solidcore::math::{Vec2, Vec3};
@@ -472,7 +502,7 @@ fn geometry_rust(g: &Geometry) -> Output {
                     let face = {
                         use crate::units::topology_brep_p8::key_of;
                         use solidcore::EntityRef;
-                        let mut records = std::collections::BTreeMap::new();
+                        let mut records = solidcore::topology::topology::NotifyRecords::new();
                         let mut attributes = solidcore::geom::attribute::AttributeStore::default();
                         let mut env = solidcore::topology::edge::NotifyEnv {
                             records: &mut records,
@@ -535,6 +565,15 @@ fn geometry_rust(g: &Geometry) -> Output {
                     });
                 }
                 let estimated_area = it.next().ok_or_else(|| SolidError::sm_err("bbox export"))?;
+                let mut face_box = [0.0; 6];
+                for v in &mut face_box {
+                    *v = it
+                        .next()
+                        .ok_or_else(|| SolidError::sm_err("face box export"))?;
+                }
+                let [x0, y0, z0, x1, y1, z1] = face_box;
+                let face_box =
+                    Extent3d::from_points(Vec3::new(x0, y0, z0), Vec3::new(x1, y1, z1));
                 let u0 = it
                     .next()
                     .ok_or_else(|| SolidError::sm_err("domain export"))?;
@@ -618,6 +657,7 @@ fn geometry_rust(g: &Geometry) -> Output {
                     &surface,
                     &curves,
                     &domain,
+                    &face_box,
                     if p[14] == 0.0 {
                         OrientType::Same
                     } else {

@@ -32,7 +32,6 @@ use solidcore::topology::edge::NotifyEnv;
 use solidcore::topology::topology_traverser::Marks;
 use solidcore::topology::{Brep, Edgeuse, EdgeuseOwner, FaceId, Vertexuse, VertexuseOwner};
 use solidcore::{EntityRef, Result, SolidError};
-use std::collections::BTreeMap;
 use solidcore_ffi::units::sweep_trans_sweep_geometry as ffi;
 
 /// Translational sweep differential runner.
@@ -81,7 +80,7 @@ fn v(p: [f64; 3]) -> Vec3 {
 fn status(e: &SolidError) -> f64 {
     match e {
         SolidError::Upstream { code, .. } => f64::from(*code),
-        SolidError::InvalidInput { .. } => 1007.,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.,
         SolidError::Nlib { .. } => 1001.,
         _ => -1.,
     }
@@ -189,7 +188,7 @@ fn curve(k: &Kernel, o: &mut Vec<f64>, c: &Curve) -> Result<()> {
 }
 fn surface(k: &Kernel, o: &mut Vec<f64>, s: &Surface) -> Result<()> {
     o.push(s.type_code() as f64);
-    let d = s.natural_uv_domain();
+    let d = s.natural_uv_domain_with_nurb(k)?;
     o.extend([d.min().x, d.min().y, d.max().x, d.max().y]);
     for u in 0..=4 {
         for z in 0..=4 {
@@ -218,7 +217,7 @@ pub(crate) fn create_face(
     s: Surface,
     domain: &Extent2d,
 ) -> Result<FaceId> {
-    let mut records = BTreeMap::new();
+    let mut records = solidcore::topology::topology::NotifyRecords::new();
     let mut attributes = AttributeStore::default();
     let key_of = super::topology_brep_p8::key_of;
     let mut env = NotifyEnv {
@@ -380,7 +379,7 @@ fn rust(i: &Input) -> Result<Vec<f64>> {
             // over the natural domain in a `new SmBrep()` (with its infinite region);
             // a failed call's status is the outcome.
             let mut b = new_brep(&mut k, USE_DEFAULT, USE_DEFAULT)?;
-            let domain = s.natural_uv_domain();
+            let domain = s.natural_uv_domain_with_nurb(&k)?;
             let f = create_face(&mut k, &mut b, s, &domain)?;
             b.face_mut(f)?.tolerance = zone_tol3d(&k, i.tolerances[3]);
             let (s, t) = sweep.face_sweep_same(&k, &b, f)?;

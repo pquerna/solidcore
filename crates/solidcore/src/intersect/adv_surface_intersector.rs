@@ -70,6 +70,23 @@
 //!   (cyclic tree links, which recurse forever upstream) is
 //!   [`SolidError::InvalidInput`], as is nesting past the base solver's
 //!   [`MAX_SOLVE_DEPTH`](crate::geom::global_solver::MAX_SOLVE_DEPTH).
+//! - **Tangential contact points** (not upstream, WR-74, tangency-labs/solidcore#394,
+//!   opt-in `Kernel::fixes.ssi_tangent_contact_points`, off by default). The node
+//!   pairs `FindInteriorCurves` drops (normals within 5 degrees, no local
+//!   intersection, normals within 2 degrees at the solution) seed the SolidCraft
+//!   fork's search for isolated tangential contacts (`tangent_contacts`,
+//!   tangency-labs/smlib@c26edbc), run after the loop for a non-self intersection.
+//!   Its Newton iterations are bounded loops (8 + 25 steps), no recursion.
+//! - **Singular start direction** (not upstream, WR-512, tangency-labs/solidcore#1522,
+//!   opt-in `Kernel::fixes.ssi_singular_start_inside_direction`, off by default). A
+//!   curve starting at a singularity takes its first direction from the first singular
+//!   direction that points into both domains, whose angle is the search's `dAngleMin`,
+//!   before the later inside directions are searched for the one closest to the
+//!   previous direction. Upstream leaves the output at `aSingDirections[0]`, so where
+//!   the first inside direction is the nearest (or the only one) the curve starts
+//!   along a direction that need not point into either domain. The flag is snapshotted
+//!   by `SurfaceIntersector::new` when the intersector is built; a point computed later
+//!   uses that value, not a later change to the kernel.
 //! - **Not ported.** `Dump` and the `SM_DEBUG_CODE` drawing blocks; `SM_ASSERT`s.
 
 use crate::curve::conic::{Conic, ConicType};
@@ -99,6 +116,8 @@ use crate::surface::surface::p2::{
 };
 use crate::surface::surface::Surface;
 use crate::surface::surface_cache::p1::{BezierPatch, SurfaceCache};
+
+mod tangent_contacts;
 
 const OP_SING: &str =
     "intersect::adv_surface_intersector::AdvSurfaceIntersector::compute_singularity_point";
@@ -502,6 +521,10 @@ impl<'s, 't, O: SolutionObject + 't> AdvSurfaceIntersector<'s, 't, O> {
         // curves): this loop only appends curves, so slot `i` stays curve `i`'s.
         let mut drop_caches = DropPointCaches::default();
 
+        // Opt-in (WR-74, #394): the patch UV domains of the node pairs that cannot
+        // start a crossing curve seed the tangential contact point search below.
+        let mut tangent_seeds: Vec<[Extent2d; 2]> = Vec::new();
+
         // Now for each node pair do a test to see if produces a unique start point
         for sol in solutions.as_slice() {
             let uv_guess1 = Point2::new(sol.start.parameters[0], sol.start.parameters[1]);
@@ -522,6 +545,7 @@ impl<'s, 't, O: SolutionObject + 't> AdvSurfaceIntersector<'s, 't, O> {
                     angle_rad = PI - angle_rad;
                 }
                 if angle_rad * (180.0 / PI) < 5.0 {
+                    self.push_tangent_seed(k, &mut tangent_seeds, node1, node2)?;
                     continue;
                 }
             }
@@ -543,6 +567,7 @@ impl<'s, 't, O: SolutionObject + 't> AdvSurfaceIntersector<'s, 't, O> {
 
             // for nodes that do not intersect - skip to next node pair
             if !found_answer {
+                self.push_tangent_seed(k, &mut tangent_seeds, node1, node2)?;
                 continue;
             }
 
@@ -560,6 +585,7 @@ impl<'s, 't, O: SolutionObject + 't> AdvSurfaceIntersector<'s, 't, O> {
                     angle_rad = PI - angle_rad;
                 }
                 if angle_rad * (180.0 / PI) < 2.0 {
+                    self.push_tangent_seed(k, &mut tangent_seeds, node1, node2)?;
                     continue;
                 }
             }
@@ -610,6 +636,36 @@ impl<'s, 't, O: SolutionObject + 't> AdvSurfaceIntersector<'s, 't, O> {
             self.base.start_point = None;
         }
 
+        // Opt-in (WR-74, #394): isolated tangential contact points
+        if k.fixes.ssi_tangent_contact_points && !self.base.doing_self_intersection {
+            tangent_contacts::find_tangent_contact_points(
+                k,
+                &self.base,
+                &tangent_seeds,
+                out,
+                &mut drop_caches,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Opt-in (WR-74, #394): records the patch UV domains of a node pair
+    /// `FindInteriorCurves` drops as a seed of the tangential contact point search
+    /// (nothing without `Kernel::fixes.ssi_tangent_contact_points`).
+    fn push_tangent_seed(
+        &self,
+        k: &Kernel,
+        seeds: &mut Vec<[Extent2d; 2]>,
+        node1: Option<NodeId>,
+        node2: Option<NodeId>,
+    ) -> Result<()> {
+        if k.fixes.ssi_tangent_contact_points {
+            seeds.push([
+                *self.patch(0, node1)?.aux.uv_domain(),
+                *self.patch(1, node2)?.aux.uv_domain(),
+            ]);
+        }
         Ok(())
     }
 
@@ -1490,6 +1546,14 @@ impl SurfaceIntersector<'_> {
                 // Decide which of the aSingDirections to use.
                 if let Some(p) = prev {
                     if let Some((&first, rest)) = inside.split_first() {
+                        // SolidCraft change (WR-512, #1522): start from the first inside
+                        // direction, which is where the search's dAngleMin comes from.
+                        // Upstream leaves the output at dir(0), so where the first inside
+                        // direction is the closest (or the only one) the curve starts
+                        // along a direction that need not point inside either domain.
+                        if self.singular_start_inside_direction {
+                            *point.crv_deriv_mut() = dir(first);
+                        }
                         // Find the singDirection closest to Prev->3DCurve_Direction.
                         let mut angle_min = angle(p, dir(first))?;
                         for &ii in rest {
@@ -1697,6 +1761,117 @@ mod tests {
         let p = si.base.point(id).unwrap();
         assert_eq!(p.point_type, IntersectionPointType::Singularity);
         assert!((p.crv_deriv().length() - 1.0).abs() < 1e-12);
+    }
+
+    /// The plane-vs-saddle singular directions of
+    /// [`plane_against_saddle_is_singular`] for `curve_trace_direction = -1`, in the
+    /// order `ComputeSingularityPoint` stores them: `-x - y`, `x + y`, `-x + y`,
+    /// `x - y` (the two asymptotic directions of the saddle and their negations).
+    const SING: f64 = core::f64::consts::FRAC_1_SQRT_2;
+
+    /// Runs the production start-point path (`compute_singularity_point` with an arena
+    /// previous point) using supplied plane-vs-saddle differential values at the origin.
+    /// The surfaces provide the domains; their cached point derivatives are set below
+    /// rather than obtained by evaluating a modeled saddle. Returns the point's type
+    /// and selected curve derivative.
+    fn singular_start(k: &Kernel, domain1: Extent2d, prev: Vec3) -> (IntersectionPointType, Vec3) {
+        let s = plane();
+        let domain2 = Extent2d::from_bounds(-1.0, -1.0, 1.0, 1.0);
+        // `from_fillet_intersector` keeps the given domains: the plane's natural domain
+        // is [0, 1]^2, and the point sits on the u = 0 and v = 0 edges the test varies.
+        let mut si: AdvSurfaceIntersector<'_, '_, H> =
+            AdvSurfaceIntersector::new(k, &s, &domain1, &s, &domain2, true).unwrap();
+        // The stored order above is the one for -1.
+        si.base.curve_trace_direction = -1.0;
+        let x = Vec3::new(1.0, 0.0, 0.0);
+        let y = Vec3::new(0.0, 1.0, 0.0);
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        let zero = Vec3::new(0.0, 0.0, 0.0);
+        let mut p = TsectPnt::new();
+        p.surface_pv[0] = eval(x, y, zero, zero, zero);
+        p.surface_pv[1] = eval(x, y, z, zero, -z);
+        *p.crv_pos_mut() = zero;
+        *p.uv_pos_mut(SrfIndex::First) = Point2::new(0.0, 0.0);
+        *p.uv_pos_mut(SrfIndex::Second) = Point2::new(0.0, 0.0);
+        let mut prev_pnt = TsectPnt::new();
+        *prev_pnt.crv_deriv_mut() = prev;
+        let prev_id = si.base.alloc_point(prev_pnt);
+        let id = si.base.alloc_point(p);
+        si.compute_singularity_point([Point2::new(0.0, 0.0); 2], id, Some(prev_id))
+            .unwrap();
+        let p = si.base.point(id).unwrap();
+        (p.point_type, p.crv_deriv())
+    }
+
+    #[test]
+    fn singular_start_uses_the_only_inside_direction_when_fixed() {
+        // Only +x +y points into the plane's [0, 1] x [0, 1] domain, and it is the
+        // second stored direction: upstream leaves the result at the first (-x -y),
+        // which points into neither domain.
+        let domain1 = Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0);
+        let inside = Vec3::new(SING, SING, 0.0);
+        let outside = Vec3::new(-SING, -SING, 0.0);
+
+        let off = singular_start(&Kernel::default(), domain1, inside);
+        assert_eq!(off.0, IntersectionPointType::Singularity);
+        assert!((off.1 - outside).length() < 1e-6, "upstream: {:?}", off.1);
+
+        let mut k = Kernel::default();
+        assert!(!k.fixes.ssi_singular_start_inside_direction);
+        k.fixes.ssi_singular_start_inside_direction = true;
+        let on = singular_start(&k, domain1, inside);
+        assert_eq!(on.0, IntersectionPointType::Singularity);
+        assert!((on.1 - inside).length() < 1e-6, "fixed: {:?}", on.1);
+    }
+
+    #[test]
+    fn singular_start_uses_the_nearest_first_inside_direction_when_fixed() {
+        // The plane's [0, 1] x [-1, 1] domain holds +x +y and +x -y; the first inside
+        // direction is +x +y and it is the nearest to the previous one.
+        let domain1 = Extent2d::from_bounds(0.0, -1.0, 1.0, 1.0);
+        let nearest = Vec3::new(SING, SING, 0.0);
+        let outside = Vec3::new(-SING, -SING, 0.0);
+
+        let off = singular_start(&Kernel::default(), domain1, nearest);
+        assert!((off.1 - outside).length() < 1e-6, "upstream: {:?}", off.1);
+
+        let mut k = Kernel::default();
+        k.fixes.ssi_singular_start_inside_direction = true;
+        let on = singular_start(&k, domain1, nearest);
+        assert!((on.1 - nearest).length() < 1e-6, "fixed: {:?}", on.1);
+    }
+
+    #[test]
+    fn singular_start_still_takes_a_later_inside_direction_when_fixed() {
+        // The first inside direction is +x +y, but +x -y is the nearest to the previous
+        // one: the later-angle search must still replace the initial choice.
+        let domain1 = Extent2d::from_bounds(0.0, -1.0, 1.0, 1.0);
+        let later = Vec3::new(SING, -SING, 0.0);
+
+        let mut k = Kernel::default();
+        k.fixes.ssi_singular_start_inside_direction = true;
+        let on = singular_start(&k, domain1, later);
+        assert!((on.1 - later).length() < 1e-6, "fixed: {:?}", on.1);
+
+        // Without the fix the same later direction wins: the default path is unchanged.
+        let off = singular_start(&Kernel::default(), domain1, later);
+        assert!((off.1 - later).length() < 1e-6, "upstream: {:?}", off.1);
+    }
+
+    #[test]
+    fn singular_start_default_is_unchanged_when_the_first_direction_is_inside() {
+        // With every direction inside, the first stored direction already is inside and
+        // the nearest to the previous one: the fix changes nothing.
+        let domain1 = Extent2d::from_bounds(-1.0, -1.0, 1.0, 1.0);
+        let nearest = Vec3::new(-SING, -SING, 0.0);
+
+        let off = singular_start(&Kernel::default(), domain1, nearest);
+        let mut k = Kernel::default();
+        k.fixes.ssi_singular_start_inside_direction = true;
+        let on = singular_start(&k, domain1, nearest);
+        assert_eq!(off.0, on.0);
+        assert!((off.1 - on.1).length() < 1e-12);
+        assert!((on.1 - nearest).length() < 1e-6, "fixed: {:?}", on.1);
     }
 
     #[test]

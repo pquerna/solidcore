@@ -103,7 +103,7 @@ use crate::math::{Point3, Vec3, BIG_DOUBLE, EFF_ZERO, EFF_ZERO_SQRT, PI};
 use crate::query::face::p2::{
     point_classify_prepared, point_classify_requested, PointClassifyOptions,
 };
-use crate::surface::surface::p2::{surface_cache, Surface, SurfaceKind};
+use crate::surface::surface::p2::{surface_cache, Surface, B_SPLINE_SURFACE_TYPE};
 use crate::surface::surface_cache::p1::{AltCacheKey, AltSrfCacheType};
 use crate::surface::trim_srf_cache::POINT_CLASS_UNKNOWN;
 use crate::topology::face::p2::create_curves_by_trimming_snapshot;
@@ -287,6 +287,9 @@ pub trait TopologyObjects<O> {
         let _ = (k, object);
         // UNPORTED(geom.tol): SmTol::GetZoneTol3d(const SmObject*) on a handle this
         // adapter does not resolve to its B-rep entity
+        // Proof (unreachable): only Rayfire solvers read this; the library ones
+        // (offset_geometry_creation, brep p2) pass a resolver or override
+        // object_zone_tol_3d; 0 hits in the green difftest sweep.
         Err(SolidError::unported(
             "SmTol::GetZoneTol3d(const SmObject*)",
             "geom.tol",
@@ -945,7 +948,8 @@ impl<O: SolutionObject> ParameterDomains<O> for TopologyDomains<'_, O> {
             self.objects
                 .surface(*surface)
                 .ok()
-                .map(Surface::natural_uv_domain)
+                // (kernel-free: a lazy analytic answers its NURB-less base's empty domain)
+                .map(Surface::natural_uv_domain_if_built)
         })
     }
 }
@@ -1440,8 +1444,12 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
             //   The target point is stored in m_vPoint, not the input args.
             //   So - put curve in as both args makes sure this works
             //        no matter the value of m_bSwapOrder
-            let curve = objects.curve(handle)?;
-            self.point_curve(k, ts, curve, Some(handle))?;
+            // the solve builds the edge curve's cache at the edge's tolerance
+            // (SmTol::GetApproxTol3d(&m_crCurve) reads pEdge->GetTolerance() through the
+            // owner)
+            let mut curve = objects.curve(handle)?.clone_for_evaluation()?;
+            curve.set_owner_zone_tol_3d(Some(objects.edge_tolerance(edge)?));
+            self.point_curve(k, ts, &curve, Some(handle))?;
         }
 
         Ok(())
@@ -1962,9 +1970,9 @@ pub(super) fn face_silhouettes<O: SolutionObject>(
     }
 
     // No cached trimmed silhouette curves in existance -- create them
-    // (SM_CAST_PTR(SmBSplineSurface, pSurface): upstream dereferences NULL for any
-    // other kind)
-    if !matches!(srf.kind(), SurfaceKind::BSpline(_) | SurfaceKind::Plane(_)) {
+    // (SM_CAST_PTR(SmBSplineSurface, pSurface): every kind derived from it; upstream
+    // dereferences NULL for any other kind)
+    if !srf.is_kind_of(B_SPLINE_SURFACE_TYPE)? {
         return Err(null_deref(
             OP_FACE_SIL,
             "face surface is not a B-spline surface",
@@ -2212,6 +2220,7 @@ pub(super) fn face_point_classify<O: Copy>(
         Err(
             e @ (SolidError::Unported { .. }
             | SolidError::InvalidInput { .. }
+            | SolidError::PortInvariant { .. }
             | SolidError::PreparationRequired { .. }),
         ) => Err(e),
         // (status ignored, as upstream)
@@ -2372,8 +2381,12 @@ pub(crate) mod tests {
                 _ => Err(SolidError::sm_err("edge")),
             }
         }
-        fn edge_tolerance(&self, _edge: Obj) -> Result<f64> {
-            Err(SolidError::sm_err("edge"))
+        fn edge_tolerance(&self, edge: Obj) -> Result<f64> {
+            // SmEdge's default tolerance (the point/edge solve reads it for the cache)
+            match edge {
+                Obj::Edge(_) => Ok(0.0),
+                _ => Err(SolidError::sm_err("edge")),
+            }
         }
         fn surface_face(&self, _surface: Obj) -> Result<Option<Obj>> {
             Ok(None)

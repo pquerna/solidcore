@@ -8,7 +8,7 @@
 //! | Rust                                       | Upstream                                          |
 //! |--------------------------------------------|---------------------------------------------------|
 //! | [`Plane::create_offset_surface`]           | `CreateOffsetSurface`                             |
-//! | `global_surface_intersect_in` (via [`Surface::global_surface_intersect`]) | `GlobalSurfaceIntersect` |
+//! | `global_surface_intersect_into` (via [`Surface::global_surface_intersect`]) | `GlobalSurfaceIntersect` |
 //! | [`Plane::intersect_with_plane`]            | `IntersectWithPlane`                              |
 //! | [`Plane::trim_curve_to_plane_domain`]      | `TrimCurveToPlaneDomain`                          |
 //! | [`Plane::is_nurb_surface_plane`]           | `IsNurbSurfacePlane` (static)                     |
@@ -34,11 +34,10 @@
 //!   ([`Surface::owner_zone_tol_3d`]), and returns [`SolidError::Unported`] there
 //!   without it (`SmFace::GetTolerance`, unit `topology.face_p2`).
 //! - **NURB.** `IntersectWithPlane`'s parallel case tests whether both planes hold a
-//!   NURB (`m_pNurb`), as upstream; the boxes are computed on a NURB made on a copy
-//!   when the plane has none (upstream makes it in place, a `const_cast`). Because the
-//!   port's read-only queries (e.g. `natural_uv_domain`) never cache the NURB, a plane
-//!   upstream would already hold one can reach this test without it (see the
-//!   `surface::plane::p1` deviations).
+//!   NURB (`m_pNurb`), as upstream. The port's read-only queries (e.g.
+//!   `natural_uv_domain`, the boxes) make a missing NURB and keep it on the plane as
+//!   upstream does through a `const_cast` (see the `surface::plane::p1` deviations),
+//!   so a plane reaches this test with a NURB exactly when upstream's would.
 //! - **Statuses.** Where upstream ignores a status and would go on with stale or
 //!   uninitialised values (curve evaluations and copies in `TrimCurveToPlaneDomain`,
 //!   the test-point evaluation of `IsNurbSurfacePlane`), the port propagates the error.
@@ -82,9 +81,10 @@ use crate::nurbs::b_spline_curve::BSplineCurve;
 use crate::nurbs::b_spline_curve_n_lib::TrimMode;
 use crate::nurbs::b_spline_surface::{BSplineSurface, BoundingBoxRequest};
 use crate::nurbs::knots::Side;
+use crate::surface::surf_of_revolution::SurfOfRevolution;
 use crate::surface::surface::p1::{evaluate_1st_derivatives, SurfaceIntersectContext};
 use crate::surface::surface::p2::{
-    base_global_surface_intersect_in, SurfaceIntersection, TsectCurveType,
+    base_global_surface_intersect_into, SurfaceIntersection, TsectCurveType,
 };
 use crate::surface::surface::p7::base_evaluate_normal;
 use crate::surface::surface::{Surface, SurfaceKind};
@@ -163,6 +163,9 @@ fn zone_tolerance(owner: PlaneOwner) -> Result<f64> {
         PlaneOwner::Face(Some(tol)) => Ok(tol),
         // UNPORTED(topology.face_p2): SmFace::GetTolerance (a bare face handle without
         // the tolerance its B-rep caches on the surface)
+        // Proof (unreachable): a B-rep face's surface carries the face tolerance
+        // (Brep::sync_face_surface_tolerance invariant, see Surface::face_zone_tol_3d); 0
+        // hits in the green difftest sweep.
         PlaneOwner::Face(None) => Err(SolidError::unported(
             "SmFace::GetTolerance",
             "topology.face_p2",
@@ -1427,12 +1430,16 @@ impl Plane {
 /// `SmSurface::GlobalSurfaceIntersect` when that is not complete (or for any other
 /// surface kind).
 ///
+/// The result is set in `out` (upstream's output arrays): on an error `out` keeps what
+/// the failing special case appended before it; the general intersection resets it
+/// first.
+///
 /// # Errors
 ///
 /// Those of [`Plane::intersect_with_plane`]; [`SolidError::Unported`] from the general
 /// intersector.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn global_surface_intersect_in<O: SolutionObject + Copy + PartialEq>(
+pub(crate) fn global_surface_intersect_into<O: SolutionObject + Copy + PartialEq>(
     k: &Kernel,
     this: &Surface,
     plane: &Plane,
@@ -1443,10 +1450,12 @@ pub(crate) fn global_surface_intersect_in<O: SolutionObject + Copy + PartialEq>(
     approx_tol_3d: Option<f64>,
     ang_tol_rad: Option<f64>,
     context: Option<SurfaceIntersectContext<'_, O>>,
-) -> Result<SurfaceIntersection> {
+    out: &mut SurfaceIntersection,
+) -> Result<()> {
     // assume special case intersections will be complete
     let mut need_nurb_intersection = true;
-    let mut out = SurfaceIntersection::default();
+    // (each special case resets the outputs on entry)
+    *out = SurfaceIntersection::default();
 
     // switch on OtherSurface Type looking for cheap special intersection case
     match other.kind_with_nurb(k)? {
@@ -1454,7 +1463,7 @@ pub(crate) fn global_surface_intersect_in<O: SolutionObject + Copy + PartialEq>(
         SurfaceKind::Plane(other_plane) => {
             // (whether each plane has a face: SmSurface::GetFace, and its tolerance)
             let owners = [PlaneOwner::of(this)?, PlaneOwner::of(other)?];
-            (need_nurb_intersection, out) = plane.intersect_with_plane_owned(
+            (need_nurb_intersection, *out) = plane.intersect_with_plane_owned(
                 k,
                 uv_domain,
                 other_plane,
@@ -1477,22 +1486,24 @@ pub(crate) fn global_surface_intersect_in<O: SolutionObject + Copy + PartialEq>(
                 approx_tol_3d,
             )?;
             core::mem::swap(&mut x.surface1_uv_curves, &mut x.surface2_uv_curves);
-            (need_nurb_intersection, out) = (need, x);
+            (need_nurb_intersection, *out) = (need, x);
         }
         // SurfOfRevolution/plane special case intersection: the orders and the UV
-        // curves are swapped (the surface of revolution's edge flags and angle
-        // tolerance are not used by it)
+        // curves are swapped, also in a partial output (the surface of revolution's
+        // edge flags and angle tolerance are not used by it)
         SurfaceKind::SurfOfRevolution(rev) => {
             // the plane's boxes take its face's tolerance
-            let (need, mut x) = rev.intersect_with_plane_owned(
+            let need = rev.intersect_with_plane_owned_using_into(
                 k,
                 plane,
                 PlaneOwner::of(this)?,
                 uv_domain,
                 approx_tol_3d,
-            )?;
-            core::mem::swap(&mut x.surface1_uv_curves, &mut x.surface2_uv_curves);
-            (need_nurb_intersection, out) = (need, x);
+                &SurfOfRevolution::own_sweep_iso,
+                out,
+            );
+            core::mem::swap(&mut out.surface1_uv_curves, &mut out.surface2_uv_curves);
+            need_nurb_intersection = need?;
         }
         // sphere/plane special case intersection: the orders and the UV curves are
         // swapped
@@ -1507,7 +1518,7 @@ pub(crate) fn global_surface_intersect_in<O: SolutionObject + Copy + PartialEq>(
                 approx_tol_3d,
             )?;
             core::mem::swap(&mut x.surface1_uv_curves, &mut x.surface2_uv_curves);
-            (need_nurb_intersection, out) = (need, x);
+            (need_nurb_intersection, *out) = (need, x);
         }
         // SurfOfExtrusion/plane special case intersection: the orders and the UV curves
         // are swapped
@@ -1523,7 +1534,7 @@ pub(crate) fn global_surface_intersect_in<O: SolutionObject + Copy + PartialEq>(
             )?;
             core::mem::swap(&mut x.surface1_uv_curves, &mut x.surface2_uv_curves);
             need_nurb_intersection = x.needs_more_intersections;
-            out = SurfaceIntersection::from(x);
+            *out = SurfaceIntersection::from(x);
         }
         // (an SmTorus has no special case: the default branch)
         SurfaceKind::Torus(_)
@@ -1536,7 +1547,7 @@ pub(crate) fn global_surface_intersect_in<O: SolutionObject + Copy + PartialEq>(
 
     // If we're here, then analytic intersection were not found - do general intersection
     if need_nurb_intersection {
-        out = base_global_surface_intersect_in(
+        base_global_surface_intersect_into(
             k,
             this,
             uv_domain,
@@ -1546,11 +1557,12 @@ pub(crate) fn global_surface_intersect_in<O: SolutionObject + Copy + PartialEq>(
             approx_tol_3d,
             ang_tol_rad,
             context,
+            out,
         )?;
     }
 
     // all done
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]

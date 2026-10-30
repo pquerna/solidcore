@@ -93,7 +93,7 @@ use crate::topology::face::p2 as face2;
 use crate::topology::loopuse;
 use crate::topology::topology_traverser::Marks;
 use crate::topology::trimming_tools::curve_loops::{
-    CurveIntersections, CurveKey, CurveLoops, IsoXSectSegment, LoopObject,
+    CurveIntersections, CurveKey, CurveLoops, IsoXSectSegment, LoopObject, StoreDomains,
 };
 use crate::topology::trimming_tools::find_outer_loops;
 use crate::topology::vertex;
@@ -166,7 +166,7 @@ fn as_sm_err(e: SolidError) -> SolidError {
 /// input upstream mishandles, e.g. `FindOuterLoops`' zero-area loop, UB-119) go through.
 fn plane_failed(e: SolidError) -> SolidError {
     match e {
-        SolidError::InvalidInput { .. } => e,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => e,
         other => as_sm_err(other),
     }
 }
@@ -385,7 +385,7 @@ pub fn create_planar_face_with_3d_curves(
 
     // create the plane - returns an error for open, degenerate, or nonCoplanar curves
     let plane = Surface::create_plane_with_3d_curves(k, curves, tol_3d).map_err(plane_failed)?;
-    let plane_domain = plane.plane.natural_uv_domain();
+    let plane_domain = plane.plane.natural_uv_domain_with_nurb(k)?;
 
     let mut next_loop = 0usize;
     let mut next_curve = 0usize;
@@ -400,7 +400,9 @@ pub fn create_planar_face_with_3d_curves(
             this_loops.push(num_curves);
             for _ in 0..num_curves {
                 let ci = *at(&plane.ordered_curves, next_curve)?;
-                this_curves.push(Some(at(curves, ci)?.clone()));
+                // the curve itself goes into the new edge upstream: an exact copy, not
+                // the copy constructor (whose knot fix-up would change the curve)
+                this_curves.push(Some(at(curves, ci)?.clone_for_evaluation()?));
                 this_orients.push(*at(&plane.orients, next_curve)?);
                 next_curve += 1;
             }
@@ -466,7 +468,8 @@ pub fn create_planar_faces_with_3d_curves(
 
     let mut ordered: Vec<Option<Curve>> = Vec::with_capacity(plane.ordered_curves.len());
     for &ci in &plane.ordered_curves {
-        ordered.push(Some(at(curves, ci)?.clone()));
+        // (the curves themselves go into the new edges upstream: exact copies)
+        ordered.push(Some(at(curves, ci)?.clone_for_evaluation()?));
     }
     let made = create_faces_with_curves(
         k,
@@ -957,7 +960,12 @@ pub fn make_faces_with_curves(
         let mut new_sols: SolutionArray<LoopObject> = SolutionArray::new();
         for ii in 0..ci.solutions.len() {
             if let Some(s) = ci.solutions.get(ii) {
-                ignore_status(new_sols.add_sorted_solution(s, SortKey::ByFirstParameter))?;
+                // (IsEqual reads the natural intervals of the solutions' curves)
+                ignore_status(new_sols.add_sorted_solution_in(
+                    s,
+                    SortKey::ByFirstParameter,
+                    &StoreDomains(&store),
+                ))?;
             }
         }
         let iso_key = ci
@@ -1287,7 +1295,6 @@ mod tests {
     use crate::geom::attribute::AttributeStore;
     use crate::math::Point2;
     use crate::surface::plane::Plane;
-    use std::collections::BTreeMap;
 
     fn code(e: &SolidError) -> Option<i32> {
         match e {
@@ -1302,7 +1309,7 @@ mod tests {
     ) -> (R, Brep) {
         let mut k = Kernel::default();
         let mut b = p3::new_brep(&mut k, tol::USE_DEFAULT, tol::USE_DEFAULT).unwrap();
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = AttributeStore::default();
         let mut env = NotifyEnv {
             records: &mut records,

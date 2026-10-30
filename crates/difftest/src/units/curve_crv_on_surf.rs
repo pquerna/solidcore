@@ -663,7 +663,7 @@ fn put_state(o: &mut Vec<f64>, c: &CrvOnSurf) {
         None => o.push(0.0),
         Some(a) => {
             o.push(1.0);
-            put_nurb(o, a);
+            put_nurb(o, &a);
         }
     }
     put_curve(o, c.uv_curve());
@@ -674,7 +674,7 @@ fn put_state(o: &mut Vec<f64>, c: &CrvOnSurf) {
 /// cannot return.
 fn status(e: &SolidError) -> f64 {
     match e {
-        SolidError::InvalidInput { .. } => 1007.0,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.0,
         SolidError::Upstream { code, .. } => f64::from(*code),
         _ => -1.0,
     }

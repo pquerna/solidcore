@@ -19,6 +19,8 @@
 //! | [`has_seam_problem`], [`SeamCheck`], [`HasSeamProblemOptions`] | `SmFace::HasSeamProblem`  |
 //! | [`BrepSeamObjects`], `merge_seam_intervals` (crate) | the `SmObject`s of `HasSeamProblem` / `SplitAtSeam`'s `MergeIntervals` |
 //! | [`ClassifyProblem`]                          | `SmClassifyProblem` (`SmCurveClass.h`)       |
+//! | [`assert_test_face37`]                       | `sm_AssertTestFace37` (file static)          |
+//! | `loop_sample_uv_point` (private)             | `sm_GetLoopSampleUVPoint` (file static)      |
 //!
 //! Deviations:
 //! - **Object model.** As [`super::p1`]: free functions over the [`Brep`]'s arenas,
@@ -155,11 +157,9 @@ use crate::topology::face::p2::{
     review_start_and_stop_on_seam_crv_classifies, UvLineHandle, UvLineObjects,
 };
 use crate::topology::loopuse::{self, AttributeFilter};
-use crate::topology::topology::Topology;
 use crate::topology::vertex;
 use crate::topology::vertexuse;
 use crate::topology::{Brep, EdgeId, EdgeuseId, FaceId, LoopId, LoopuseId, VertexId, VertexuseId};
-use std::collections::BTreeMap;
 
 const OP: &str = "topology::face::p4";
 
@@ -172,7 +172,10 @@ fn null(reason: &'static str) -> SolidError {
 const fn must_propagate(e: &SolidError) -> bool {
     matches!(
         e,
-        SolidError::Unported { .. } | SolidError::InvalidInput { .. } | SolidError::NotFound { .. }
+        SolidError::Unported { .. }
+            | SolidError::InvalidInput { .. }
+            | SolidError::PortInvariant { .. }
+            | SolidError::NotFound { .. }
     )
 }
 
@@ -1557,7 +1560,10 @@ where
 /// `pCrvClass->MergeIntervals(&faces, &edges, &vertices, this)` of
 /// `SmFace::SplitAtSeam` on face `f`'s own B-rep ([`BrepSeamObjects::for_merge`]), for
 /// the `dir` seam classification [`has_seam_problem`] made: the merge's status with its
-/// partial output ([`CurveClassification::merge_intervals_mut`]).
+/// partial output ([`CurveClassification::merge_intervals_mut`]). `vertices_only` is
+/// upstream's `bMergeVerticesOnly` (`FALSE` in `SplitAtSeam`, `TRUE` in
+/// `SmHealData::Fix_SplitEdgesAtSeam`); the merge's edits are notified through `notify`
+/// when given ([`BrepSeamObjects::for_merge_notified`]).
 ///
 /// Upstream's classification owns its seam curve; the port's names it with a
 /// temporary handle ([`ClassObject::temporary`]), so the seam curve and its UV curve
@@ -1572,9 +1578,11 @@ where
 pub(crate) fn merge_seam_intervals<O: LoopObject>(
     k: &mut Kernel,
     b: &mut Brep,
+    notify: Option<&mut edge::NotifyEnv<'_>>,
     f: FaceId,
     dir: SurfParamType,
     c: &mut CurveClassification<O>,
+    vertices_only: bool,
 ) -> Result<core::result::Result<MergedTopology<O>, PartialMergeError<O>>> {
     // (a failure to rebuild the seam leaves it unresolved, as above)
     let seam = match b.face(f)?.surface.as_ref() {
@@ -1587,7 +1595,19 @@ pub(crate) fn merge_seam_intervals<O: LoopObject>(
     } else {
         SEAM_U_TEMPS
     };
-    let mut inner = BrepSeamObjects::for_merge(b, f)?;
+    let mut inner = match notify {
+        Some(n) => BrepSeamObjects::for_merge_notified(
+            b,
+            f,
+            edge::NotifyEnv {
+                records: &mut *n.records,
+                attributes: &mut *n.attributes,
+                context: n.context.as_deref_mut(),
+                key_of: n.key_of,
+            },
+        )?,
+        None => BrepSeamObjects::for_merge(b, f)?,
+    };
     let mut objects = WithSeam {
         inner: &mut inner,
         seam: seam
@@ -1597,7 +1617,7 @@ pub(crate) fn merge_seam_intervals<O: LoopObject>(
             .as_ref()
             .and_then(|(uv, _)| O::temporary(ui, ClassObjectKind::Curve).map(|h| (h, uv))),
     };
-    Ok(c.merge_intervals_mut_with_partial(k, &mut objects, false))
+    Ok(c.merge_intervals_mut_with_partial(k, &mut objects, vertices_only))
 }
 
 /// The inputs of [`has_seam_problem`] after the face (`HasSeamProblem`'s optional
@@ -1791,9 +1811,12 @@ fn classify_seam<O: LoopObject, M: CurveOnClassifyBrep<O>>(
 /// `HasSeamProblem`: whether the seams of the face's periodic surface are badly
 /// represented: crossed by face edges without a vertex there, or not represented by
 /// seam edges (allowing for edge/face gaps beyond tolerance). Each periodic direction's
-/// seam curve is classified against the face (`class_u`, `class_v`); a doubly periodic
-/// surface whose seam does not meet any loop but the other seam enters the face has
-/// that seam missing (the torus case). Without stage 2 face properties
+/// seam curve is classified against the face (`class_u`, `class_v`). A whole closed
+/// surface with only vertex loops has the unclassified parts of its seams in the face
+/// (missing). On a doubly periodic surface a seam that does not meet any loop is missing
+/// when the other seam starts in or enters the face (the torus case; crossed only when
+/// that other seam touches an edge loop), and both are missing when neither meets a loop
+/// and every closed edge loop runs clockwise in 3D. Without stage 2 face properties
 /// (`opts.face_props` below `PropStage::Stage2A`), `SetProps_Stage2` runs instead
 /// (which calls back here) and its results are returned with `has_problem` `true` (the
 /// `SM_SUCCESS`, `1000`, upstream returns as `SmBoolean`).
@@ -2023,6 +2046,32 @@ pub fn has_seam_problem_mut<O: LoopObject, M: CurveOnClassifyBrep<O>>(
         (crossed_v, missing_v, near_miss_v) = (crossed, missing, near_miss);
     }
 
+    // With only isolated vertex loops, the whole closed surface is retained. Fill the
+    // unknown portions of each seam, keeping existing vertex hits so insertion connects
+    // to the original graph, including shared vertices.
+    if super::p3::is_closed_surface_with_vertex_loops(k, objects.brep(), f, Some(&*props))? {
+        let this = objects.face(f);
+        let seams = [
+            (&mut out.class_u, periodic_u),
+            (&mut out.class_v, periodic_v),
+        ];
+        for (class, periodic) in seams {
+            if !periodic {
+                continue;
+            }
+            for interval in 0..class.size() {
+                let ivl = class.at_mut(interval)?;
+                for point in [&mut ivl.start, &mut ivl.mid, &mut ivl.end] {
+                    if point.point_class() == PointClassType::Unknown {
+                        point.set_class_object(PointClassType::Face, Some(this));
+                    }
+                }
+            }
+        }
+        missing_u = periodic_u && out.class_u.is_crossing_face(Some(this));
+        missing_v = periodic_v && out.class_v.is_crossing_face(Some(this));
+    }
+
     // remember when SeamCrvU / SeamCrvV has no FaceLoop Bndry XSects
     let no_xsect_seam_u = no_xsect(&out.class_u)?;
     let no_xsect_seam_v = no_xsect(&out.class_v)?;
@@ -2031,29 +2080,131 @@ pub fn has_seam_problem_mut<O: LoopObject, M: CurveOnClassifyBrep<O>>(
     // NonIntersecting Seam may be Missing
     if periodic_u && periodic_v {
         let this = objects.face(f);
+
+        // Both seam curves start at (Umin,Vmin). If a nonintersecting seam has this point
+        // inside the face, its entire curve is inside. Coincident IN/ON/IN touches can
+        // disappear from the processed crossing list.
+        let starts_in_face = |class: &CurveClassification<O>| -> Result<bool> {
+            Ok(class.size() > 0 && {
+                let start = &class.at(0)?.start;
+                start.point_class() == PointClassType::Face && start.object() == Some(this)
+            })
+        };
+        let v_start_in_face = starts_in_face(&out.class_v)?;
+        let u_start_in_face = starts_in_face(&out.class_u)?;
+
+        // Point-only touches divide a seam but do not cross a face boundary. Keep them out
+        // of the crossing flags used to request MoveSeam. Use the raw lists so coincident
+        // edge touches remain visible after processing.
+        let mut touches_boundary = [false, false];
+        for (touches_seam, touches) in touches_boundary
+            .iter_mut()
+            .zip([&props.raw_touch_list_u, &props.raw_touch_list_v])
+        {
+            for touch in touches {
+                let Some(o) = touch.connected_to else {
+                    continue;
+                };
+                // (SmLoop*) cast
+                let l = o
+                    .as_loop()
+                    .ok_or_else(|| null("HasSeamProblem: touch not connected to a loop"))?;
+                let lu = objects
+                    .brep()
+                    .loop_(l)?
+                    .loopuse
+                    .ok_or_else(|| null("HasSeamProblem: loop without loop use"))?;
+                if !loopuse::is_vertex_loopuse(objects.brep(), lu)? {
+                    *touches_seam = true;
+                    break;
+                }
+            }
+        }
+
+        // use the shared seam point or crossing list to detect a missing SeamU
         if no_xsect_seam_u
-            && props
-                .done_touch_list_v
-                .first()
-                .is_some_and(|t| t.loop_dir == CrvDirOnFaceType::In)
+            && (v_start_in_face
+                || props
+                    .done_touch_list_v
+                    .first()
+                    .is_some_and(|t| t.loop_dir == CrvDirOnFaceType::In))
         {
             missing_u = true;
             mark_in_face(&mut out.class_u, this)?;
-            crossed_u = true;
-            crossed_v = true;
+
+            // A boundary crossing can require relocating either seam. Isolated vertex
+            // loops only require insertion through their existing vertices.
+            if touches_boundary[1] {
+                crossed_u = true;
+                crossed_v = true;
+            }
         }
+
+        // use the shared seam point or crossing list to detect a missing SeamV
         if no_xsect_seam_v
-            && props
-                .done_touch_list_u
-                .first()
-                .is_some_and(|t| t.loop_dir == CrvDirOnFaceType::In)
+            && (u_start_in_face
+                || props
+                    .done_touch_list_u
+                    .first()
+                    .is_some_and(|t| t.loop_dir == CrvDirOnFaceType::In))
         {
             missing_v = true;
             mark_in_face(&mut out.class_v, this)?;
-            crossed_u = true;
-            crossed_v = true;
+
+            // A boundary crossing can require relocating either seam. Isolated vertex
+            // loops only require insertion through their existing vertices.
+            if touches_boundary[0] {
+                crossed_u = true;
+                crossed_v = true;
+            }
         }
     }
+
+    // If neither seam intersects a boundary on a doubly periodic surface, all closed
+    // clockwise area loops describe holes in the retained face. Use the defining curves,
+    // not stored loop labels or optional UV trims. Stage 3 loop containment is not
+    // available while these Stage 2 properties are built.
+    if periodic_u && periodic_v && no_xsect_seam_u && no_xsect_seam_v && !loops.is_empty() {
+        let mut all_clockwise = true;
+        for &l in &loops {
+            // Isolated vertices do not enclose a retained patch. They have no measured
+            // loop orientation and cannot disprove missing seams.
+            let lu = objects
+                .brep()
+                .loop_(l)?
+                .loopuse
+                .ok_or_else(|| null("HasSeamProblem: loop without loop use"))?;
+            if loopuse::is_vertex_loopuse(objects.brep(), lu)? {
+                continue;
+            }
+            if !loopuse::is_closed_ptrs(objects.brep(), lu)? {
+                all_clockwise = false;
+                break;
+            }
+            // (a failing status is not clockwise)
+            let orient = match super::p3::compute_loop_orientation_3d(k, objects.brep(), f, l, None)
+            {
+                Ok(o) => o,
+                Err(e) if must_propagate(&e) => return Err(e),
+                Err(_) => OrientType::Unknown,
+            };
+            if orient != OrientType::Opposite {
+                all_clockwise = false;
+                break;
+            }
+        }
+        if all_clockwise {
+            missing_u = true;
+            missing_v = true;
+            let this = objects.face(f);
+            mark_in_face(&mut out.class_u, this)?;
+            mark_in_face(&mut out.class_v, this)?;
+        }
+    }
+
+    // Other nonintersecting cases remain unresolved. In particular, stored loop
+    // order/orientation cannot replace geometric evidence for singly periodic surfaces
+    // or ambiguous, degenerate, and mixed-orientation loops.
 
     out.problem = SeamProblem {
         crossed: sp_of(crossed_u, crossed_v),
@@ -2095,9 +2246,14 @@ pub struct BrepSeamObjects<'b, O, B = &'b Brep> {
     face: O,
     surface: Option<O>,
     /// The notification records of the merge's edits (see [`MergeIntervalBrep`]).
-    records: BTreeMap<ObjectKey, Topology>,
+    records: crate::topology::topology::NotifyRecords,
     /// The attribute store of the merge's edits.
     attributes: AttributeStore,
+    /// The caller's notification environment of the merge's edits (its records,
+    /// attributes, context callbacks and identities), when the caller tracks them
+    /// ([`BrepSeamObjects::for_merge_notified`]); `None` keeps them in
+    /// [`Self::records`] / [`Self::attributes`] without context callbacks.
+    notify: Option<edge::NotifyEnv<'b>>,
 }
 
 impl<'b, O: LoopObject, B: FaceBrep> BrepSeamObjects<'b, O, B> {
@@ -2153,8 +2309,9 @@ impl<'b, O: LoopObject, B: FaceBrep> BrepSeamObjects<'b, O, B> {
             f,
             face: O::from_face(f).ok_or_else(no)?,
             surface,
-            records: BTreeMap::new(),
+            records: crate::topology::topology::NotifyRecords::new(),
             attributes: AttributeStore::default(),
+            notify: None,
         })
     }
 
@@ -2341,6 +2498,23 @@ impl<'b, O: LoopObject> BrepSeamObjects<'b, O, &'b mut Brep> {
     pub fn for_merge(b: &'b mut Brep, f: FaceId) -> Result<Self> {
         Self::build(None, b, f)
     }
+
+    /// [`Self::for_merge`] notifying the merge's edits through `notify` (upstream's
+    /// `SmObject::Notify` reaches the context's system callback, e.g. a healer's
+    /// `SmTrackTopologyChanges`), under `notify`'s identities.
+    ///
+    /// # Errors
+    ///
+    /// As [`BrepSeamObjects::new`].
+    pub fn for_merge_notified(
+        b: &'b mut Brep,
+        f: FaceId,
+        notify: edge::NotifyEnv<'b>,
+    ) -> Result<Self> {
+        let mut objects = Self::build(None, b, f)?;
+        objects.notify = Some(notify);
+        Ok(objects)
+    }
 }
 
 /// The face's own B-rep for every topology handle: `MergeIntervals` edits the
@@ -2365,11 +2539,19 @@ impl<O: LoopObject> MergeIntervalBrep<O> for BrepSeamObjects<'_, O, &mut Brep> {
                 EntityRef::Face(x) if x == f => face,
                 _ => O::from_topology(e).unwrap_or(face),
             }),
-            notifications: edge::NotifyEnv {
-                records: &mut self.records,
-                attributes: &mut self.attributes,
-                context: None,
-                key_of: &loopuse::notify_ref,
+            notifications: match self.notify.as_mut() {
+                Some(n) => edge::NotifyEnv {
+                    records: &mut *n.records,
+                    attributes: &mut *n.attributes,
+                    context: n.context.as_deref_mut(),
+                    key_of: n.key_of,
+                },
+                None => edge::NotifyEnv {
+                    records: &mut self.records,
+                    attributes: &mut self.attributes,
+                    context: None,
+                    key_of: &loopuse::notify_ref,
+                },
             },
             curve_ref: &merge_curve_ref,
         })
@@ -2424,6 +2606,104 @@ pub(crate) fn has_seam_problem_in_brep_cached<O: LoopObject>(
 ) -> Result<SeamCheck<O>> {
     let objects = BrepSeamObjects::new(k, b, f)?;
     has_seam_problem_cached(k, b, f, &objects, opts, cache)
+}
+
+// ---- AssertValid helpers (sm_GetLoopSampleUVPoint, sm_AssertTestFace37) -------------------
+
+/// `sm_GetLoopSampleUVPoint(pLoop, rUVPoint)` (file static of `SmFace.cpp`): the UV
+/// point at the middle (`NormalizedEvaluate(0.5, TRUE, ..)`) of the first edge use of
+/// the loop that evaluates; `None` for a vertex loop and a loop whose edge uses all
+/// fail (a missing UV trim curve is made, as upstream).
+///
+/// # Errors
+///
+/// [`SolidError::NotFound`] for a dangling id; those of the loop's edge-use walk;
+/// [`SolidError::Unported`] from the evaluation (its other failures move on to the next
+/// edge use, as upstream).
+fn loop_sample_uv_point(k: &Kernel, b: &mut Brep, l: LoopId) -> Result<Option<Point2>> {
+    let edgeuses = match b.loop_(l)?.loopuse {
+        Some(lu) => eu1::loopuse_edgeuses(b, lu)?,
+        None => Vec::new(),
+    };
+    for eu in edgeuses {
+        match eu3::normalized_evaluate(k, b, eu, 0.5, true, false, true) {
+            Ok(e) => return Ok(Some(Point2::new(e.point.x, e.point.y))),
+            Err(e) if e.is_unported() => return Err(e),
+            Err(_) => (),
+        }
+    }
+
+    // arrive here for VertexLoops and Loops with no usable UVTrimCurve
+    Ok(None)
+}
+
+/// `sm_AssertTestFace37(pFace)` (`SmFace::AssertValid` test 37): whether every inner
+/// loop of the face lies inside its outer loop (the first loop) and outside every other
+/// inner loop, judged at one sample UV point per inner loop ([`loop_sample_uv_point`])
+/// with `SmLoop::ContainsUVPoint` to the face tolerance mapped to UV. An inner loop
+/// outside or on the boundary of the outer loop, or inside another inner loop, fails;
+/// a face with fewer than two loops, an inner loop without a sample point and an
+/// unknown containment pass.
+///
+/// # Errors
+///
+/// [`SolidError::NotFound`] for a dangling id; [`SolidError::InvalidInput`] for a face
+/// without surface that has a sampled inner loop (upstream dereferences null); those
+/// of [`crate::query::loop::contains_uv_point`] and `MapTo2d`.
+pub fn assert_test_face37(k: &Kernel, b: &mut Brep, f: FaceId) -> Result<bool> {
+    use crate::geom::point_set::PointContainment;
+    use crate::query::r#loop::contains_uv_point;
+
+    // locals
+    let loops = super::p2::loops(b, f, false, None)?;
+    let num_loops = loops.len();
+
+    // no work - a Face with fewer than 2 Loops has no nesting to check
+    if num_loops < 2 {
+        return Ok(true);
+    }
+
+    // the OuterLoop is the first Loop in the Faceuse Loopuse list
+    let Some(&outer_loop) = loops.first() else {
+        return Ok(true);
+    };
+
+    let zone_tol_3d = super::p2::tolerance(b, f)?;
+
+    // for every InnerLoop
+    for (ii, &inner_loop) in loops.iter().enumerate().skip(1) {
+        let Some(sample_uv) = loop_sample_uv_point(k, b, inner_loop)? else {
+            continue; // inconclusive - nothing to classify
+        };
+
+        let uv_tol = {
+            let surface = b.face(f)?.surface.as_ref().ok_or_else(|| {
+                SolidError::invalid_input(OP, "AssertTestFace37: face without surface")
+            })?;
+            crate::surface::surface::p1::map_to_2d(k, zone_tol_3d, sample_uv, surface)?
+        };
+
+        // every InnerLoop must lie inside the OuterLoop
+        let containment = contains_uv_point(k, b, outer_loop, None, sample_uv, uv_tol)?.containment;
+        if containment == PointContainment::Outside || containment == PointContainment::OnBoundary {
+            return Ok(false);
+        }
+
+        // no InnerLoop may lie inside another InnerLoop
+        for (jj, &other) in loops.iter().enumerate().skip(1) {
+            if jj == ii {
+                continue;
+            }
+            if contains_uv_point(k, b, other, None, sample_uv, uv_tol)?.containment
+                == PointContainment::Inside
+            {
+                return Ok(false);
+            }
+        }
+    }
+
+    // arrive here when all InnerLoops are properly nested
+    Ok(true)
 }
 
 #[cfg(test)]

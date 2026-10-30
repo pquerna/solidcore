@@ -25,8 +25,15 @@
 //! `PiecewiseMerge` ends on an error of its first `IntersectInsertRelate` (SolidCraft
 //! fix, tangency-labs/smlib af8db37, UB-242), where upstream ignores the status and
 //! goes on with half-imprinted B-reps.
-//! `BooleanLists` slices surface copies to base `SmSurface` upstream (WR-196); the missing
-//! base-only constructor branch is deferred to partial `surface.surface_p1`.
+//! `BooleanLists` copies its surface operands with the base copy constructor, which slices
+//! every derived surface to a geometry-less `SmSurface` (WR-196). The `Surface` enum has no
+//! geometry-less kind, so that copy is its own type here ([`BaseSlicedSurface`]) with the
+//! base virtual defaults the list path reaches on it: `GetNaturalUVDomain` is the zero
+//! extent and `CreateFaceFromSurface` fails at the base `Evaluate` / `EvaluatePoint` with
+//! `SM_ERR`, so a surface list fails as upstream's does and the planar 2D path is never
+//! taken. `Kernel::fixes.boolean_lists_virtual_surface_copies` copies with the virtual
+//! `Copy` instead (the function's documented intent); the planar outputs are then virtual
+//! copies too. The sliced copy's `SM_NO_CONSTRUCTION` notification has no arena counterpart.
 //! Component-copy notifications use caller-owned records/attributes through
 //! `boolean_lists_with_notifications`; the arena-only entry passes an arena-only
 //! notification store (default topology records, no attributes), because the arena
@@ -50,7 +57,9 @@ use crate::geom::context::{with_mark_lock, MarkLock, ALL_MARKS};
 use crate::geom::extent2d::Extent2d;
 use crate::geom::tol::Relation;
 use crate::kernel::Kernel;
-use crate::surface::surface::{Surface, SurfaceKind};
+use crate::math::EFF_ZERO;
+use crate::surface::surface::p2::PLANE_TYPE;
+use crate::surface::surface::Surface;
 use crate::topology::brep::{p1 as bp, p7 as bp7};
 use crate::topology::proto_topology::p1::CopyBrepMap;
 use crate::topology::topology_traverser::{collect_faces, Marks};
@@ -161,6 +170,77 @@ impl MergeEngine {
                     crate::boolean::merge::p4::adopt_namespace_owners(body, namespace, is_other)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// (not upstream: upstream's attributes stay on the operands' objects, which the
+    /// merge edits in place.) Moves each operand's own attributes
+    /// ([`Brep::add_attribute`]) into the engine's store under the merge's names of
+    /// their objects, so the merge's notifications propagate them with SMLib's
+    /// handlers. Pair with [`Self::restore_operand_attributes`].
+    ///
+    /// # Errors
+    /// [`SolidError::InvalidInput`] for an engine using the caller's identities (it has
+    /// no names of its own for the operands) or an attribute list whose key names no
+    /// object.
+    pub fn seed_operand_attributes(
+        &mut self,
+        primary: Option<&mut Brep>,
+        other: Option<&mut Brep>,
+    ) -> Result<()> {
+        const SEED: &str = "boolean::merge::p3::MergeEngine::seed_operand_attributes";
+        let namespace = self
+            .intersector
+            .namespace()
+            .ok_or(SolidError::invalid_input(
+                SEED,
+                "the engine names no operand objects",
+            ))?;
+        for (body, is_other) in [(primary, false), (other, true)] {
+            let Some(body) = body else { continue };
+            let store = body.take_attributes();
+            self.attributes.absorb(store, &|key| {
+                crate::topology::loopuse::entity_of_notify_key(key)
+                    .map(|e| {
+                        crate::boolean::merge::p4::notification_key(namespace, is_other, e).key
+                    })
+                    .ok_or(SolidError::invalid_input(
+                        SEED,
+                        "attribute list names no object",
+                    ))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// (not upstream) Hands the engine's attributes back to the B-reps the merge
+    /// leaves: each live object of `result` (the primary slot's arena) and of a kept
+    /// `other` gets the attribute list the merge's notifications left on it; every other
+    /// object's list (an object the merge deleted, or of the other operand when it is
+    /// consumed) is cleared as upstream's object destructor does. A reference attribute
+    /// on objects of both returned B-reps becomes one attribute per B-rep.
+    ///
+    /// # Errors
+    /// None in practice.
+    pub fn restore_operand_attributes(
+        &mut self,
+        result: Option<&mut Brep>,
+        other: Option<&mut Brep>,
+    ) -> Result<()> {
+        let Some(namespace) = self.intersector.namespace() else {
+            return Ok(());
+        };
+        for (body, is_other) in [(result, false), (other, true)] {
+            let Some(body) = body else { continue };
+            let mut store = self.attributes.clone();
+            let live = &*body;
+            store.retain_rekeyed(&|key| {
+                crate::boolean::merge::p4::entity_of_notification_key(namespace, key)
+                    .filter(|&(o, e)| o == is_other && live.is_live_entity(e))
+                    .map(|(_, e)| crate::topology::loopuse::notify_ref(e).key)
+            })?;
+            body.set_attributes(store);
         }
         Ok(())
     }
@@ -327,7 +407,12 @@ pub fn boolean_trees<D: BooleanDriver>(
                 .map_err(|e| {
                     // undefined behaviour the port detects (InvalidInput) keeps its
                     // error, as Unported does
-                    if e.is_unported() || matches!(e, SolidError::InvalidInput { .. }) {
+                    if e.is_unported()
+                        || matches!(
+                            e,
+                            SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }
+                        )
+                    {
                         e
                     } else {
                         SolidError::sm_err(OP)
@@ -706,16 +791,73 @@ fn create_face_from_surface(
     crate::topology::brep::p8::create_face_from_surface(k, brep, Some(surface), &domain, &mut fenv)
 }
 
-fn copy_base_surface(_k: &mut Kernel, _source: &Surface) -> Result<Surface> {
-    // WR-196: BooleanLists invokes the BASE copy constructor, slicing derived
-    // geometry. SurfaceKind currently has no base-only SmSurface variant. This
-    // is a missing branch of the partial surface_p1 constructor port; virtual
-    // Surface::copy would silently retain geometry that upstream discards.
-    // UNPORTED(surface.surface_p1): SmSurface::SmSurface(copy, sliced base)
-    Err(SolidError::unported(
-        "SmSurface::SmSurface(copy, sliced base)",
-        "surface.surface_p1",
-    ))
+/// A surface copied by the base copy constructor `SmSurface::SmSurface(const SmSurface&)`
+/// as `BooleanLists` does (`new (*pContext) SmSurface(*pOrig)`, WR-196): `SmAObject`'s
+/// attributes and an empty owner slot, no geometry. The `Surface` enum has no
+/// geometry-less kind, so this type carries the base virtual defaults the list path reaches
+/// on such a copy.
+#[derive(Debug, Clone, Copy)]
+struct BaseSlicedSurface;
+
+impl BaseSlicedSurface {
+    /// The base copy constructor: nothing of `source` the list path can observe survives
+    /// (the attributes it copies have no arena-only counterpart).
+    const fn copy_of(_source: &Surface) -> Self {
+        Self
+    }
+
+    /// `SmSurface::GetNaturalUVDomain`'s base default: `ERR(SM_ERR)` (logged) and the zero
+    /// extent `[(0, 0), (0, 0)]`.
+    const fn natural_uv_domain() -> Extent2d {
+        Extent2d::from_bounds(0.0, 0.0, 0.0, 0.0)
+    }
+
+    /// `IsKindOf(SmPlane_TYPE)` of the base class: only `SmSurface_TYPE` and its bases.
+    fn is_plane() -> bool {
+        crate::surface::surface::p2::is_kind_of(PLANE_TYPE)
+    }
+}
+
+/// `SmBrep::CreateFaceFromSurface(pSurfaceCopy, pSurfaceCopy->GetNaturalUVDomain(), pFace)`
+/// on a [`BaseSlicedSurface`], as upstream's `CreateFaceInRegionFromSurface` runs it: the
+/// surface is not null; `uv_domain` (the zero extent) is contained by the zero natural
+/// domain within `SM_EFF_ZERO`; `CreateNaturalUVTrimCurves` then asks the base
+/// `CreateIsoParametricCurve` for the minimum-`u` side, whose `IsSingularity` fails its
+/// `EvaluateSimple` at the base `Evaluate` (`SM_ERR`, which that `SmBoolean` function's
+/// `SER` returns as a nonzero "singular"), so the singular branch's base `EvaluatePoint`
+/// returns `SM_ERR` through every `SER` to the caller. No face is made and the B-rep is
+/// left as it was (`m_bEditingEnabled` is restored).
+///
+/// # Errors
+///
+/// `SM_ERR`, always, as upstream.
+fn create_face_from_base_sliced_surface(
+    _surface: BaseSlicedSurface,
+    uv_domain: &Extent2d,
+) -> Result<FaceId> {
+    // check input - crUVDomain contained within the pSurface->GetNaturalUVDomain()
+    if !uv_domain.is_contained_by(&BaseSlicedSurface::natural_uv_domain(), EFF_ZERO) {
+        return Err(SolidError::sm_err(OP));
+    }
+    // SER(pSurface->CreateNaturalUVTrimCurves(...)): the minimum-u side's
+    // CreateIsoParametricCurve -> IsSingularity -> EvaluateSimple -> Evaluate (base:
+    // SM_ERR, so "singular") -> SER(EvaluatePoint(sUV, sPnt)) (base: SM_ERR)
+    Err(SolidError::sm_err(OP))
+}
+
+/// `new (*pContext) SmSurface(*pSurface)` for an output surface of the planar path. That
+/// path is reached only with `Kernel::fixes.boolean_lists_virtual_surface_copies` (a
+/// base-sliced input never makes a face), so the output copies are virtual copies too;
+/// upstream's sliced output copies would carry no geometry.
+fn copy_list_surface(k: &Kernel, surface: &Surface) -> Result<Surface> {
+    if k.fixes.boolean_lists_virtual_surface_copies {
+        surface.copy(k)
+    } else {
+        Err(SolidError::invalid_input(
+            OP,
+            "planar list outputs need boolean_lists_virtual_surface_copies (WR-196)",
+        ))
+    }
 }
 
 fn stitch_and_orient(
@@ -815,12 +957,25 @@ fn list_operand(k: &mut Kernel, breps: &[Brep], surfaces: &[Surface]) -> Result<
             None,
         )?;
         let mut planar = false;
+        // surfaces, make into single brep with multiple faces.
         for source in surfaces {
-            let copy = copy_base_surface(k, source)?;
-            // Upstream records ONLY the last surface's kind.
-            planar = matches!(copy.kind(), SurfaceKind::Plane(_));
-            let domain = copy.natural_uv_domain_with_nurb(k)?;
-            create_face_from_surface(k, &mut result, copy, domain)?;
+            // Upstream records ONLY the last surface's kind ("we hope they are all the
+            // same").
+            planar = if k.fixes.boolean_lists_virtual_surface_copies {
+                // the virtual Copy: the derived surface, its natural domain and its kind
+                let copy = source.copy(k)?;
+                let is_plane = copy.is_kind_of(PLANE_TYPE)?;
+                let domain = copy.natural_uv_domain_with_nurb(k)?;
+                create_face_from_surface(k, &mut result, copy, domain)?;
+                is_plane
+            } else {
+                // new (*pContext) SmSurface(*pOrig): the base copy constructor slices the
+                // surface (WR-196); the face creation fails on the copy
+                let copy = BaseSlicedSurface::copy_of(source);
+                let domain = BaseSlicedSurface::natural_uv_domain();
+                create_face_from_base_sliced_surface(copy, &domain)?;
+                BaseSlicedSurface::is_plane()
+            };
         }
         (result, planar)
     };
@@ -910,7 +1065,7 @@ pub fn boolean_lists_with_notifications(
     let mut output = BooleanListsResult::default();
     if both_planar {
         for surface in bp::surfaces(&result, None)? {
-            output.surfaces.push(copy_base_surface(k, surface)?);
+            output.surfaces.push(copy_list_surface(k, surface)?);
         }
     } else {
         let region = result
@@ -1216,20 +1371,121 @@ mod tests {
         assert!(!kernel.context.doing_boolean());
     }
 
+    /// The bounded unit-square plane `z = height` (`SmPlane(origin, X, Y, scale, domain)`).
+    fn square_plane(height: f64) -> Surface {
+        Surface::from(crate::surface::plane::Plane::new(
+            crate::math::Vec3::new(0.0, 0.0, height),
+            crate::math::Vec3::new(1.0, 0.0, 0.0),
+            crate::math::Vec3::new(0.0, 1.0, 0.0),
+            crate::math::Vec2::new(1.0, 1.0),
+            &Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
+        ))
+    }
+
+    /// Upstream's base copy constructor slices every surface operand (WR-196): the copy
+    /// has no geometry, `CreateFaceFromSurface` fails on it with `SM_ERR`, and so does the
+    /// whole call, before the operation is looked at; a list with B-reps never reads its
+    /// surfaces.
     #[test]
-    fn surface_list_makes_the_native_empty_brep_then_stops_at_the_surface_copy() {
+    fn surface_list_makes_the_native_empty_brep_then_fails_on_the_sliced_copy() {
         let mut k = Kernel::default();
         k.tolerances.zone_tol_3d = 0.002;
-        let surface = Surface::from(crate::surface::plane::Plane::from_normal(
+        let sliced = |result: Result<(Brep, bool)>| {
+            assert!(
+                matches!(
+                    result,
+                    Err(SolidError::Upstream {
+                        operation: OP,
+                        code: crate::error::SM_ERR,
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+        };
+        sliced(list_operand(&mut k, &[], &[square_plane(0.0)]));
+        let infinite = Surface::from(crate::surface::plane::Plane::from_normal(
             crate::math::Vec3::ZERO,
             crate::math::Vec3::new(0.0, 0.0, 1.0),
         ));
+        sliced(list_operand(&mut k, &[], &[infinite, square_plane(1.0)]));
+        // the base copy's checks: the zero domain is contained by the zero natural domain
+        assert!(BaseSlicedSurface::natural_uv_domain()
+            .is_contained_by(&BaseSlicedSurface::natural_uv_domain(), EFF_ZERO));
+        assert!(!BaseSlicedSurface::is_plane());
+        // the whole call: list 1 fails first, even for an operation BooleanLists rejects
+        let result = boolean_lists(
+            &mut k,
+            &[],
+            &[square_plane(0.0)],
+            &[],
+            &[square_plane(1.0)],
+            -1,
+            None,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(SolidError::Upstream {
+                    operation: OP,
+                    code: crate::error::SM_ERR,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        // a list with a B-rep ignores its surfaces
+        let (brep, planar) = list_operand(&mut k, &[Brep::new()], &[square_plane(0.0)]).unwrap();
+        assert!(!planar);
+        assert!(bp::faces(&brep, None).unwrap().is_empty());
+    }
+
+    /// `Kernel::fixes.boolean_lists_virtual_surface_copies`: the operands are copied with
+    /// the virtual `Copy`, so each surface makes a face over its natural domain and a list
+    /// of planes is recognised as planar (the function's documented intent).
+    #[test]
+    fn virtual_surface_copies_make_faces_and_recognise_planes() {
+        let mut k = Kernel::default();
+        k.fixes.boolean_lists_virtual_surface_copies = true;
+        let (brep, planar) =
+            list_operand(&mut k, &[], &[square_plane(0.0), square_plane(2.0)]).unwrap();
+        assert!(planar);
+        assert_eq!(bp::faces(&brep, None).unwrap().len(), 2);
+        // the last surface's kind decides (upstream: "we hope they are all the same")
+        let sphere = Surface::from(
+            crate::surface::sphere::Sphere::new(
+                &k,
+                crate::math::Vec3::ZERO,
+                crate::math::Vec3::new(1.0, 0.0, 0.0),
+                crate::math::Vec3::new(0.0, 1.0, 0.0),
+                Extent2d::from_bounds(0.0, -90.0, 360.0, 90.0),
+                1.0,
+                crate::surface::sphere::SphereOptions {
+                    swap_uv: false,
+                    inside_out: false,
+                    circle_nurb: None,
+                },
+            )
+            .unwrap(),
+        );
+        let (brep, planar) = list_operand(&mut k, &[], &[square_plane(0.0), sphere]).unwrap();
+        assert!(!planar);
+        assert_eq!(bp::faces(&brep, None).unwrap().len(), 2);
+        // the planar outputs are virtual copies too; without the flag they cannot be made
+        let (brep, _) = list_operand(&mut k, &[], &[square_plane(0.0)]).unwrap();
+        let surface = bp::surfaces(&brep, None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(copy_list_surface(&k, surface)
+            .unwrap()
+            .is_kind_of(PLANE_TYPE)
+            .unwrap());
+        k.fixes.boolean_lists_virtual_surface_copies = false;
         assert!(matches!(
-            list_operand(&mut k, &[], &[surface]),
-            Err(SolidError::Unported {
-                upstream: "SmSurface::SmSurface(copy, sliced base)",
-                unit: "surface.surface_p1",
-            })
+            copy_list_surface(&k, surface),
+            Err(SolidError::InvalidInput { operation: OP, .. })
         ));
     }
 

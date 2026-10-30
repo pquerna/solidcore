@@ -47,8 +47,6 @@ use solidcore::topology::proto_topology::p1::CopyBrepMap;
 use solidcore::topology::{edge, Brep, EdgeId, EdgeuseId};
 use solidcore::{Result as SolidResult, SolidError};
 use solidcore_ffi::units::blend_fillet_executive_p2::{self as ffi, Op};
-use solidcore_ffi::units::heal_stitch_p2 as stitch_ffi;
-use solidcore_ffi::units::topology_brep_p1::counts;
 
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
 
@@ -64,11 +62,6 @@ const NULL_DEREF: f64 = -2.0;
 
 /// The box has fewer than 12 edges (`-4 n_edges`): no op runs on either side.
 const SHORT_BOX: f64 = -4.0;
-
-/// `SmPlane_TYPE`; `SmLine_TYPE`: the geometry of an `SmApiCreateBox` box, which the
-/// export carries exactly.
-const BOX_SURFACE: i64 = 15011;
-const BOX_CURVE: i64 = 14010;
 
 // ---- inputs -----------------------------------------------------------------------------
 
@@ -441,8 +434,18 @@ impl ExecutiveAccess<Handle> for Access {
         if let std::collections::btree_map::Entry::Vacant(entry) = self.edge_caches.entry(id) {
             // The cache manager returns null on construction failure; LoadFilletSolver
             // applies NER to that pointer after GetKnots has succeeded.
-            let cache = solidcore::curve::curve::p5::make_curve_cache(k, curve, Some(edge))
-                .map_err(|error| {
+            // the cache is the edge curve's own: its tolerance is the edge's
+            let zone_tol_3d = edge::tolerance(
+                self.breps.first().ok_or_else(missing_error)?,
+                id,
+            )?;
+            let cache = solidcore::curve::curve::p5::make_curve_cache_with_zone_tol(
+                k,
+                curve,
+                Some(edge),
+                Some(zone_tol_3d),
+            )
+            .map_err(|error| {
                     if error.is_unported() {
                         error
                     } else {
@@ -1441,33 +1444,24 @@ fn law_elliptic(
     values_output(o)
 }
 
-/// The box B-rep (index 0), or the deferral of an inexact import.
+/// The box B-rep (index 0): `SmApiCreateBox(P, l, w, h)` (the `heal.stitch_p2` shim's
+/// box block) made by the Rust kernel in the shim's traversal order
+/// ([`crate::own_builder`]), or the output of a failed build. No C++ state reaches the
+/// Rust side.
 fn box_access(bx: &BoxIn) -> Result<Result<Access, Output>, HarnessError> {
-    let mut block = vec![2.0];
-    push_box(&mut block, bx);
-    let ex = stitch_ffi::eval(stitch_ffi::Op::Export, "", &block)
-        .map_err(|e| harness(format!("c++ export: {e}")))?;
-    let Some((_, graph_at)) = counts(&ex) else {
-        return Ok(Err(Output::err(format!(
-            "brep_build_status_{}",
-            ex.get(1).copied().unwrap_or(0.0)
-        ))));
+    use crate::own_builder::{build, Built};
+    let src = super::topology_edgeuse_p1::BrepIn::Box {
+        origin: bx.origin,
+        size: bx.size,
     };
-    let (b, types) = super::topology_brep_p1::import(&ex, graph_at)?;
+    let b = match build(&mut Kernel::default(), &src, false, false)? {
+        Some(Built::Brep(b)) => *b,
+        Some(Built::Failed(e)) => return Ok(Err(crate::own_builder::failed_output(&e))),
+        None => return Err(harness("box source not built")),
+    };
     if b.edges().len() != ffi::BOX_EDGES {
         // The shim reports the same box as `-4 n_edges`.
         return Ok(Err(Output::err("box_edge_count")));
-    }
-    if types
-        .face_surface_types
-        .iter()
-        .any(|&t| t >= 0 && t != BOX_SURFACE)
-        || types
-            .edge_curve_types
-            .iter()
-            .any(|&t| t >= 0 && t != BOX_CURVE)
-    {
-        return Err(harness("box geometry is not planes and lines"));
     }
     Ok(Ok(Access {
         breps: vec![b],
@@ -1513,6 +1507,8 @@ fn executive(target: Option<Handle>) -> FilletExecutive<Handle> {
         vertex_corner_map: BTreeMap::new(),
         edgeuse_solver_map: BTreeMap::new(),
         self_intersection_handler: None,
+        blend_curve_at_thirds: false,
+        mark_corner_patches: false,
     };
     executive.intersector.ignore_tangency = true;
     executive
@@ -1565,8 +1561,15 @@ fn set_params(
         Ok(a) => a,
         Err(o) => return Ok(o),
     };
+    // the shim drops an index past the box's edges
+    let edge_count = access
+        .brep(Handle::Brep(0))
+        .map_err(|e| harness(format!("box: {e}")))?
+        .edges()
+        .len();
     let edges: Vec<Handle> = edges
         .iter()
+        .filter(|&&e| e < edge_count)
         .map(|&e| Handle::Edge(EdgeId::from_index(e as u32)))
         .collect();
     let xsect_types = xsect_types

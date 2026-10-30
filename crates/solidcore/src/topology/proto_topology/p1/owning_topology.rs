@@ -57,7 +57,7 @@ pub trait OwningRecords: TopologyRecords {
 }
 
 /// A store without owning objects (plain topology records).
-impl OwningRecords for std::collections::BTreeMap<ObjectKey, Topology> {
+impl OwningRecords for crate::topology::topology::NotifyRecords {
     fn owning(&self, _key: ObjectKey) -> Option<OwningTopology> {
         None
     }
@@ -510,7 +510,9 @@ pub fn destroy_topology<R: OwningRecords + ?Sized>(records: &mut R, this: Object
         return Ok(());
     };
     let mut list = records.owning(owner).ok_or(broken_list(OP))?;
-    if let Err(e @ SolidError::InvalidInput { .. }) = list.remove(owner, records, this) {
+    if let Err(e @ (SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. })) =
+        list.remove(owner, records, this)
+    {
         return Err(e);
     }
     records.set_owning(owner, list).ok_or(broken_list(OP))?;

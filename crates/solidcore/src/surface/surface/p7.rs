@@ -37,10 +37,6 @@
 //! | [`good_drop_result`]                              | `sm_GoodDropResult` (static)                     |
 //!
 //! Deviations:
-//! - **Face tolerance of `IsPlanar`.** The B-spline, revolution and cone boxes are
-//!   expanded by the face tolerance the B-rep cached on the surface
-//!   ([`Surface::owner_zone_tol_3d`]). A face-owned surface without it returns
-//!   [`SolidError::Unported`] (`SmFace::GetTolerance`).
 //! - **Generic bodies.** The `SmSurface` bodies that only call the evaluation virtuals
 //!   (`Evaluate`, `EvaluatePoint`, `GetNaturalUVDomain`) are generic over
 //!   [`SurfaceEvaluate`], so a caller holding a bare [`BSplineSurface`] (which does not
@@ -72,6 +68,10 @@
 //!   (non-zero: `TRUE`) for a missing patch; `sm_GoodDropResult` compares the guess and
 //!   result distances with swapped names; `FindDegenParamForDirection` compares a
 //!   sample fraction with the parameter `dS`.
+//! - **Projection curve class.** `CreateParallelProjectionCurves` takes a [`Curve`] for
+//!   upstream's `const SmBSplineCurve&`; a curve outside the `SmBSplineCurve` classes
+//!   (B-spline, line, ellipse, hyperbola, parabola), which upstream's type rules out,
+//!   is `SM_ERR_INVALID_INPUT` before the sweep.
 //! - **`GlobalPointSolve_0`** takes the kernel and the surface's handle `surface: O`
 //!   (the cache's owner object and the solutions' object), as `GlobalLineIntersect`
 //!   does; it and `SmSPGlobalSolver::BranchMayContainAnswers` (which reads the cache
@@ -88,8 +88,8 @@
 //!   (`surface.surface_p1`; the solver constructors also hand over the caches holding
 //!   the patch data of tree nodes).
 
-use crate::curve::curve::Curve;
-use crate::error::{ignored, Result, SolidError};
+use crate::curve::curve::{Curve, CurveKind};
+use crate::error::{ignore_status, ignored, Result, SolidError};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent1d::ExtentNd;
 use crate::geom::extent2d::Extent2d;
@@ -239,7 +239,7 @@ pub fn base_evaluate_normal<S: SurfaceEvaluate + ?Sized>(
         }
     }
 
-    let uv_domain = surface.natural_uv_domain();
+    let uv_domain = surface.natural_uv_domain_with_nurb(k)?;
     let mut step = 1.0e-8;
 
     // First check for the parallel-derivatives case (the lengths of the
@@ -840,7 +840,8 @@ impl Surface {
 
     /// Whether the surface is planar within `tol_3d`, with a plane point, unit normal
     /// and the largest deviation seen (`IsPlanar`, virtual): a plane always is; the
-    /// others test the pseudo box of `CalculateBoundingBox` over the natural domain.
+    /// others test the pseudo box of `CalculateBoundingBox` over the natural domain,
+    /// not expanded by the zone tolerance.
     ///
     /// # Errors
     ///
@@ -849,6 +850,8 @@ impl Surface {
     /// of an offset surface's bounding box (its other failures are ignored, as
     /// upstream).
     pub fn is_planar(&self, k: &Kernel, tol_3d: f64) -> Result<Planar> {
+        // the unpadded box: the zone-tolerance padding made flat surfaces fail small
+        // tolerances
         match self.kind_with_nurb(k)? {
             SurfaceKind::Plane(p) => {
                 let (point, normal, deviation) = p.is_planar();
@@ -860,53 +863,31 @@ impl Surface {
                 })
             }
             SurfaceKind::BSpline(s) => {
-                // the box expansion uses the owning face's tolerance, as cached on the
-                // surface by its B-rep (UNPORTED(topology.face_p2): SmFace::GetTolerance
-                // for a bare face handle without it)
-                let face_tol = self.face_zone_tol_3d()?;
+                Ok(planar_of(k, s, &self.natural_uv_domain_with_nurb(k)?)?.is_planar(tol_3d))
+            }
+            // SmSurfOfRevolution (and SmCone, SmSphere, SmTorus) inherit
+            // SmBSplineSurface::CalculateBoundingBox
+            SurfaceKind::Cone(s) => {
                 Ok(
-                    planar_of(k, s, &self.natural_uv_domain_with_nurb(k)?, face_tol)?
+                    planar_of(k, s.rev().base(), &self.natural_uv_domain_with_nurb(k)?)?
                         .is_planar(tol_3d),
                 )
             }
-            // SmSurfOfRevolution (and SmCone, SmSphere, SmTorus) inherit
-            // SmBSplineSurface::CalculateBoundingBox:
-            // the face's cached tolerance, as for the B-spline (UNPORTED(topology.face_p2):
-            // SmFace::GetTolerance for a bare face handle without it)
-            SurfaceKind::Cone(s) => {
-                let face_tol = self.face_zone_tol_3d()?;
-                Ok(planar_of(
-                    k,
-                    s.rev().base(),
-                    &self.natural_uv_domain_with_nurb(k)?,
-                    face_tol,
-                )?
-                .is_planar(tol_3d))
-            }
             SurfaceKind::Sphere(s) => {
-                let face_tol = self.face_zone_tol_3d()?;
-                Ok(planar_of(
-                    k,
-                    s.base().base(),
-                    &self.natural_uv_domain_with_nurb(k)?,
-                    face_tol,
-                )?
-                .is_planar(tol_3d))
+                Ok(
+                    planar_of(k, s.base().base(), &self.natural_uv_domain_with_nurb(k)?)?
+                        .is_planar(tol_3d),
+                )
             }
             SurfaceKind::Torus(s) => {
-                let face_tol = self.face_zone_tol_3d()?;
-                Ok(planar_of(
-                    k,
-                    s.base().base(),
-                    &self.natural_uv_domain_with_nurb(k)?,
-                    face_tol,
-                )?
-                .is_planar(tol_3d))
+                Ok(
+                    planar_of(k, s.base().base(), &self.natural_uv_domain_with_nurb(k)?)?
+                        .is_planar(tol_3d),
+                )
             }
             SurfaceKind::SurfOfRevolution(s) => {
-                let face_tol = self.face_zone_tol_3d()?;
                 Ok(
-                    planar_of(k, s.base(), &self.natural_uv_domain_with_nurb(k)?, face_tol)?
+                    planar_of(k, s.base(), &self.natural_uv_domain_with_nurb(k)?)?
                         .is_planar(tol_3d),
                 )
             }
@@ -914,12 +895,8 @@ impl Surface {
             // (`CalculateBoundingBox`'s `GetOrCreateGwNurbPointer` makes a recognised
             // extrusion's NURB)
             SurfaceKind::SurfOfExtrusion(s) => {
-                let face_tol = self.face_zone_tol_3d()?;
                 let base = s.base_with_nurb(k)?;
-                Ok(
-                    planar_of(k, &base, &self.natural_uv_domain_with_nurb(k)?, face_tol)?
-                        .is_planar(tol_3d),
-                )
+                Ok(planar_of(k, &base, &self.natural_uv_domain_with_nurb(k)?)?.is_planar(tol_3d))
             }
             // SmSurface body: use the virtual box and ignore ordinary failures,
             // which leave the default pseudo box. The kernel is available here.
@@ -931,7 +908,7 @@ impl Surface {
                     k,
                     &self.natural_uv_domain_with_nurb(k)?,
                     [false, true, false],
-                    true,
+                    false,
                 ))?
                 .and_then(|b| b.pseudo_box)
                 .unwrap_or_else(PseudoBox::new);
@@ -952,6 +929,9 @@ impl Surface {
             return Ok(None);
         }
         // UNPORTED(topology.face_p4): SmFace::GetBrep
+        // Proof (unreachable): no library caller; a surface's owner is an `ObjectRef`
+        // key, which cannot reach the face's arena. Code holding the face holds its
+        // `Brep` (the arena is the B-rep), so it never asks the surface.
         Err(SolidError::unported("SmFace::GetBrep", "topology.face_p4"))
     }
 
@@ -1401,10 +1381,11 @@ impl Surface {
         if let Some(context) = context.as_deref() {
             gs.face_queries = context.face_queries();
         }
+        let domain = self.natural_uv_domain_with_nurb(k)?;
         gs.operands = Some(SolveOperands {
             operands: [
                 handles[0].map(|h| (h, OperandDomain::Curve(curve.natural_interval()))),
-                handles[1].map(|h| (h, OperandDomain::Surface(self.natural_uv_domain()))),
+                handles[1].map(|h| (h, OperandDomain::Surface(domain))),
             ],
         });
 
@@ -1590,10 +1571,14 @@ impl Surface {
         if let Some(context) = context.as_deref() {
             gs.face_queries = context.face_queries();
         }
+        let (domain, other_domain) = (
+            self.natural_uv_domain_with_nurb(k)?,
+            other.natural_uv_domain_with_nurb(k)?,
+        );
         gs.operands = Some(SolveOperands {
             operands: [
-                handles[0].map(|h| (h, OperandDomain::Surface(self.natural_uv_domain()))),
-                handles[1].map(|h| (h, OperandDomain::Surface(other.natural_uv_domain()))),
+                handles[0].map(|h| (h, OperandDomain::Surface(domain))),
+                handles[1].map(|h| (h, OperandDomain::Surface(other_domain))),
             ],
         });
 
@@ -1717,19 +1702,22 @@ impl Surface {
     /// between the curve's and the surface's boxes, the sweep then moved back by half
     /// to run both ways), through `SmAdvSurfaceIntersector::DoIntersection`. Returns
     /// the 3D curves and their UV curves on this surface (`None` for a `NULL` entry).
-    /// The surface and curve continuity checks only report.
+    /// The surface and curve continuity checks only report. `curve` is one of the
+    /// `SmBSplineCurve` classes (B-spline, line, ellipse, hyperbola, parabola): its
+    /// continuities, box and natural interval dispatch as upstream's virtuals, and the
+    /// sweep uses its NURB.
     ///
     /// # Errors
     ///
-    /// `SM_ERR_INVALID_INPUT` for a zero projection vector; `SM_ERR_NULL_POINTER`
-    /// without a surface cache; those of the continuities, the boxes, the sweep, its
-    /// move and the intersection; [`SolidError::Unported`] from unported callees of the
-    /// surface cache and the intersector.
+    /// `SM_ERR_INVALID_INPUT` for a zero projection vector or a curve of another class;
+    /// `SM_ERR_NULL_POINTER` without a surface cache; those of the continuities, the
+    /// boxes, the sweep, its move and the intersection; [`SolidError::Unported`] from
+    /// unported callees of the surface cache and the intersector.
     pub fn create_parallel_projection_curves(
         &self,
         k: &Kernel,
         uv_domain: &Extent2d,
-        curve: &BSplineCurve,
+        curve: &Curve,
         projection_vector: Vec3,
         opt_projection_distance: Option<f64>,
         opt_approx_tol_3d: Option<f64>,
@@ -1761,7 +1749,7 @@ impl Surface {
         &self,
         k: &Kernel,
         uv_domain: &Extent2d,
-        curve: &BSplineCurve,
+        curve: &Curve,
         projection_vector: Vec3,
         opt_projection_distance: Option<f64>,
         opt_approx_tol_3d: Option<f64>,
@@ -1786,7 +1774,7 @@ impl Surface {
         &self,
         k: &Kernel,
         uv_domain: &Extent2d,
-        curve: &BSplineCurve,
+        curve: &Curve,
         projection_vector: Vec3,
         opt_projection_distance: Option<f64>,
         opt_approx_tol_3d: Option<f64>,
@@ -1839,7 +1827,7 @@ impl Surface {
                 polar: false,
             };
             let curve_box = curve
-                .calculate_bounding_box(&curve.natural_interval(), req)?
+                .calculate_bounding_box(k, &curve.natural_interval(), req, true)?
                 .normal
                 .unwrap_or_default();
             4.0 * curve_box.max_distance(&surf_box)
@@ -1848,8 +1836,32 @@ impl Surface {
         // sweep vector
         let sweep_vec = projection_vector.unitize()? * projection_distance;
 
-        // swept surface
-        let mut sweep_curve = curve.clone();
+        // swept surface (`const SmBSplineCurve&`: the class's NURB)
+        // (the analytic classes' own NURB, swept exactly with no knot fix-up; when it is
+        // missing, their virtual MakeNurb makes it on a copy)
+        let mut sweep_curve: BSplineCurve = match curve.kind() {
+            CurveKind::BSpline(c) => c.clone_exact(),
+            CurveKind::Line(c) => c.base_with_nurb()?.clone_exact(),
+            CurveKind::Ellipse(c) if c.base().gw_nurb().is_some() => c.base().clone_exact(),
+            CurveKind::Ellipse(c) => {
+                let mut c = c.clone();
+                ignore_status(c.make_nurb(k))?;
+                c.base().clone_exact()
+            }
+            CurveKind::Hyperbola(c) if c.base().gw_nurb().is_some() => c.base().clone_exact(),
+            CurveKind::Hyperbola(c) => {
+                let mut c = c.clone();
+                ignore_status(c.make_nurb(None))?;
+                c.base().clone_exact()
+            }
+            CurveKind::Parabola(c) if c.base().gw_nurb().is_some() => c.base().clone_exact(),
+            CurveKind::Parabola(c) => {
+                let mut c = c.clone();
+                ignore_status(c.make_nurb(None))?;
+                c.base().clone_exact()
+            }
+            _ => return Err(SolidError::invalid_input(OP_PROJ, "not an SmBSplineCurve")),
+        };
         let mut projection_surface = Surface::from(BSplineSurface::create_linear_sweep(
             &mut sweep_curve,
             sweep_vec,
@@ -1902,26 +1914,20 @@ impl Surface {
 ///
 /// [`SolidError::Unported`] from the bounding box.
 pub fn b_spline_is_planar(k: &Kernel, s: &BSplineSurface, tol_3d: f64) -> Result<Planar> {
-    Ok(planar_of(k, s, &s.natural_uv_domain(), None)?.is_planar(tol_3d))
+    Ok(planar_of(k, s, &s.natural_uv_domain())?.is_planar(tol_3d))
 }
 
-/// The pseudo box of a B-spline surface over `uv_domain`, expanded by `face_tol` (the
-/// owning face's tolerance; `None` for `SM_ZONE_TOL_3D`); a failed box is the default
-/// box, as upstream ignores the status.
-fn planar_of(
-    k: &Kernel,
-    s: &BSplineSurface,
-    uv_domain: &Extent2d,
-    face_tol: Option<f64>,
-) -> Result<PseudoBox> {
+/// The pseudo box of a B-spline surface over `uv_domain`, not expanded by the zone
+/// tolerance; a failed box is the default box, as upstream ignores the status.
+fn planar_of(k: &Kernel, s: &BSplineSurface, uv_domain: &Extent2d) -> Result<PseudoBox> {
     let req = BoundingBoxRequest {
         normal: false,
         pseudo: true,
         polar: false,
         pseudo_guess: None,
         polar_guess: None,
-        expand_by_zone_tol: true,
-        expand_tolerance: face_tol,
+        expand_by_zone_tol: false,
+        expand_tolerance: None,
     };
     Ok(ignored(s.calculate_bounding_box(k, uv_domain, &req))?
         .and_then(|b| b.pseudo)
@@ -2091,7 +2097,8 @@ pub struct HigherOrderDerivs {
 ///
 /// # Errors
 ///
-/// Those of `Evaluate1stDerivatives`.
+/// Those of `Evaluate1stDerivatives` and of the natural domain (a lazy analytic
+/// surface makes its NURB first).
 pub fn compute_higher_order_derivs<S: SurfaceEvaluate + ?Sized>(
     k: &Kernel,
     surface: &S,
@@ -2101,7 +2108,7 @@ pub fn compute_higher_order_derivs<S: SurfaceEvaluate + ?Sized>(
     want_g4: bool,
 ) -> Result<HigherOrderDerivs> {
     // locals
-    let domain = surface.natural_uv_domain();
+    let domain = surface.natural_uv_domain_with_nurb(k)?;
 
     // finite difference step - watch for stepping out of surface boundaries
     let mut step = EFF_ZERO_SQRT / 1000.0; // 1.0e-9
@@ -2164,7 +2171,8 @@ pub fn compute_higher_order_derivs<S: SurfaceEvaluate + ?Sized>(
 ///
 /// # Errors
 ///
-/// Those of `Evaluate1stDerivatives`; the status of `Unitize` for a zero result.
+/// Those of `Evaluate1stDerivatives` and of the natural domain (a lazy analytic
+/// surface makes its NURB first); the status of `Unitize` for a zero result.
 pub fn compute_inward_vector<S: SurfaceEvaluate + ?Sized>(
     k: &Kernel,
     surface: &S,
@@ -2174,7 +2182,7 @@ pub fn compute_inward_vector<S: SurfaceEvaluate + ?Sized>(
     let (_, du, dv) = evaluate_1st_derivatives(k, surface, uv, Side::Left, Side::Left)?;
 
     // towards midPoint UV vec
-    let mid_uv = surface.natural_uv_domain().evaluate(0.5, 0.5);
+    let mid_uv = surface.natural_uv_domain_with_nurb(k)?.evaluate(0.5, 0.5);
     let dir_uv = mid_uv - uv;
     let dir_uv = dir_uv.unitize().unwrap_or(dir_uv);
 
@@ -2846,9 +2854,9 @@ impl<O: SolutionObject> SsGlobalSolver<'_, '_, O> {
     ///
     /// # Errors
     ///
-    /// [`SolidError::Unported`] for two patch nodes when normalizing (the patch data
-    /// lives in the surface caches, which a `Tree` does not reach yet:
-    /// `surface.surface_cache_p1`).
+    /// [`SolidError::Unported`] for two patch nodes when normalizing without
+    /// [`SsGlobalSolver::caches`] (the patch data lives in the surface caches:
+    /// `surface.surface_cache_p1`); the production solve always sets them.
     pub fn may_contain_answers(&self, branch: &Branch) -> Result<bool> {
         let k = self.kernel;
         if self.base.operation == SolverOperation::Normalize {
@@ -2898,12 +2906,11 @@ impl<O: SolutionObject> SsGlobalSolver<'_, '_, O> {
                     return self.base.branch_may_contain_answers(branch);
                 }
                 // The patches (the nodes' m_pData) are SurfaceCache::patch(node) of the
-                // two surface caches. DISPATCH GAP: the constructor (SsGlobalSolver::new,
-                // surface::surface::p1) takes the trees as upstream does, and a Tree does
-                // not reach its cache; handing the caches over needs them mutable (the
-                // polar boxes are built lazily). No UNPORTED marker: the constructor is
-                // ported; the error names the owner of the patch data
-                // (surface.surface_cache_p1).
+                // two surface caches, which the branch above reads. Without them (a
+                // solver built without caches: tests and runners; the production SS
+                // solve, Surface::global_surface_solve_in here, always sets `caches`
+                // after SsGlobalSolver::new) the polar boxes are out of reach; the
+                // error names the owner of the patch data (surface.surface_cache_p1).
                 // (then sm_IsNodeValid of both nodes, returning SM_SUCCESS = FALSE when
                 // outside, ComputeConeBoundTo and the polar box cone tests)
                 return Err(SolidError::unported(
@@ -3091,7 +3098,7 @@ mod tests {
     fn inward_vector_points_to_middle() {
         let k = &Kernel::default();
         let s = plane();
-        let d = s.natural_uv_domain();
+        let d = s.natural_uv_domain_if_built();
         let v = compute_inward_vector(k, &s, d.min()).unwrap();
         assert!((v.length() - 1.0).abs() < 1e-12);
     }

@@ -11,8 +11,10 @@
 //! | [`OffsetExecutive::shell_brep`], [`ShellOutcome`] | both `SmOffsetExecutive::ShellBrep` overloads, including input ownership |
 //! | [`OffsetExecutive::do_solid_offset`] | `SmOffsetExecutive::DoSolidOffset` |
 //! | [`OffsetExecutive::do_extended_offset`] | `SmOffsetExecutive::DoExtendedOffset` |
+//! | `order_edgeuses_by_brep` (private) | `sm_OrderEdgeusesByBrep` |
 //! | [`api_shell_brep_full`], [`ShellCopyIdentities`] | `SmApiShellBrepFull` (and its working copy's identities) |
 //! | [`api_offset_brep_full`] | `SmApiOffsetBrepFull` |
+//! | [`faceuse_offset`] | `SmOffsetGeometryCreation::FaceuseOffset` over the owned B-rep |
 //!
 //! Deviations: original B-reps and the kernel are explicit arguments, not retained
 //! pointers. Options replace scalar flag lists; owned results replace output pointers.
@@ -25,6 +27,8 @@
 //! upstream); member null is native 1006, API null/invalid selection is native 1007.
 //! Offset/member inputs are mutable so existing queries can populate lazy UV trim
 //! geometry in the same arena; this adds no constructive capability or topology copy.
+//! `sm_OrderEdgeusesByBrep` (void upstream) propagates a dangling-id error from its
+//! face and edge-use queries; only a corrupt B-rep reaches it.
 //! Source faces use the native owning-list order. Temporary allocation uses the real
 //! empty constructor's void infinite region, tolerance, editing flag and caller-reserved
 //! result key. No offset geometry is fabricated. Copied faces pass the actual region
@@ -42,7 +46,7 @@
 //! not parity with the native ownership flag.
 //! There is no new recursion; all owned loops are bounded by existing arena/relation lengths.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use super::p1::{OffsetExecutive, OffsetOperation};
 use crate::boolean::merge::p4::{
@@ -51,11 +55,13 @@ use crate::boolean::merge::p4::{
 };
 use crate::error::{EntityRef, Result, SolidError};
 use crate::geom::a_object::BooleanOperation;
-use crate::geom::attribute::{AttributeStore, ObjectKey};
+use crate::geom::attribute::AttributeStore;
 use crate::geom::context::{with_mark_lock, MarkType, ALL_MARKS};
 use crate::geom::extent2d::Extent2d;
 use crate::geom::object::{FaceKey, NotifyOperation, ObjectRef};
+use crate::heal::stitch::p1::{DefaultStitchCallback, Stitch};
 use crate::heal::stitch::p2 as stitch;
+use crate::heal::stitch::p2::MinGapRequest;
 use crate::kernel::Kernel;
 use crate::math::Vec3;
 use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
@@ -67,10 +73,13 @@ use crate::topology::brep::p4::{shrink_geometry, stitch_faces};
 use crate::topology::brep::p7::{make_face_with_curves_with_kernel_context, FaceCurvesInput};
 use crate::topology::proto_topology::p1::CopyBrepMap;
 
+#[cfg(test)]
+use crate::geom::attribute::ObjectKey;
 use crate::sweep::topology_sweep::store::SweepIdentities;
 use crate::topology::edge::{NotificationStores, NotifyState};
 use crate::topology::edgeuse::{p1 as eu, p2 as eu2};
 use crate::topology::face::p2 as face;
+#[cfg(test)]
 use crate::topology::topology::Topology;
 use crate::topology::{Brep, BrepId, EdgeId, EdgeuseId, FaceId, FaceuseId, RegionId};
 
@@ -90,7 +99,7 @@ const OP_API_OFFSET: &str = "offset::offset_executive::p2::api_offset_brep_full"
 /// The context always comes from the supplied `Kernel`, never from a substitute.
 pub struct OffsetNotifications<'a> {
     /// Actual topology metadata, shared by source and result notifications.
-    pub records: &'a mut BTreeMap<ObjectKey, Topology>,
+    pub records: &'a mut crate::topology::topology::NotifyRecords,
     /// Actual attributes associated with those object identities.
     pub attributes: &'a mut AttributeStore,
     /// Object identities in the source arena.
@@ -238,6 +247,20 @@ impl OffsetExecutive {
             // cpp:217–251: the helper's scope drops any separately retained
             // executive temporary before querying the result's manifold status.
             let mut shell = run_shell_offset(kernel, original, options, faces, notifications)?;
+            // Opt-in (WR-454, #380; tangency-labs/smlib@fbe43bb): an inset of a solid whose
+            // offset leaves nothing has no cavity to take away (the difference would hand
+            // the input back unhollowed); an offset that is no closed solid bounds none.
+            if kernel.fixes.shell_empty_cavity_fails
+                && options.offset.distance < 0.0
+                && input_is_manifold
+            {
+                if bp1::num_faces(&shell) == 0 {
+                    return Err(invalid_input(OP_SHELL));
+                }
+                if !brep_is_manifold_solid(&shell)? {
+                    return Err(SolidError::sm_err(OP_SHELL));
+                }
+            }
             if !brep_is_manifold_solid(&shell)? && !options.create_offset_solid {
                 return Ok(shell);
             }
@@ -522,7 +545,7 @@ impl OffsetExecutive {
             }
         }
 
-        let mapped = self.mapped_original_edgeuses();
+        let mapped = order_edgeuses_by_brep(original, &self.mapped_original_edgeuses())?;
         with_mark_lock(kernel, ALL_MARKS, |kernel, mark_type| {
             // The same claimed mark reaches both mapped-edge passes. Source and
             // result keys stay disjoint through p1's synchronization and Copy calls.
@@ -750,7 +773,21 @@ impl OffsetExecutive {
             // FindAndSetInfiniteRegion when >1 region (editing temporarily false),
             // refresh regions, set void flags by infinite-region identity, then
             // transfer result ownership and clear the executive temporary.
-            crate::error::ignore_status(stitch::stitch_into_solid(kernel, &mut result))?;
+            if kernel.fixes.offset_stitch_at_body_tolerance {
+                // Opt-in (WR-455, #855; tangency-labs/smlib@601d804): one pass at the body's
+                // tolerance. `StitchIntoSolid` doubles its tolerance until no lamina edge is
+                // left, but the lamina edges a merge leaves are the rims of the cut-off
+                // pieces `MakeManifold` removes next; escalating, it welds two of them into
+                // one edge of a far larger tolerance. (SER: a failure propagates.)
+                let mut callback = DefaultStitchCallback::new();
+                let mut one_pass = Stitch::new(&mut callback, result.tolerance(), true, false);
+                one_pass.fast_edge_compare = true;
+                one_pass.split_edges_with_vertices = false;
+                one_pass.making_manifold_solid = true;
+                one_pass.do_stitching(kernel, &mut result, None, None, MinGapRequest::default())?;
+            } else {
+                crate::error::ignore_status(stitch::stitch_into_solid(kernel, &mut result))?;
+            }
             // MakeManifold exists in p5, but its remaining metadata/topology
             // adapters must still propagate Unported even though native ignores
             // ordinary errors. Do not turn that partial path into empty success.
@@ -861,8 +898,7 @@ impl OffsetExecutive {
         // records and the reserved B-rep key, it did not exist before this call.
         notifications
             .records
-            .entry((notifications.result_key_of)(EntityRef::Region(region)).key)
-            .or_default();
+            .or_default((notifications.result_key_of)(EntityRef::Region(region)).key);
         temporary.set_tolerance(self.approximation_tol_3d());
         // SmOffsetExecutive.cpp:437 / 1073, after constructing the temporary.
         temporary.set_editing_enabled(true);
@@ -989,11 +1025,17 @@ impl OffsetExecutive {
     ) -> Result<()> {
         let operation = if extended { OP_EXTENDED } else { OP_SOLID };
         let faceuse = select_offset_faceuse(original, id, extended, self.inset(), operation)?;
-        let creator = crate::offset::offset_geometry_creation::OffsetGeometryCreation::new(
-            self.offset_distance(),
-            self.approximation_tol_3d(),
-        );
-        let (mut surface, ssi) = super::face::build(kernel, &creator, original, faceuse, true)?;
+        let (mut surface, ssi) = if self.local_faces.is_empty() {
+            let creator = crate::offset::offset_geometry_creation::OffsetGeometryCreation::new(
+                self.offset_distance(),
+                self.approximation_tol_3d(),
+            );
+            super::face::build(kernel, &creator, original, faceuse, true)?
+        } else {
+            // SmLocalOperationGeometryCreation::FaceuseOffset: the surface given per face. The
+            // creator object decides upstream (virtual call), not `m_eOffsetOperation`.
+            super::face::build_local(original, &self.local_faces, &self.local_surfaces, faceuse)?
+        };
         // Not upstream (WR-346, tangency-labs/solidcore#397), opt-in
         // `Kernel::fixes.offset_collapsed_rounds_mated`: an inset face whose offset collapses (a
         // convex round thinner than the wall) gets no offset face; the faces beside it are
@@ -1090,7 +1132,7 @@ impl OffsetExecutive {
             let faces = bp1::faces(&temporary, None)?;
             for id in faces {
                 let key = (notifications.result_key_of)(EntityRef::Face(id));
-                let record = notifications.records.entry(key.key).or_default();
+                let record = notifications.records.or_default(key.key);
                 if record.is_marked(&kernel.context, mark_type) {
                     continue;
                 }
@@ -1099,12 +1141,12 @@ impl OffsetExecutive {
                 }
                 record.mark(Some(&kernel.context), mark_type);
                 let surface = required(temporary.face(id)?.surface.as_ref(), OP_EXTENDED)?;
-                let original_domain = surface.natural_uv_domain();
+                let original_domain = surface.natural_uv_domain_with_nurb(kernel)?;
                 // Face-owned surfaces use the caller's result-arena identities.
                 let extension = self
                     .get_create_extended_surface(kernel, key.key.0, surface)?
                     .clone();
-                let extension_domain = extension.natural_uv_domain();
+                let extension_domain = extension.natural_uv_domain_with_nurb(kernel)?;
                 // cpp:1639: UNSURE retains the original; FALSE suppresses UV trim
                 // creation. The optional modified-face list is not requested.
                 let (original_surface, _) =
@@ -1336,6 +1378,28 @@ pub fn api_offset_brep_full(
     // (not upstream: the port's cached topology, true again for the caller)
     result.refresh_cached_topology();
     Ok(result)
+}
+
+/// `SmOffsetGeometryCreation(distance, approx_tol_3d).FaceuseOffset(faceuse, TRUE)`: the
+/// face's surface offset by `distance` along the normal of the source face use (against
+/// it for an opposite one), made analytic when possible, its self-intersections skipped.
+/// `None` when no offset surface was made.
+///
+/// # Errors
+///
+/// Those of `FaceuseOffset` (the face use's face, its surface, the offset surface).
+pub fn faceuse_offset(
+    kernel: &Kernel,
+    original: &Brep,
+    faceuse: FaceuseId,
+    distance: f64,
+    approx_tol_3d: f64,
+) -> Result<Option<crate::surface::surface::Surface>> {
+    let creator = crate::offset::offset_geometry_creation::OffsetGeometryCreation::new(
+        distance,
+        approx_tol_3d,
+    );
+    Ok(super::face::build(kernel, &creator, original, faceuse, true)?.0)
 }
 
 fn configured_executive(original: &Brep, options: OffsetOptions) -> OffsetExecutive {
@@ -1765,6 +1829,35 @@ fn invalid_input(operation: &'static str) -> SolidError {
     }
 }
 
+/// `sm_OrderEdgeusesByBrep`: `edgeuses` ordered by `brep` (its faces, each face's
+/// two face uses, their edge uses), not by identity: the B-rep order is walked from
+/// its end and each listed edge use is placed at its first sighting. Edge uses not
+/// found in `brep` go last, in their input order.
+fn order_edgeuses_by_brep(brep: &Brep, edgeuses: &[EdgeuseId]) -> Result<Vec<EdgeuseId>> {
+    let mut unplaced: BTreeSet<EdgeuseId> = edgeuses.iter().copied().collect();
+
+    let mut brep_order = Vec::new();
+    for f in bp1::faces(brep, None)? {
+        let (faceuse1, faceuse2) = face::faceuses(brep, f)?;
+        for faceuse in [faceuse1, faceuse2].into_iter().flatten() {
+            brep_order.extend(eu::faceuse_edgeuses(brep, faceuse, false, None)?);
+        }
+    }
+
+    let mut ordered = Vec::new();
+    for &edgeuse in brep_order.iter().rev() {
+        if unplaced.remove(&edgeuse) {
+            ordered.push(edgeuse);
+        }
+    }
+    for &edgeuse in edgeuses {
+        if unplaced.contains(&edgeuse) {
+            ordered.push(edgeuse);
+        }
+    }
+    Ok(ordered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1775,6 +1868,72 @@ mod tests {
     use crate::surface::plane::Plane;
     use crate::surface::surface::Surface;
     use crate::topology::{Faceuse, FaceuseId, Region, Shell};
+
+    /// `faceuse_offset` offsets a box face's plane: a plane parallel to it, `distance` away.
+    #[test]
+    fn faceuse_offset_of_a_box_face_is_a_plane_at_the_distance() {
+        use crate::math::Point2;
+        use crate::surface::surface::p2::SurfaceKind;
+        let mut k = Kernel::default();
+        let brep = crate::primitive::api_primitives::create_box(
+            &mut k,
+            crate::math::Point3::new(0.0, 0.0, 0.0),
+            1.0,
+            2.0,
+            3.0,
+        )
+        .unwrap();
+        let f = bp1::faces(&brep, None).unwrap()[0];
+        let faceuse = face::faceuses(&brep, f).unwrap().0.unwrap();
+        let SurfaceKind::Plane(source) = face::surface(&brep, f).unwrap().unwrap().kind() else {
+            panic!("a box face is a plane");
+        };
+        let on_source = source.evaluate_point(Point2::new(0.0, 0.0));
+        let made = faceuse_offset(&k, &brep, faceuse, 0.25, 1e-6)
+            .unwrap()
+            .unwrap();
+        let SurfaceKind::Plane(made) = made.kind() else {
+            panic!("an offset plane stays a plane");
+        };
+        let [a, b, c] = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]
+            .map(|(u, v)| made.evaluate_point(Point2::new(u, v)));
+        let normal = (b - a).cross(c - a);
+        let normal = normal * (1.0 / normal.length());
+        for q in [a, b, c] {
+            assert!(((q - on_source).dot(normal).abs() - 0.25).abs() < 1e-12);
+        }
+    }
+
+    /// `sm_OrderEdgeusesByBrep`: the B-rep's edge uses come from the end of its
+    /// face/face-use/edge-use order, each once; an edge use not in the B-rep goes last.
+    #[test]
+    fn edgeuses_are_ordered_by_their_brep_then_input_order() {
+        let mut k = Kernel::default();
+        let brep = crate::primitive::api_primitives::create_box(
+            &mut k,
+            crate::math::Point3::new(0.0, 0.0, 0.0),
+            1.0,
+            2.0,
+            3.0,
+        )
+        .unwrap();
+        let mut brep_order = Vec::new();
+        for f in bp1::faces(&brep, None).unwrap() {
+            let (a, b) = face::faceuses(&brep, f).unwrap();
+            for fu in [a, b].into_iter().flatten() {
+                brep_order.extend(eu::faceuse_edgeuses(&brep, fu, false, None).unwrap());
+            }
+        }
+        let last = *brep_order.last().unwrap();
+        let first = brep_order[0];
+        let foreign = [
+            EdgeuseId::from_index(900_001),
+            EdgeuseId::from_index(900_000),
+        ];
+        let input = vec![foreign[0], first, foreign[1], last];
+        let ordered = order_edgeuses_by_brep(&brep, &input).unwrap();
+        assert_eq!(ordered, vec![last, first, foreign[0], foreign[1]]);
+    }
 
     fn fixture_key(entity: EntityRef, namespace: u64) -> ObjectRef {
         let (index, type_code) = match entity {
@@ -1918,13 +2077,13 @@ mod tests {
     }
 
     struct NotificationFixture {
-        records: BTreeMap<ObjectKey, Topology>,
+        records: crate::topology::topology::NotifyRecords,
         attributes: AttributeStore,
     }
 
     impl NotificationFixture {
         fn new(original: &Brep) -> Self {
-            let mut records = BTreeMap::new();
+            let mut records = crate::topology::topology::NotifyRecords::new();
             records.insert(original.key(), Topology::new());
             records.insert(
                 result_key(EntityRef::Brep(BrepId::from_index(0))).key,
@@ -2657,8 +2816,7 @@ mod tests {
                 .set_user_index1(17);
             fixture
                 .records
-                .entry(offset_key.key)
-                .or_default()
+                .or_default(offset_key.key)
                 .set_user_index1(93);
             let records_before = fixture.records.clone();
             let mut kernel = Kernel::default();
@@ -2889,7 +3047,7 @@ mod tests {
             .edit_parameterization(&kernel, &part_interval)
             .unwrap();
         let mut fixture = NotificationFixture::new(&original);
-        let source_records = fixture.records.clone();
+        let source_records = (*fixture.records).clone();
         let entities = result
             .edges()
             .iter()
@@ -4154,7 +4312,7 @@ mod tests {
         use crate::primitive::api_primitives::create_plane;
         let mut sheet = create_plane(k, Vec3::new(0.0, 0.0, 0.0), 10.0, 10.0).unwrap();
         let other = create_plane(k, Vec3::new(10.0, 0.0, 0.0), 10.0, 10.0).unwrap();
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = AttributeStore::default();
         let mut env = crate::topology::edge::NotifyEnv {
             records: &mut records,
@@ -4337,6 +4495,71 @@ mod tests {
         );
     }
 
+    /// tangency-labs/solidcore#403 (WR-463): a sphere r10 cut by a box to a hemisphere has
+    /// a rim of two arcs (270 and 90 degrees) of one circle. Shelled 2 inward open at the
+    /// flat face, the offset of that circle is trimmed to the interval between two points
+    /// for both arcs, so the flat face gets the long arc twice and the cavity is no solid.
+    /// With the opt-in each arc takes the part of the circle it runs along: a solid of
+    /// volume 2/3 pi (10^3 - 8^3).
+    #[test]
+    fn issue_403_hemisphere_rim_arcs_keep_their_own_trim() {
+        use crate::primitive::api_primitives::{create_box, create_sphere};
+        let shell = |fixed: bool| -> Result<(bool, f64)> {
+            let mut kernel = Kernel::default();
+            kernel.fixes.offset_closed_curve_trim_arc = fixed;
+            let ball = create_sphere(&mut kernel, Vec3::new(0.0, 0.0, 0.0), 10.0).unwrap();
+            let upper =
+                create_box(&mut kernel, Vec3::new(-20.0, -20.0, 0.0), 40.0, 40.0, 20.0).unwrap();
+            let mut part =
+                crate::boolean::api_brep::boolean_intersection(&mut kernel, ball, upper).unwrap();
+            part.set_key(original_key(EntityRef::Brep(BrepId::from_index(0))).key);
+            let flat = planar_faces_at_z(&kernel, &part, 0.0);
+            assert_eq!(flat.len(), 1);
+            let mut notifications = NotificationFixture::new(&part);
+            OffsetExecutive::shell_brep(
+                &mut kernel,
+                part,
+                ShellOptions {
+                    offset: OffsetOptions {
+                        distance: -2.0,
+                        extend_convex_edges: true,
+                        merge_results: true,
+                    },
+                    create_offset_solid: false,
+                    merge_sheet_side_walls: false,
+                },
+                &flat,
+                &mut notifications.context(),
+            )
+            .result
+            .map(|mut shell| {
+                let store = AttributeStore::default();
+                let key_of = |_| ObjectKey(0);
+                let attributes = crate::mass::integrator::properties::PropertyAttributes {
+                    store: &store,
+                    key_of: &key_of,
+                };
+                let volume = crate::mass::integrator::properties::brep_volume(
+                    &kernel,
+                    &mut shell,
+                    1e-6,
+                    &attributes,
+                )
+                .unwrap();
+                (brep_is_manifold_solid(&shell).unwrap(), volume)
+            })
+        };
+        // upstream: the cavity is no solid and encloses no volume
+        let (solid, volume) = shell(false).unwrap();
+        assert!(!solid && volume.abs() < 1e-9, "{solid} {volume}");
+        let (solid, volume) = shell(true).unwrap();
+        let expected = 2.0 / 3.0 * PI * (1000.0 - 512.0);
+        assert!(
+            solid && (volume - expected).abs() < 1e-6 * expected,
+            "{volume}"
+        );
+    }
+
     /// A 40 x 40 x 10 plate with a 4 mm through hole at (4.5, 20), 0.5 from the side
     /// x = 0, and its top face.
     fn plate_with_hole_by_side(k: &mut Kernel) -> (Brep, Vec<FaceId>) {
@@ -4486,5 +4709,116 @@ mod tests {
             (volume - expected).abs() < 1e-6 * expected,
             "volume {volume}"
         );
+    }
+
+    /// tangency-labs/solidcore#855: a 40 x 40 x 10 plate with a 4 mm hole at (4.99, 20)
+    /// shelled 1.5 inward open at the top: the hole's offset (r 3.5) crosses the offset
+    /// side x = 1.5 only 0.01 mm deep. Upstream's `StitchIntoSolid` doubles its tolerance
+    /// until the cut-off rims of that crossing are welded, and the shell is no solid;
+    /// with the opt-in one pass at the body's tolerance leaves a solid whose volume is
+    /// the inner box less the hole's offset disk (cut by x = 1.5), over the height 8.5.
+    /// `contacts_at_ends` adds the other opt-in of #855 (a tangential contact is found at
+    /// a curve's end), which must not change this shell.
+    #[test]
+    fn issue_855_offset_stitch_keeps_the_bodys_tolerance() {
+        let shell = |stitch: bool, contacts_at_ends: bool| -> Result<Option<f64>> {
+            use crate::primitive::api_primitives::{create_box, create_cylinder};
+            let mut kernel = Kernel::default();
+            kernel.fixes.offset_resolve_crossing_loops = true;
+            kernel.fixes.offset_stitch_at_body_tolerance = stitch;
+            kernel.fixes.curve_contacts_at_curve_ends = contacts_at_ends;
+            let plate =
+                create_box(&mut kernel, Vec3::new(0.0, 0.0, 0.0), 40.0, 40.0, 10.0).unwrap();
+            let hole =
+                create_cylinder(&mut kernel, Vec3::new(4.99, 20.0, -1.0), 2.0, 12.0).unwrap();
+            let mut part =
+                crate::boolean::api_brep::boolean_difference(&mut kernel, plate, hole).unwrap();
+            part.set_key(original_key(EntityRef::Brep(BrepId::from_index(0))).key);
+            let top = planar_faces_at_z(&kernel, &part, 10.0);
+            let mut notifications = NotificationFixture::new(&part);
+            let mut result = OffsetExecutive::shell_brep(
+                &mut kernel,
+                part,
+                ShellOptions {
+                    offset: OffsetOptions {
+                        distance: -1.5,
+                        extend_convex_edges: true,
+                        merge_results: true,
+                    },
+                    create_offset_solid: false,
+                    merge_sheet_side_walls: false,
+                },
+                &top,
+                &mut notifications.context(),
+            )
+            .result?;
+            if !brep_is_manifold_solid(&result)? {
+                return Ok(None);
+            }
+            let store = AttributeStore::default();
+            let key_of = |_| ObjectKey(0);
+            let attributes = crate::mass::integrator::properties::PropertyAttributes {
+                store: &store,
+                key_of: &key_of,
+            };
+            let volume = crate::mass::integrator::properties::brep_volume(
+                &kernel,
+                &mut result,
+                1e-6,
+                &attributes,
+            )?;
+            Ok(Some(volume))
+        };
+        assert_eq!(shell(false, false).unwrap(), None);
+        // 40 x 40 x 10 less the hole, less the cavity: 8.5 high over the inner box (37 x 37)
+        // less the hole's offset disk (r 3.5, centre 3.49 from x = 1.5) cut by x = 1.5
+        let expected = 4564.924657;
+        for contacts_at_ends in [false, true] {
+            let volume = shell(true, contacts_at_ends).unwrap().unwrap();
+            assert!(
+                (volume - expected).abs() < 1e-6 * expected,
+                "volume {volume}"
+            );
+        }
+    }
+
+    /// tangency-labs/solidcore#380: a closed inward shell of a box whose wall is as thick
+    /// as (or thicker than) the inradius leaves no cavity. Upstream returns the empty
+    /// offset as a success (the fork: the body unhollowed); with the opt-in it fails, and a thinner wall still shells.
+    #[test]
+    fn issue_380_shell_with_no_cavity_fails_with_the_fix() {
+        let shell = |fix: bool, wall: f64| -> Result<Brep> {
+            use crate::primitive::api_primitives::create_box;
+            let mut kernel = Kernel::default();
+            kernel.fixes.shell_empty_cavity_fails = fix;
+            let mut part =
+                create_box(&mut kernel, Vec3::new(0.0, 0.0, 0.0), 10.0, 10.0, 10.0).unwrap();
+            part.set_key(original_key(EntityRef::Brep(BrepId::from_index(0))).key);
+            let mut notifications = NotificationFixture::new(&part);
+            OffsetExecutive::shell_brep(
+                &mut kernel,
+                part,
+                ShellOptions {
+                    offset: OffsetOptions {
+                        distance: -wall,
+                        extend_convex_edges: true,
+                        merge_results: true,
+                    },
+                    create_offset_solid: false,
+                    merge_sheet_side_walls: false,
+                },
+                &[],
+                &mut notifications.context(),
+            )
+            .result
+        };
+        for wall in [5.0, 6.0] {
+            // upstream: an empty offset is "not a manifold solid", returned as a success
+            let upstream = shell(false, wall).unwrap();
+            assert_eq!(bp1::num_faces(&upstream), 0);
+            assert_status(shell(true, wall), 1007);
+        }
+        let thin = shell(true, 1.0).unwrap();
+        assert!(brep_is_manifold_solid(&thin).unwrap());
     }
 }

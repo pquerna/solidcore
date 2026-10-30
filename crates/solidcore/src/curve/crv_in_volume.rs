@@ -27,13 +27,20 @@
 //! | [`CrvInVolume::trim`]                          | `Trim`                                            |
 //! | [`CrvInVolume::transform`]                     | `Transform`                                       |
 //! | [`CrvInVolume::read_from_db`]                  | `ReadFromDB`                                      |
+//! | [`CrvInVolume::make_exact_b_spline_if_possible_with`] | `MakeExactBSplineIfPossible`               |
+//! | `make_exact_b_spline_out_curve_from_{in,param}_space` (private) | `SmVolume::MakeExactBSplineOutCurveFrom{In,Param}Space` |
+//! | `make_exact_b_spline_1st_out_curve` (private)  | `SmVolume`/`SmBSplineVolume`/`SmTransform::MakeExactBSpline1stOutCurve` |
 //! | `SetContext` (dropped)                         | `SetContext`                                      |
 //!
 //! Deviations:
 //! - **Nesting.** `new` returns `InvalidInput` when the curve or the volume would nest
 //!   deeper than [`MAX_GEOMETRY_NESTING`](crate::surface::surface::p2::MAX_GEOMETRY_NESTING)
 //!   (32; upstream fixtures nest at most 3), which bounds the recursive dispatch,
-//!   cloning and dropping of nested geometry (no limit upstream).
+//!   cloning and dropping of nested geometry (no limit upstream). A database read bounds
+//!   the same graph through `DatabaseReader::enter_nested` (32) on both nested readers.
+//!   No method replaces the curve or the volume after construction, so every
+//!   `CrvInVolume` holds a bounded graph; that is what [`CrvInVolume::copy`] and the
+//!   infallible `Clone` rely on.
 //! - **Volumes.** The volume is a [`Volume`] (units `surface.volume_p1`, `_p2`);
 //!   the queries of the unported volume kinds return [`SolidError::Unported`].
 //! - **Curve classification.** `GetKnots` classifies the base curve against the
@@ -46,9 +53,18 @@
 //!   in is already this object's copy) and the owner flag is kept as data: it
 //!   decides [`CrvInVolume::owns_curve`], [`CrvInVolume::owns_volume`] and whether
 //!   `Trim` / `ReverseParameterization` are allowed, as upstream. The copy
-//!   constructor clones both parts (upstream copies owned parts and shares the
-//!   rest; the result is the same geometry) and recomputes the owner flag as
-//!   upstream. The owner links of the contained objects (`SetOwner(this)`) and the
+//!   constructor - [`CrvInVolume::copy`] and `Clone` alike - follows upstream part by
+//!   part: a part this object owns is copied with that part's copy constructor, one it
+//!   does not own is an exact copy that keeps its owner (upstream shares it), and the
+//!   owner flag is normalized using the recognized ownership predicates, not a bit
+//!   mask: noncanonical flags own neither part. The volume is copied field-wise; upstream
+//!   copy-constructs the volume whenever it owns either part (also for flag 1, which
+//!   owns only the curve) and shares it at flag 0, and the `Copy` knot fix-up of a
+//!   B-spline volume is not modelled, as in [`CrvInVolume::copy`]. The break cache is
+//!   copied only when `m_bNeedBreaks` is FALSE, as upstream; the operations here leave
+//!   the cache empty whenever they invalidate it (`Trim` and `EditParameterization`
+//!   clear both arrays when they set the flag), so that branch is not observable
+//!   through them. The owner links of the contained objects (`SetOwner(this)`) and the
 //!   notifications (`Notify`) are not modelled; `SetContext` and the `SmContext`
 //!   arguments (they only choose where upstream allocates) are dropped.
 //! - **Equality.** Upstream first compares the curve and volume pointers; held by
@@ -80,7 +96,20 @@
 //!   stream had already failed) leaves upstream's variable uninitialised; the port
 //!   returns [`SolidError::InvalidInput`]. Counts are bounded by the bytes left
 //!   (`plan/findings.md`, "header-declared sizes").
-//! - **Not in this unit.** `EvaluateVolume`, `MakeExactBSplineIfPossible`,
+//! - **Exact B-spline.** `MakeExactBSplineIfPossible` and the volume functions it
+//!   needs (`MakeExactBSplineOutCurveFrom{Param,In}Space`, the
+//!   `MakeExactBSpline1stOutCurve` of `SmVolume`, `SmBSplineVolume` (both `NULL`) and
+//!   `SmTransform`) are in no unit in `units.json`; they are ported here as
+//!   [`CrvInVolume::make_exact_b_spline_if_possible_with`], which takes the kernel the
+//!   curve copies need (upstream's takes the context). The bend, unbend and twist
+//!   overrides are ported beside their volumes
+//!   ([`BendVolume::make_exact_b_spline_1st_out_curve`](crate::surface::bend_volume::BendVolume::make_exact_b_spline_1st_out_curve)
+//!   and the unbend and twist counterparts). The compounding loops stop with
+//!   `InvalidInput` past `MAX_GEOMETRY_NESTING` maps (upstream walks the whole chain);
+//!   the result is a [`Curve`] (upstream an `SmBSplineCurve*`, which a twist fills with
+//!   a copy of any input kind); a failed `Copy` (upstream then dereferences `NULL`) is
+//!   returned as its error.
+//! - **Not in this unit.** `EvaluateVolume`,
 //!   `CreateMirrorCurve`, `SetBaseCurve`, `SetVolume`, `SetOwnerFlag`, `MakeOwner`,
 //!   `GetMemoryUsed`, `WriteToDB`, `Dump`, `AssertValid` and `GetRootCurve` belong
 //!   to other units or are out of scope; the base constructor `SmCurve(ULONG)`
@@ -92,7 +121,7 @@
 
 use crate::curve::curve::p2::{
     at, evaluate_continuity, is_kind_of as curve_is_kind_of, Curve, CurveEvaluate, KnotsWithStatus,
-    CRV_IN_VOLUME_TYPE,
+    BSPLINE_CURVE_TYPE, CRV_IN_VOLUME_TYPE,
 };
 use crate::error::{ignored, Result, SolidError};
 use crate::geom::axis2_placement::Axis2Placement;
@@ -104,11 +133,12 @@ use crate::intersect::curve_class::p8::volume_discontinuity_intervals;
 use crate::kernel::Kernel;
 use crate::math::{max2, BIG_DOUBLE, BOUNDED_INFINITE_PARAM, EFF_ZERO};
 use crate::nurbs::b_spline_curve_n_lib::TrimMode;
-use crate::surface::surface::p2::{check_geometry_nesting, NestedGeometry};
+use crate::surface::srf_in_volume::transform_axis2_placement;
+use crate::surface::surface::p2::{check_geometry_nesting, NestedGeometry, MAX_GEOMETRY_NESTING};
 use crate::surface::volume::p1::{
     lift_first_derivative, lift_second_derivative, lift_third_derivative,
 };
-use crate::surface::volume::{EvalOptions, Volume};
+use crate::surface::volume::{EvalOptions, Volume, VolumeKind};
 use crate::topology::database_io::{DatabaseReader, FileType};
 
 const OP: &str = "curve::crv_in_volume::CrvInVolume";
@@ -116,6 +146,7 @@ const OP_KNOTS: &str = "curve::crv_in_volume::CrvInVolume::knots";
 const OP_MULTS: &str = "curve::crv_in_volume::CrvInVolume::generate_mults";
 const OP_CONTS: &str = "curve::crv_in_volume::CrvInVolume::calculate_continuities";
 const OP_READ: &str = "curve::crv_in_volume::CrvInVolume::read_from_db";
+const OP_EXACT: &str = "curve::crv_in_volume::CrvInVolume::make_exact_b_spline_if_possible_with";
 
 /// `MAX_DERIVS` of `Evaluate`: the volume lifts go up to third derivatives.
 const MAX_DERIVS: usize = 3;
@@ -149,6 +180,117 @@ fn classify_against_volume(
     volume_discontinuity_intervals(k, curve, *interval, tol, volume, in_param_space)
 }
 
+// ---- exact B-spline images ------------------------------------------------------------
+
+/// `MakeExactBSpline1stOutCurve(eInputSpace, rInputCurve, rpNewCurve)` of one map (no
+/// compounding), from in-space when `in_space` (`SM_VS_IN_SPACE`), else from parameter
+/// space: `None` when the map cannot produce an exact B-spline.
+///
+/// `SmVolume` and `SmBSplineVolume` never can (header bodies); `SmTransform` copies a
+/// B-spline-derived curve and transforms it by its placement when the matrix is a
+/// right-handed unit orthonormal one (upstream asserts the orient map is NULL for a
+/// parameter-space input and uses the same mapping either way); the bend, unbend and
+/// twist overrides are [`BendVolume::make_exact_b_spline_1st_out_curve`](crate::surface::bend_volume::BendVolume::make_exact_b_spline_1st_out_curve)
+/// and its unbend and twist counterparts.
+fn make_exact_b_spline_1st_out_curve(
+    k: &Kernel,
+    map: &Volume,
+    in_space: bool,
+    curve: &Curve,
+) -> Result<Option<Curve>> {
+    match map.kind() {
+        VolumeKind::Base | VolumeKind::BSpline(_) => Ok(None),
+        VolumeKind::Transform(t) => {
+            // for geometry derived from SmBSpline
+            if curve.is_kind_of(BSPLINE_CURVE_TYPE) {
+                // for Transforms which can be represented by SmAxis2Placement mappings
+                if let Some(placement) = transform_axis2_placement(t) {
+                    // copy and transform the curve (statuses ignored)
+                    let mut new_curve = curve.copy(k)?;
+                    ignored(new_curve.transform(k, &placement, None))?;
+                    return Ok(Some(new_curve));
+                }
+            }
+            Ok(None)
+        }
+        VolumeKind::Bend(b) => b.make_exact_b_spline_1st_out_curve(k, map, in_space, curve),
+        VolumeKind::Unbend(u) => u.make_exact_b_spline_1st_out_curve(k, map, in_space, curve),
+        VolumeKind::Twist(t) => t.make_exact_b_spline_1st_out_curve(k, map, in_space, curve),
+    }
+}
+
+/// `SmVolume::MakeExactBSplineOutCurveFromInSpace`: `curve` projected exactly through
+/// every compounded map, or `None` when one cannot.
+fn make_exact_b_spline_out_curve_from_in_space(
+    k: &Kernel,
+    volume: &Volume,
+    in_space_curve: &Curve,
+) -> Result<Option<Curve>> {
+    // init output and locals
+    let mut this_map = Some(volume);
+    let mut this_in_space: Option<Curve> = None;
+
+    // for every compounding map
+    let mut depth = 0;
+    while let Some(map) = this_map {
+        depth += 1;
+        if depth > MAX_GEOMETRY_NESTING {
+            return Err(SolidError::invalid_input(
+                OP_EXACT,
+                "volume chain deeper than MAX_GEOMETRY_NESTING",
+            ));
+        }
+        // see if the current InSpaceCurve can project exactly to the Next OutSpace
+        let input = this_in_space.as_ref().unwrap_or(in_space_curve);
+        let Some(new_curve) = make_exact_b_spline_1st_out_curve(k, map, true, input)? else {
+            // return NULL when an exact projection was not possible
+            return Ok(None);
+        };
+
+        // set up for the next iteration
+        this_in_space = Some(new_curve);
+        this_map = map.next_map();
+    }
+    Ok(this_in_space)
+}
+
+/// `SmVolume::MakeExactBSplineOutCurveFromParamSpace`: the first map from parameter
+/// space, then every compounded map from in-space; `None` when one cannot.
+fn make_exact_b_spline_out_curve_from_param_space(
+    k: &Kernel,
+    volume: &Volume,
+    param_space_curve: &Curve,
+) -> Result<Option<Curve>> {
+    // for 1st volume mapping - Get 1stOutSpace project if possible
+    let Some(mut new_curve) =
+        make_exact_b_spline_1st_out_curve(k, volume, false, param_space_curve)?
+    else {
+        // return NULL when an exact projection was not possible
+        return Ok(None);
+    };
+
+    // for every subsequent compounding map
+    let mut this_map = volume.next_map();
+    let mut depth = 1;
+    while let Some(map) = this_map {
+        depth += 1;
+        if depth > MAX_GEOMETRY_NESTING {
+            return Err(SolidError::invalid_input(
+                OP_EXACT,
+                "volume chain deeper than MAX_GEOMETRY_NESTING",
+            ));
+        }
+        // see if the current InSpaceCurve can project exactly to the Next OutSpace
+        let Some(next) = make_exact_b_spline_1st_out_curve(k, map, true, &new_curve)? else {
+            // return NULL when an exact projection was not possible
+            return Ok(None);
+        };
+        new_curve = next;
+        this_map = map.next_map();
+    }
+    Ok(Some(new_curve))
+}
+
 // ---- continuity codes ---------------------------------------------------------------
 
 /// The `SmContinuityType` of integer `code` (the C cast in `ReadFromDB`); `None`
@@ -180,7 +322,7 @@ pub const fn continuity_from_code(code: i64) -> Option<ContinuityType> {
 /// volume's parameter space or in-space and is mapped to the volume's final
 /// out-space. Its "knots" are the base curve's knots plus the parameters where the
 /// base curve crosses the volume's discontinuity iso-planes, cached once computed.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CrvInVolume {
     /// `m_pCurve`: the base curve.
     curve: Curve,
@@ -198,6 +340,51 @@ pub struct CrvInVolume {
     /// `m_lOwnerFlag`: bit 1 owns the curve, bit 2 owns the volume (only the values
     /// 1 and 3, and 2 and 3, count as owning).
     owner_flag: u64,
+}
+
+/// The copy constructor `SmCrvInVolume::SmCrvInVolume(const SmCrvInVolume&)`
+/// (`SmCrvInVolume.cpp:102-159`), not the virtual `Copy` (that is
+/// [`CrvInVolume::copy`]): the owner flag is normalized from the recognized ownership
+/// predicates, the break cache is kept only when it is current, and the base curve is
+/// copied with the copy constructor (which fixes its knots up) when this object owns
+/// it, but exactly - keeping the curve and its owner - when upstream would share it
+/// instead. The volume is held by value, so it is a field-wise copy either way.
+///
+/// Infallible, unlike [`CrvInVolume::copy`]: the exact copy of a borrowed curve is
+/// [`Curve`]'s `clone_exact_bounded`, which walks the same nesting-bounded graph the
+/// derived `Clone` this replaces walked (see the module's nesting deviation).
+impl Clone for CrvInVolume {
+    fn clone(&self) -> Self {
+        let owns_curve = self.owns_curve();
+        let owns_volume = self.owns_volume();
+        let owner_flag = match (owns_curve, owns_volume) {
+            (true, true) => 3,
+            (true, false) => 1,
+            (false, true) => 2,
+            (false, false) => 0,
+        };
+        // copy knots when appropriate
+        let (breaks, conts) = if self.need_breaks {
+            (Vec::new(), Vec::new())
+        } else {
+            (self.breaks.clone(), self.conts.clone())
+        };
+        Self {
+            curve: if owns_curve {
+                // an owned curve is copied by its copy constructor
+                self.curve.clone()
+            } else {
+                // a curve shared upstream is an exact copy here
+                self.curve.clone_exact_bounded()
+            },
+            in_param_space: self.in_param_space,
+            volume: self.volume.clone(),
+            need_breaks: self.need_breaks,
+            breaks,
+            conts,
+            owner_flag,
+        }
+    }
 }
 
 impl CrvInVolume {
@@ -272,9 +459,14 @@ impl CrvInVolume {
 
     /// The copy constructor (`Copy`): copies both parts, keeps the break cache when
     /// it is current, and sets the owner flag to 3, 1, 2 or 0 from what this object
-    /// owns.
-    #[must_use]
-    pub fn copy(&self) -> Self {
+    /// owns. A curve this object does not own is shared upstream, so here it is an
+    /// exact copy that keeps its owner (`Curve::clone` would fix its knots up).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Curve::clone_for_evaluation`] on a curve not owned (geometry
+    /// nested too deeply).
+    pub fn copy(&self) -> Result<Self> {
         let owns_curve = self.owns_curve();
         let owns_volume = self.owns_volume();
         let owner_flag = if owns_curve && owns_volume {
@@ -291,15 +483,36 @@ impl CrvInVolume {
         } else {
             (self.breaks.clone(), self.conts.clone())
         };
-        Self {
-            curve: self.curve.clone(),
+        let curve = if owns_curve {
+            self.curve.clone()
+        } else {
+            self.curve.clone_for_evaluation()?
+        };
+        Ok(Self {
+            curve,
             in_param_space: self.in_param_space,
             volume: self.volume.clone(),
             need_breaks: self.need_breaks,
             breaks,
             conts,
             owner_flag,
-        }
+        })
+    }
+
+    /// `CreateMirrorCurve`: a copy of this curve whose volume is mirrored about
+    /// `mirror_plane`. The parts are held by value, so the copy never shares (and the
+    /// mirror never edits) this curve's volume, which upstream does for a volume the
+    /// curve does not own.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Volume::mirror`].
+    pub fn create_mirror_curve(&self, mirror_plane: &Axis2Placement) -> Result<Self> {
+        // copy this curve
+        let mut new_curve = self.copy()?;
+        // mirror the the volume
+        new_curve.volume.mirror(mirror_plane)?;
+        Ok(new_curve)
     }
 
     // ---- simple access --------------------------------------------------------------
@@ -1161,6 +1374,28 @@ impl CrvInVolume {
             .transform_at_depth(rotate_n_move, scale, depth + 1)
     }
 
+    // ---- exact B-spline -------------------------------------------------------------
+
+    /// `MakeExactBSplineIfPossible`: the exact B-spline equivalent (upstream an
+    /// `SmBSplineCurve` or a derived kind) of the base curve mapped through every
+    /// compounded map of the volume to its final out-space; `None` (upstream `NULL`
+    /// with `SM_SUCCESS`) when a map cannot produce one.
+    ///
+    /// # Errors
+    ///
+    /// Those of the curve copies (a twist copies any input curve; upstream then
+    /// dereferences the `NULL` a failed `Copy` leaves); [`SolidError::Unported`] from
+    /// the curve and volume services; `InvalidInput` for a volume chain deeper than
+    /// `MAX_GEOMETRY_NESTING`.
+    pub fn make_exact_b_spline_if_possible_with(&self, k: &Kernel) -> Result<Option<Curve>> {
+        // Ask Volume to make exact BSpline if Possible
+        if self.in_param_space {
+            make_exact_b_spline_out_curve_from_param_space(k, &self.volume, &self.curve)
+        } else {
+            make_exact_b_spline_out_curve_from_in_space(k, &self.volume, &self.curve)
+        }
+    }
+
     // ---- persistence ----------------------------------------------------------------
 
     /// Reads a curve in volume from `db` (database version `version`) (`ReadFromDB`):
@@ -1397,7 +1632,7 @@ mod tests {
         .unwrap();
         assert_eq!(c.owner_flag(), 5);
         assert!(!c.owns_curve() && !c.owns_volume());
-        assert_eq!(c.copy().owner_flag(), 0);
+        assert_eq!(c.copy().unwrap().owner_flag(), 0);
         assert!(c.need_breaks());
         assert!(c.is_kind_of(CrvInVolume::TYPE) && c.is_kind_of(crate::curve::curve::p2::TYPE));
         assert_eq!(c.natural_interval().max(), 1.0);

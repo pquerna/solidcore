@@ -6,6 +6,7 @@
 //! | Rust | Upstream |
 //! |------|----------|
 //! | [`PrimitiveCreation::create_curve_sweep`] | `CreateCurveSweep` |
+//! | [`PrimitiveCreation::create_curve_sweep_with_placements`], `profile_motions` (private) | `CreateCurveSweep` with the SolidCraft fork's `pOptPlacements` |
 //! | [`PrimitiveCreation::create_swung_primitive`] | `CreateSwungPrimitive` |
 //! | [`PrimitiveCreation::create_skin_from_faces`] | `CreateSkinFromFaces` |
 //! | [`PrimitiveCreation::create_blend_primitive`] | `CreateBlendPrimitive` |
@@ -19,9 +20,12 @@
 //! `Kernel::fixes.curve_sweep_caps_at_sweep_ends`): the curve sweep's caps
 //! come from the side faces at the sweep's ends (`sweep_end_curves`), not the first
 //! and last `count` side faces.
+//! Not upstream (the SolidCraft fork's tangency-labs/smlib 5d3939e, WR-523, #1450):
+//! [`PrimitiveCreation::create_curve_sweep_with_placements`] reports the rigid motions
+//! carrying the profile onto the first, middle and last sections.
 
 use super::{
-    geometry::{prepare_curve_sweep, GeometryHandle},
+    geometry::{prepare_curve_sweep, GeometryHandle, PreparedCurveSweep},
     PrimitiveAccess,
 };
 use crate::curve::composite_curve::CompositeCurve;
@@ -29,6 +33,7 @@ use crate::curve::curve::p2::CurvePropertyType;
 use crate::curve::curve::p7::PropertyAnalysisOptions;
 use crate::curve::curve::{Curve, CurveKind};
 use crate::error::{ignore_status, Result, SolidError};
+use crate::geom::axis2_placement::Axis2Placement;
 use crate::math::{Vec3, EFF_ZERO_SQRT};
 use crate::nurbs::b_spline_curve::p1::BSplineCurve;
 use crate::nurbs::b_spline_surface::p1::{BSplineSurface, SurfParamType};
@@ -119,7 +124,11 @@ fn swung_nurb(kernel: &crate::kernel::Kernel, curve: &Curve) -> Result<BSplineCu
         }
         CurveKind::Ellipse(ellipse) => {
             let mut ellipse = ellipse.clone();
-            ignore_status(ellipse.make_nurb_owned(kernel, curve.owner()))?;
+            ignore_status(ellipse.make_nurb_owned_with_edge_tol(
+                kernel,
+                curve.owner(),
+                curve.owner_zone_tol_3d(),
+            ))?;
             Ok(ellipse.base().clone())
         }
         CurveKind::Parabola(parabola) => {
@@ -183,7 +192,8 @@ impl PrimitiveCreation {
                 }
                 let surface = swung_surface(a.kernel(brep)?, path, profile, scale * curve_scale)?;
                 let surface = Surface::from(surface);
-                let domain = surface.natural_uv_domain();
+                // (a B-spline surface just made: never lazy)
+                let domain = surface.natural_uv_domain_if_built();
                 a.surface_faces(brep, surface, domain, &mut faces)?;
             }
         }
@@ -251,7 +261,8 @@ impl PrimitiveCreation {
                 },
             )?;
             let surface = Surface::from(surface);
-            let domain = surface.natural_uv_domain();
+            // (a B-spline surface just made: never lazy)
+            let domain = surface.natural_uv_domain_if_built();
             ignore_status(a.surface_faces(brep, surface, domain, &mut made))?;
             new_faces.extend_from_slice(&made);
         }
@@ -295,7 +306,8 @@ impl PrimitiveCreation {
             )
         })?;
         a.set_editing(brep, true)?;
-        let domain = surface.natural_uv_domain();
+        // (a B-spline surface just made: never lazy)
+        let domain = surface.natural_uv_domain_if_built();
         ignore_status(a.surface_face(brep, surface, domain, output))?;
         Ok(())
     }
@@ -319,16 +331,103 @@ impl PrimitiveCreation {
         side_faces: &mut Vec<FaceId>,
         end_faces: &mut Vec<FaceId>,
     ) -> Result<()> {
+        self.curve_sweep(
+            a,
+            brep,
+            profiles,
+            path,
+            scale_reference,
+            scale_curve,
+            approx_tol,
+            options,
+            test_continuity,
+            start_faces,
+            side_faces,
+            end_faces,
+            None,
+        )
+    }
+
+    /// [`create_curve_sweep`](Self::create_curve_sweep) that also reports where it
+    /// placed the profile (the SolidCraft fork's `pOptPlacements`, tangency-labs/smlib
+    /// 5d3939e, WR-523, #1450): the rigid motions carrying the profile curves as given
+    /// onto the sweep's first, middle and last sections (of the first composite; all
+    /// share the path and its start frame). The B-rep and faces are the same as
+    /// [`create_curve_sweep`](Self::create_curve_sweep)'s.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` with a scale curve (its sections are no rigid images of the
+    /// profile); otherwise those of [`create_curve_sweep`](Self::create_curve_sweep).
+    pub fn create_curve_sweep_with_placements(
+        &mut self,
+        a: &mut impl PrimitiveAccess,
+        brep: BrepId,
+        profiles: &[Option<Curve>],
+        path: &BSplineCurve,
+        scale_reference: Option<&Curve>,
+        scale_curve: Option<&BSplineCurve>,
+        approx_tol: f64,
+        options: SweepOptions,
+        test_continuity: bool,
+        start_faces: &mut Vec<FaceId>,
+        side_faces: &mut Vec<FaceId>,
+        end_faces: &mut Vec<FaceId>,
+    ) -> Result<[Axis2Placement; 3]> {
+        let mut placements = [Axis2Placement::IDENTITY; 3];
+        self.curve_sweep(
+            a,
+            brep,
+            profiles,
+            path,
+            scale_reference,
+            scale_curve,
+            approx_tol,
+            options,
+            test_continuity,
+            start_faces,
+            side_faces,
+            end_faces,
+            Some(&mut placements),
+        )?;
+        Ok(placements)
+    }
+
+    /// `CreateCurveSweep` with the fork's optional `pOptPlacements` output.
+    fn curve_sweep(
+        &mut self,
+        a: &mut impl PrimitiveAccess,
+        brep: BrepId,
+        profiles: &[Option<Curve>],
+        path: &BSplineCurve,
+        scale_reference: Option<&Curve>,
+        scale_curve: Option<&BSplineCurve>,
+        approx_tol: f64,
+        options: SweepOptions,
+        test_continuity: bool,
+        start_faces: &mut Vec<FaceId>,
+        side_faces: &mut Vec<FaceId>,
+        end_faces: &mut Vec<FaceId>,
+        mut opt_placements: Option<&mut [Axis2Placement; 3]>,
+    ) -> Result<()> {
         self.init_entity_maps();
         side_faces.clear();
         if profiles.is_empty() {
             return Err(SolidError::sm_err(OP));
         }
+        // SolidCraft fork (5d3939e): a scaled sweep's sections are no rigid images of the
+        // profile.
+        if opt_placements.is_some() && scale_curve.is_some() {
+            return Err(SolidError::invalid_input(
+                OP,
+                "no placements of a scaled sweep",
+            ));
+        }
         let region = target(self, brep)?;
         let previous = a.kernel(brep)?.context.doing_boolean();
         a.kernel_mut(brep)?.context.set_doing_boolean(true);
         let result = (|| {
-            let prepared = prepare_curve_sweep(
+            let mut prepared = prepare_curve_sweep(
                 a.kernel(brep)?,
                 profiles,
                 path,
@@ -338,26 +437,46 @@ impl PrimitiveCreation {
                 test_continuity,
             )?;
             let count = prepared.profiles.len();
-            let curves = prepared.profiles.into_iter().map(Curve::from).collect();
+            let curves = core::mem::take(&mut prepared.profiles)
+                .into_iter()
+                .map(Curve::from)
+                .collect();
             let composites = CompositeCurve::build_composites_from_curves(
                 a.kernel(brep)?,
                 curves,
                 a.brep(brep)?.tolerance(),
                 0.0,
             )?;
+            // SolidCraft fork (5d3939e): where the sweep places the profile, in the space
+            // it sweeps in (the same for every composite: they share the path and its
+            // start frame).
+            let mut placed = [Axis2Placement::IDENTITY; 3];
             // each composite's side faces (WR-404's caps)
             let mut groups = Vec::new();
-            for mut composite in composites.composites {
+            for (index, mut composite) in composites.composites.into_iter().enumerate() {
                 let profile = composite.make_composite_nurb()?;
-                let surface = BSplineSurface::create_sweep_surface(
-                    &profile,
-                    &prepared.path,
-                    prepared.scale.as_ref(),
-                    options.translational_sweep,
-                    approx_tol,
-                )?;
+                let surface = if index == 0 && opt_placements.is_some() {
+                    let (surface, at) = BSplineSurface::create_sweep_surface_with_placements(
+                        &profile,
+                        &prepared.path,
+                        prepared.scale.as_ref(),
+                        options.translational_sweep,
+                        approx_tol,
+                    )?;
+                    placed = at;
+                    surface
+                } else {
+                    BSplineSurface::create_sweep_surface(
+                        &profile,
+                        &prepared.path,
+                        prepared.scale.as_ref(),
+                        options.translational_sweep,
+                        approx_tol,
+                    )?
+                };
                 let surface = Surface::from(surface);
-                let domain = surface.natural_uv_domain();
+                // (a B-spline surface just made: never lazy)
+                let domain = surface.natural_uv_domain_if_built();
                 let mut made = Vec::new();
                 ignore_status(a.surface_faces(brep, surface, domain, &mut made))?;
                 let first = side_faces.len();
@@ -371,6 +490,14 @@ impl PrimitiveCreation {
                 &prepared.path_back
             };
             ignore_status(a.transform_primitive(brep, placement))?;
+            // SolidCraft fork (5d3939e): the motions carrying the profile as given onto
+            // its first, middle and last sections. A profile point went forward into the
+            // sweep's space (to the origin, the path turned onto x, oriented with the path
+            // when asked), the sweep placed it, and the result came back: each motion is
+            // that chain, applied to the global system.
+            if let Some(out) = opt_placements.as_deref_mut() {
+                *out = profile_motions(&prepared, placement, &placed);
+            }
             if options.cap_ends && a.kernel(brep)?.fixes.curve_sweep_caps_at_sweep_ends {
                 // not upstream (WR-404, #411, opt-in)
                 let (mut starts, mut ends) = sweep_end_curves(
@@ -390,7 +517,7 @@ impl PrimitiveCreation {
                 let total = side_faces.len();
                 for (i, &face) in side_faces.iter().enumerate() {
                     let surface = face_surface(a, (brep, face))?;
-                    let domain = surface.natural_uv_domain();
+                    let domain = surface.natural_uv_domain_with_nurb(a.kernel(brep)?)?;
                     if i < count {
                         direction = if options.translational_sweep {
                             SurfParamType::V
@@ -445,6 +572,44 @@ impl PrimitiveCreation {
     }
 }
 
+/// The rigid motions carrying the profile as given onto the sweep's sections placed
+/// on `placed` (in the sweep's space), with `back_move` the move back from the path
+/// (the SolidCraft fork's `pOptPlacements` of `CreateCurveSweep`, tangency-labs/smlib
+/// 5d3939e): the global system carried forward (profile to the origin, path turned onto
+/// x, oriented when asked), placed, and carried back.
+fn profile_motions(
+    prepared: &PreparedCurveSweep,
+    back_move: &Axis2Placement,
+    placed: &[Axis2Placement; 3],
+) -> [Axis2Placement; 3] {
+    let forward = |q: Vec3| {
+        let a = prepared.profile_to_origin.transform_point(q);
+        let b = prepared.rotation.transform_point(a);
+        match &prepared.orientation {
+            Some(orientation) => orientation.transform_point(b),
+            None => b,
+        }
+    };
+    let back = |q: Vec3| {
+        let a = prepared.rotation_back.transform_point(q);
+        back_move.transform_point(a)
+    };
+    let turned = |at: &Axis2Placement, v: Vec3| {
+        let a = prepared.rotation.transform_vector(v);
+        let b = match &prepared.orientation {
+            Some(orientation) => orientation.transform_vector(a),
+            None => a,
+        };
+        let c = at.transform_vector(b);
+        let d = prepared.rotation_back.transform_vector(c);
+        back_move.transform_vector(d)
+    };
+    placed.map(|at| {
+        let origin = at.transform_point(forward(Vec3::ZERO));
+        Axis2Placement::new(back(origin), turned(&at, Vec3::X), turned(&at, Vec3::Y))
+    })
+}
+
 /// The 3D curves of one cap's loops, as `planar_faces` takes them.
 type CapCurves = Vec<Option<Curve>>;
 
@@ -471,7 +636,8 @@ fn sweep_end_curves(
     for group in groups {
         let mut spans = Vec::new();
         for &face in side_faces.get(group.clone()).unwrap_or_default() {
-            let domain = face_surface(a, (brep, face))?.natural_uv_domain();
+            let domain =
+                face_surface(a, (brep, face))?.natural_uv_domain_with_nurb(a.kernel(brep)?)?;
             let span = if translational {
                 (domain.min().y, domain.max().y)
             } else {
@@ -565,8 +731,8 @@ mod tests {
                 &Curve::from(profile),
                 0.5,
             )?);
-            let domain = surface.natural_uv_domain();
-            assert_eq!(domain, expected.natural_uv_domain());
+            let domain = surface.natural_uv_domain_if_built();
+            assert_eq!(domain, expected.natural_uv_domain_if_built());
             for i in 0..=4 {
                 for j in 0..=4 {
                     let uv = domain.evaluate(f64::from(i) / 4.0, f64::from(j) / 4.0);
@@ -586,7 +752,7 @@ mod tests {
         let profile = imported_line(Vec3::new(2.0, 0.0, 0.0), Vec3::Z, 1.0);
         let path = Curve::from(Line::from_points(Vec3::X, Vec3::X + Vec3::Y, 3));
         let surface = Surface::from(swung_surface(&kernel, &path, &profile, 1.0)?);
-        let uv = surface.natural_uv_domain().min();
+        let uv = surface.natural_uv_domain_if_built().min();
         let point = surface.evaluate_point(&kernel, uv)?;
         // Surface construction uses the existing NURB, even though scale
         // initialization above must use the original analytic evaluations.

@@ -24,7 +24,7 @@
 //! | [`Surface::create_extended_surface`], [`Surface::create_extended_surface_dir`] | `CreateExtendedSurface` (both) |
 //! | [`Surface::drop_point_fast`]                      | `DropPointFast`                                  |
 //! | [`Surface::evaluate`], [`Surface::evaluate_point`] | `Evaluate`, `EvaluatePoint`                     |
-//! | [`Surface::natural_uv_domain`], [`Surface::step_uv_domain`] | `GetNaturalUVDomain`, `GetSTEPUVDomain` |
+//! | [`Surface::natural_uv_domain_if_built`], [`Surface::step_uv_domain`] | `GetNaturalUVDomain`, `GetSTEPUVDomain` |
 //! | [`Surface::degree`], [`Surface::number_control_points`] | `GetDegree`, `GetNumberControlPoints`       |
 //! | [`Surface::max_analytic_domain`]                  | `GetMaxAnalyticDomain`                           |
 //! | [`Surface::is_bilinear`], [`Surface::is_parallel_to_vector`] | `IsBilinear`, `IsParallelToVector`    |
@@ -36,6 +36,7 @@
 //! | [`Surface::convert_uv_from_step_to_nurbs`], [`Surface::convert_uv_from_nurbs_to_step`] | `ConvertUVFromSTEPToNURBS`, `ConvertUVFromNURBSToSTEP` |
 //! | [`Surface::curve_on_classify`]                    | `CurveOnClassify`                                |
 //! | [`Surface::global_surface_intersect`], [`base_global_surface_intersect`], [`SurfaceIntersection`] | `GlobalSurfaceIntersect` (virtual: the `SmPlane` override in `surface::plane::p2`; the `SmSurface` body) |
+//! | [`Surface::global_surface_intersect_with_partial`] | `GlobalSurfaceIntersect` with the outputs left in the caller's arrays on a failure |
 //! | [`Surface::point_based_surface_intersect`], [`PointIntersection`] | `PointBasedSurfaceIntersect` (UV point version) |
 //! | [`Surface::read_from_db`]                         | `SmSurface::ReadFromDB`                          |
 //! | [`Surface::create_plane_with_3d_curves`], [`PlaneWith3dCurves`] | `CreatePlaneWith3DCurves`          |
@@ -63,10 +64,25 @@
 //! | [`IsoCurveLengthIntegrand`]                       | `SmIsoCurveLengthIFEO` (constructor)             |
 //!
 //! Deviations:
+//! - **Output arrays.** `GlobalSurfaceIntersect`'s output arrays are a
+//!   `&mut SurfaceIntersection` threaded through the kind dispatchers and the special
+//!   cases that can fail after appending (the `*_into` functions), so a failure leaves in
+//!   it what upstream leaves in the caller's arrays
+//!   ([`Surface::global_surface_intersect_with_partial`]). The general intersection
+//!   resets them first (`SmSurfaceIntersector::DoIntersection`): a special case that asks
+//!   for it keeps none of its own outputs.
 //! - **Touching loops** (not upstream, WR-405, tangency-labs/solidcore#892, opt-in
 //!   `Kernel::fixes.join_touching_loops`): `create_plane_with_3d_curves`
 //!   joins a loop touching another loop of its face at a vertex into that loop
 //!   (`join_touching_loops`, the SolidCraft fork's `JoinTouchingLoops`).
+//! - **Edit notifications.** `SwapUV`'s `Notify` calls (`SetCanonical`'s for the
+//!   kinds built on `SmBSplineSurface`, `SmSrfInVolume`'s own) need a context and an
+//!   attribute store the surface does not hold: [`Surface::swap_uv`] notifies nobody
+//!   (only `SmSurface::Notify`'s trimmed surface cache deletion runs) and the
+//!   crate-private `Surface::swap_uv_notifying` hands each edited surface's identity
+//!   slot to the caller's hook (the face's `SwapUV` sends them through its
+//!   environment). A trimmed surface cache in use when the swap notifies stays with its
+//!   caller (upstream deletes the object the caller holds).
 //! - **Nesting.** [`MAX_GEOMETRY_NESTING`] (32, the database reader's bound; upstream
 //!   fixtures nest at most 3) bounds wrapper geometry across curves, surfaces and
 //!   volumes. Every wrapper constructor and setter checks its inner geometry with the
@@ -185,18 +201,25 @@
 //!   NURB (`GetOrCreateGwNurbPointer`); [`Surface::degree`] and [`Surface::knots`] read
 //!   the stored base, so a lazy extrusion, cone, sphere or torus answers `0` / the
 //!   NURB-less base. [`Surface::degree_with_nurb`] and [`Surface::knots_with_nurb`] answer
-//!   as upstream and serve the callers that hold a kernel. Callers without one still
-//!   read the stored base: `Surface::domain_with_continuity_using`,
-//!   `Surface::snap_to_knots`, `SurfaceCache::surface_continuity`, the offset surface's
-//!   and the surface-in-volume's `knots`, and `IsoCurve::knots` (a kernel would change
-//!   their signatures).
-//! - **Made NURB.** An analytic kind without a NURB makes one for `const` queries; the
-//!   surface keeps the made kind (`NurbMemo`, [`Surface::kind_with_nurb`]) for later
-//!   queries, emptied by any mutable access to the kind and absent on copies. A
-//!   surface of extrusion's made copy is exact (no copy-constructor knot fix-up), as its
-//!   query copy `base_with_nurb`, so its evaluations through the kept copy are those of
-//!   a fresh make. As upstream's NURB on the object, it is not keyed on the [`Kernel`]
-//!   the make used.
+//!   as upstream and serve the callers that hold a kernel. `SurfaceEvaluate::knots`,
+//!   `Surface::snap_to_knots` and `Surface::domain_with_continuity_from_cache` take the
+//!   kernel for it. Callers without one still read the stored base:
+//!   `SurfaceCache::surface_continuity`, the offset surface's and the surface-in-volume's
+//!   inherent `knots`, and `IsoCurve::knots` (a kernel would change their signatures).
+//! - **Made NURB.** An analytic kind without a NURB makes one for `const` queries
+//!   ([`Surface::kind_with_nurb`]), as upstream's `GetOrCreateGwNurbPointer`. A plane
+//!   and a surface of extrusion keep it in their own NURB slot (filled once from
+//!   `&self`), so `kind()`, copies and `operator==` see it as upstream. A cone, sphere,
+//!   torus or surface of revolution's `MakeNurb` also rebuilds its polar converter and
+//!   may trim its generator, so the surface keeps the whole made kind (`MadeKindSlot`,
+//!   filled once from `&self`) and [`Surface::kind`] answers it from then on: `kind()`
+//!   readers, copies (`Clone` copies the made object; [`Surface::copy`] first makes the
+//!   source's NURB, as the copy constructor does) and `operator==` see it. Evaluation
+//!   copies share the cell (upstream's pointer to the one object); `&mut` access moves
+//!   the made kind into the surface first, on a cell of its own, so an edit applies to
+//!   the made object and reaches no other surface. `Clone` itself cannot make a missing
+//!   NURB first (that needs the [`Kernel`]). As upstream's NURB on the
+//!   object, neither is keyed on the [`Kernel`] the make used.
 
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -251,7 +274,7 @@ use crate::surface::plane::Plane;
 use crate::surface::sphere::Sphere;
 use crate::surface::srf_in_volume::SrfInVolume;
 use crate::surface::surf_of_extrusion::SurfOfExtrusion;
-use crate::surface::surf_of_revolution::p3::intersect_revolved;
+use crate::surface::surf_of_revolution::p3::intersect_revolved_into;
 use crate::surface::surf_of_revolution::{Revolved, SurfOfRevolution};
 use crate::surface::surface::p1::{StepSurface, SurfaceIntersectContext, SurfaceSolveContext};
 use crate::surface::surface::p8::BoundaryMemo;
@@ -307,6 +330,7 @@ pub const fn is_kind_of(t: i64) -> bool {
 }
 
 const OP_BASE: &str = "surface::surface::p2::Surface";
+const OP_MIRROR: &str = "surface::surface::p2::Surface::create_mirror_surface";
 const OP_READ: &str = "surface::surface::p2::Surface::read_from_db";
 const OP_EVAL: &str = "surface::surface::p2::SurfaceEval::eval";
 const OP_DERIV: &str = "surface::surface::p2::DerivSurfDefinition";
@@ -374,9 +398,10 @@ pub struct Surface {
     /// The identity a context issued this surface object for its notifications
     /// (upstream passes the object itself, known by address); a copy has none.
     notify_identity: IdentitySlot,
-    /// The NURB an analytic kind made on first use from a `const` method
-    /// ([`Surface::kind_with_nurb`], [`NurbMemo`]).
-    made_nurb: NurbMemo,
+    /// The kind a cone, sphere, torus or surface of revolution made its NURB in on
+    /// first use from a `const` method ([`Surface::kind_with_nurb`], [`MadeKindSlot`]);
+    /// [`Surface::kind`] answers it once filled.
+    made_kind: MadeKindSlot,
     /// Not upstream: the memo of the natural boundary curves `CoincidenceCheck` makes
     /// (`BoundaryMemo`); a copy starts an empty one, an edit replaces it.
     boundary_memo: BoundaryMemo,
@@ -471,21 +496,82 @@ impl CacheSlot {
     }
 }
 
-/// `GetOrCreateGwNurbPointer` called from a `const` method of an analytic kind that has
-/// no NURB yet (cone, sphere, torus, surface of revolution or extrusion): upstream runs
-/// the virtual `MakeNurb` and keeps the NURB on the surface, so every later call sees
-/// it. The port's `&self` methods cannot fill the kind in place; the kind with its NURB
-/// made is kept here instead, once, and dropped whenever the kind is changed
-/// ([`Surface::kind_mut`] and the kind's in-place edits). A copy starts empty.
+/// `GetOrCreateGwNurbPointer` called from a `const` method of a cone (or cylinder),
+/// sphere, torus or surface of revolution that has no NURB yet (a plane and an
+/// extrusion keep theirs in their own [`NurbSlot`](crate::nurbs::b_spline_surface)):
+/// upstream runs the virtual `MakeNurb` on the object and keeps the result, so every
+/// later reader sees it. `SmSurfOfRevolution::MakeNurbWithSweepParams` changes more
+/// than the NURB: it may trim the generator (`AdjustSTEPInterval`) and it rebuilds the
+/// polar converter. The slot therefore keeps the whole made kind, filled once from
+/// `&self`, and [`Surface::kind`] answers it from then on, so `kind()` readers, the copy
+/// constructor ([`Clone`]) and `operator==` see the made object, as upstream.
+///
+/// The cell sits behind an `Arc` so that an evaluation copy (upstream's pointer to the
+/// same object, [`Surface::clone_for_evaluation`]) shares it, as it shares a plane's
+/// NURB cell: a NURB made through the copy stays on the surface. Every `&mut` access to
+/// the kind first moves the made kind into the surface ([`MadeKindSlot::take_for_edit`]),
+/// leaving this surface a cell of its own, so an edit applies to the made object (as
+/// upstream's edits do) and never reaches another surface sharing the cell. The made
+/// kind depends only on the surface's own data, so the result is deterministic.
 #[derive(Debug, Default)]
-struct NurbMemo(std::sync::OnceLock<Box<SurfaceKind>>);
+struct MadeKindSlot(Arc<std::sync::OnceLock<Box<SurfaceKind>>>);
 
 const OP_KIND_WITH_NURB: &str = "surface::surface::p2::Surface::kind_with_nurb";
 
-impl NurbMemo {
-    /// Forgets the made NURB (the kind changed).
-    fn reset(&mut self) {
-        self.0 = std::sync::OnceLock::new();
+impl MadeKindSlot {
+    /// The same cell (an evaluation copy stands for the same surface object).
+    fn shared(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+
+    /// The made kind, if any.
+    fn get(&self) -> Option<&SurfaceKind> {
+        self.0.get().map(AsRef::as_ref)
+    }
+
+    /// Stores `made` when no kind was made yet (the first fill wins, as upstream's
+    /// `GetOrCreateGwNurbPointer` makes once) and returns the stored kind.
+    fn fill(&self, made: SurfaceKind) -> &SurfaceKind {
+        self.0.get_or_init(|| Box::new(made))
+    }
+
+    /// Takes the made kind out for an edit of this surface and leaves this surface an
+    /// empty cell of its own. A cell shared with evaluation copies keeps its kind for
+    /// them; this surface then takes an exact copy of it.
+    fn take_for_edit(&mut self) -> Option<SurfaceKind> {
+        match Arc::try_unwrap(core::mem::take(&mut self.0)) {
+            Ok(cell) => cell.into_inner().map(|made| *made),
+            Err(shared) => shared.get().map(|made| clone_kind_exact(made)),
+        }
+    }
+}
+
+/// An exact copy of a kind kept in a [`MadeKindSlot`] (a cone, sphere, torus or surface
+/// of revolution): the B-spline objects are copied as they are
+/// ([`SurfOfRevolution::clone_exact`]), not through the copy constructor's knot fix-up,
+/// and a torus keeps its inside-out flag, which its copy constructor resets.
+fn clone_kind_exact(kind: &SurfaceKind) -> SurfaceKind {
+    match kind {
+        SurfaceKind::Cone(s) => {
+            let mut c = s.as_ref().clone();
+            c.rev = s.rev().clone_exact();
+            SurfaceKind::Cone(Box::new(c))
+        }
+        SurfaceKind::Sphere(s) => {
+            let mut c = s.as_ref().clone();
+            c.base = s.base().clone_exact();
+            SurfaceKind::Sphere(Box::new(c))
+        }
+        SurfaceKind::Torus(s) => {
+            let mut c = s.as_ref().clone();
+            c.base = s.base().clone_exact();
+            c.inside_out = s.inside_out;
+            SurfaceKind::Torus(Box::new(c))
+        }
+        SurfaceKind::SurfOfRevolution(s) => {
+            SurfaceKind::SurfOfRevolution(Box::new(s.clone_exact()))
+        }
+        other => other.clone(),
     }
 }
 
@@ -494,13 +580,15 @@ impl NurbMemo {
 impl Clone for Surface {
     fn clone(&self) -> Self {
         let mut s = Self {
-            kind: self.kind.clone(),
+            // (the made kind when a `const` query made the NURB: the copy constructor
+            // copies the object as it is)
+            kind: self.kind().clone(),
             owner: None,
             owner_chain_face: None,
             owner_zone_tol_3d: None,
             cache_slot: CacheSlot::default(),
             notify_identity: IdentitySlot::new(),
-            made_nurb: NurbMemo::default(),
+            made_kind: MadeKindSlot::default(),
             boundary_memo: BoundaryMemo::new(),
         };
         s.update_owned_bases();
@@ -511,7 +599,7 @@ impl Clone for Surface {
 impl Surface {
     /// A temporary evaluation copy: retain the owner and exact NURBS data rather
     /// than invoking the upstream copy constructor's knot fix-up.
-    pub(crate) fn clone_for_evaluation(&self) -> Result<Self> {
+    pub fn clone_for_evaluation(&self) -> Result<Self> {
         self.clone_for_evaluation_depth(0)
     }
 
@@ -668,6 +756,10 @@ pub(crate) fn check_geometry_nesting(
                     push(Geometry::Curve(c.uv_curve()));
                     push(Geometry::Surface(c.surface()));
                 }
+                CurveKind::TangentField(c) => {
+                    push(Geometry::Curve(c.base().uv_curve()));
+                    push(Geometry::Surface(c.base().surface()));
+                }
                 CurveKind::Composite(c) => {
                     for segment in c.segments() {
                         push(Geometry::Curve(&segment.curve));
@@ -698,7 +790,7 @@ impl Surface {
         self.check_evaluation_copy_depth(depth)?;
         let kind = match &self.kind {
             SurfaceKind::BSpline(s) => SurfaceKind::BSpline(s.clone_exact()),
-            SurfaceKind::Plane(s) => SurfaceKind::Plane(s.clone_exact()),
+            SurfaceKind::Plane(s) => SurfaceKind::Plane(s.clone_shared()),
             SurfaceKind::Cone(s) => SurfaceKind::Cone(Box::new(Cone {
                 rev: s.rev().clone_for_evaluation(depth + 1)?,
                 base_radius: s.base_radius,
@@ -717,12 +809,13 @@ impl Surface {
                 minor_radius: s.minor_radius,
                 // The copy constructor resets this flag; an evaluation copy must not.
                 inside_out: s.inside_out,
+                keeps_inside_out: s.keeps_inside_out,
             })),
             SurfaceKind::SurfOfRevolution(s) => {
                 SurfaceKind::SurfOfRevolution(Box::new(s.clone_for_evaluation(depth + 1)?))
             }
             SurfaceKind::SurfOfExtrusion(s) => {
-                SurfaceKind::SurfOfExtrusion(Box::new(s.clone_for_evaluation(depth + 1)?))
+                SurfaceKind::SurfOfExtrusion(Box::new(s.clone_for_evaluation_shared(depth + 1)?))
             }
             SurfaceKind::Step(s) => SurfaceKind::Step(s.clone_for_evaluation(depth + 1)?),
             SurfaceKind::CurveBounded(s) => {
@@ -742,16 +835,39 @@ impl Surface {
             owner_zone_tol_3d: self.owner_zone_tol_3d,
             cache_slot: self.cache_slot.share(),
             notify_identity: IdentitySlot::new(),
-            made_nurb: NurbMemo::default(),
+            made_kind: self.made_kind.shared(),
             boundary_memo: BoundaryMemo::new(),
         })
+    }
+
+    /// Detaches the NURB cells this surface's planes and surfaces of extrusion (and the
+    /// made-kind cells of its cones, spheres, tori and surfaces of revolution) share
+    /// with evaluation copies, through the whole surface tree (offset, STEP,
+    /// curve-bounded and in-volume bases). Iterative (an explicit stack), so no input
+    /// depth bound applies. Surfaces held by curves (a curve-bounded surface's trim
+    /// curves, generator curves) are not reached.
+    pub(crate) fn detach_nurb_cells(&mut self) {
+        let mut stack: Vec<&mut Surface> = vec![self];
+        while let Some(s) = stack.pop() {
+            // (a kept made kind moves into the surface, on a cell of its own)
+            s.take_made_kind_for_edit();
+            match &mut s.kind {
+                SurfaceKind::Plane(p) => p.detach_nurb(),
+                SurfaceKind::SurfOfExtrusion(e) => e.detach_nurb(),
+                SurfaceKind::Step(st) => stack.extend(st.nested_surfaces_mut()),
+                SurfaceKind::CurveBounded(c) => stack.extend(c.nested_surfaces_mut()),
+                SurfaceKind::SrfInVolume(v) => stack.extend(v.nested_surfaces_mut()),
+                SurfaceKind::OffsetSurface(o) => stack.extend(o.nested_surfaces_mut()),
+                _ => {}
+            }
+        }
     }
 
     /// Exact recursive copy after the caller has validated the complete geometry graph.
     pub(crate) fn clone_exact_bounded(&self) -> Self {
         let kind = match &self.kind {
             SurfaceKind::BSpline(s) => SurfaceKind::BSpline(s.clone_exact()),
-            SurfaceKind::Plane(s) => SurfaceKind::Plane(s.clone_exact()),
+            SurfaceKind::Plane(s) => SurfaceKind::Plane(s.clone_shared()),
             SurfaceKind::Cone(s) => {
                 let mut c = s.as_ref().clone();
                 c.rev = s.rev().clone_exact();
@@ -774,7 +890,9 @@ impl Surface {
                 SurfaceKind::SurfOfRevolution(Box::new(s.clone_exact()))
             }
             SurfaceKind::SurfOfExtrusion(s) => {
-                SurfaceKind::SurfOfExtrusion(Box::new(s.clone_exact()))
+                let mut c = s.clone_exact();
+                c.base = s.base().clone_exact_shared();
+                SurfaceKind::SurfOfExtrusion(Box::new(c))
             }
             SurfaceKind::Step(s) => SurfaceKind::Step(s.clone_exact_bounded()),
             SurfaceKind::CurveBounded(s) => SurfaceKind::CurveBounded(s.clone_exact_bounded()),
@@ -790,7 +908,7 @@ impl Surface {
             owner_zone_tol_3d: self.owner_zone_tol_3d,
             cache_slot: self.cache_slot.share(),
             notify_identity: IdentitySlot::new(),
-            made_nurb: NurbMemo::default(),
+            made_kind: self.made_kind.shared(),
             boundary_memo: BoundaryMemo::new(),
         }
     }
@@ -942,7 +1060,7 @@ impl Surface {
             owner_zone_tol_3d: None,
             cache_slot: CacheSlot::default(),
             notify_identity: IdentitySlot::new(),
-            made_nurb: NurbMemo::default(),
+            made_kind: MadeKindSlot::default(),
             boundary_memo: BoundaryMemo::new(),
         }
     }
@@ -1127,6 +1245,47 @@ impl Surface {
             .with(|s| matches!(s.trim, TrimCacheSlot::CheckedOut))
     }
 
+    /// Gives this surface (a copy of `src` standing for it in a B-rep copied into new
+    /// arenas, its owner already renamed) what `src`'s cache slot holds: its tree state
+    /// and its kept trimmed surface cache, the cache's topology handles renamed by
+    /// `map` and its face binding keyed to this surface's owner. `src` keeps its own.
+    /// Upstream has one surface object, so nothing is copied there; this keeps a copy's
+    /// later cache lookups seeing the cache the original's earlier ones made
+    /// ([`Clone`] gives a copy an empty slot).
+    ///
+    /// # Errors
+    ///
+    /// Those of `map` and of the cache copy; [`SolidError::InvalidInput`] when `src`'s
+    /// trimmed cache is in use.
+    pub fn copy_cache_slot_of(
+        &self,
+        src: &Self,
+        map: impl Fn(EntityRef) -> Result<EntityRef>,
+    ) -> Result<()> {
+        match src.take_trim_cache() {
+            TrimCacheSlot::Empty => {}
+            TrimCacheSlot::CheckedOut => {
+                return Err(SolidError::invalid_input(
+                    "surface::copy_cache_slot_of",
+                    "the trimmed surface cache is in use",
+                ))
+            }
+            TrimCacheSlot::Stored(cache) => {
+                let copied = cache.map_handles(&map).and_then(|mut copy| {
+                    let surface = copy.base_mut().surface_mut();
+                    surface.cache_slot = self.cache_slot.share();
+                    surface.adopt_owner_of(self);
+                    copy.base_mut().rekey_trimmed_face()?;
+                    Ok(copy)
+                });
+                Self::store_trim_cache(*cache);
+                Self::store_trim_cache(copied?);
+            }
+        }
+        self.set_cache_tree_state(src.cache_tree_state());
+        Ok(())
+    }
+
     /// Makes this surface share `other`'s cache slot: `self` is a copy that stands for
     /// the same surface object (a private snapshot of a B-rep standing for the B-rep
     /// itself).
@@ -1141,20 +1300,50 @@ impl Surface {
         self.cache_slot.same(&other.cache_slot)
     }
 
+    /// A copy as [`Clone`] that shares this surface's cache slot, standing for the same
+    /// surface object as far as its caches go: a cache built on the copy is this
+    /// surface's (a port-side stand-in for one upstream surface pointer).
+    #[must_use]
+    pub(crate) fn clone_sharing_cache(&self) -> Self {
+        let mut copy = self.clone();
+        copy.cache_slot = self.cache_slot.share();
+        copy
+    }
+
     /// The boundary curve memo of `CoincidenceCheck` (see `BoundaryMemo`).
     pub(crate) const fn boundary_memo(&self) -> &BoundaryMemo {
         &self.boundary_memo
     }
 
-    /// The concrete kind.
+    /// The concrete kind: once a `const` query made a cone's, sphere's, torus's or
+    /// surface of revolution's missing NURB ([`Surface::kind_with_nurb`]), the made kind
+    /// kept on this surface ([`MadeKindSlot`]), as upstream keeps the made NURB on the
+    /// object.
     #[must_use]
-    pub const fn kind(&self) -> &SurfaceKind {
-        &self.kind
+    pub fn kind(&self) -> &SurfaceKind {
+        self.made_kind.get().unwrap_or(&self.kind)
     }
 
-    /// The concrete kind, mutable (forgets a NURB made by [`Surface::kind_with_nurb`]).
+    /// Moves a kind made by [`Surface::kind_with_nurb`] into this surface before an
+    /// edit (the edit applies to the made object, as upstream's), detaching it from the
+    /// evaluation copies sharing the cell.
+    fn take_made_kind_for_edit(&mut self) {
+        if let Some(made) = self.made_kind.take_for_edit() {
+            self.kind = made;
+        }
+    }
+
+    /// The concrete kind, mutable: a kind made by [`Surface::kind_with_nurb`] is moved
+    /// into the surface first, and a plane's or extrusion's NURB cell (and a made kind's
+    /// cell) is detached from the evaluation copies sharing it, so an edit applies to
+    /// the made object and stays with this surface.
     pub fn kind_mut(&mut self) -> &mut SurfaceKind {
-        self.made_nurb.reset();
+        self.take_made_kind_for_edit();
+        match &mut self.kind {
+            SurfaceKind::Plane(s) => s.detach_nurb(),
+            SurfaceKind::SurfOfExtrusion(s) => s.detach_nurb(),
+            _ => {}
+        }
         // an edit makes another surface value: start an empty boundary memo
         self.boundary_memo = BoundaryMemo::new();
         &mut self.kind
@@ -1163,80 +1352,81 @@ impl Surface {
     /// The concrete kind with its NURB (`GetOrCreateGwNurbPointer` from a `const`
     /// method): this surface's kind when it is not analytic or has its NURB, else the
     /// kind with the NURB its virtual `MakeNurb` makes (status ignored, as upstream: a
-    /// NURB that cannot be made stays missing), made once and kept on this surface as
-    /// upstream keeps it ([`NurbMemo`]).
+    /// NURB that cannot be made stays missing), made once on an exact copy and kept on
+    /// this surface ([`MadeKindSlot`]; a plane's and an extrusion's NURB in their own
+    /// NURB slot), so that [`Surface::kind`] answers it from then on, as upstream keeps
+    /// it on the object.
     ///
     /// # Errors
     ///
     /// [`SolidError::Unported`] from `MakeNurb`.
     pub fn kind_with_nurb(&self, k: &Kernel) -> Result<&SurfaceKind> {
+        if let Some(made) = self.made_kind.get() {
+            return Ok(made);
+        }
         let missing = match &self.kind {
             SurfaceKind::Cone(s) => s.rev().base().gw_nurb().is_none(),
             SurfaceKind::Sphere(s) => s.base().base().gw_nurb().is_none(),
             SurfaceKind::Torus(s) => s.base().base().gw_nurb().is_none(),
             SurfaceKind::SurfOfRevolution(s) => s.base().gw_nurb().is_none(),
-            SurfaceKind::SurfOfExtrusion(s) => s.base().gw_nurb().is_none(),
+            SurfaceKind::SurfOfExtrusion(s) => {
+                // made once and kept in the extrusion's own NURB slot
+                // (`SurfOfExtrusion::base_with_nurb`; status ignored, as upstream)
+                if s.base().gw_nurb().is_none() {
+                    match s.base_with_nurb(k) {
+                        Err(e) if e.is_unported() => return Err(e),
+                        _ => {}
+                    }
+                }
+                false
+            }
             _ => false,
         };
         if !missing {
             return Ok(&self.kind);
         }
-        if let Some(made) = self.made_nurb.0.get() {
-            return Ok(made);
-        }
-        let mut kind = match &self.kind {
-            // an exact copy, as SurfOfExtrusion::base_with_nurb makes for a query (no
-            // copy-constructor knot fix-up: upstream makes the NURB on the object itself)
-            SurfaceKind::SurfOfExtrusion(s) => {
-                SurfaceKind::SurfOfExtrusion(Box::new(s.clone_for_evaluation(0)?))
-            }
-            _ => self.kind.clone(),
-        };
+        let mut kind = clone_kind_exact(&self.kind);
         match &mut kind {
             SurfaceKind::Cone(s) => ignore_status(s.make_nurb(k))?,
             SurfaceKind::Sphere(s) => ignore_status(s.make_nurb(k))?,
             SurfaceKind::Torus(s) => ignore_status(s.make_nurb(k))?,
             SurfaceKind::SurfOfRevolution(s) => ignore_status(s.make_nurb(k))?,
-            SurfaceKind::SurfOfExtrusion(s) => ignore_status(s.make_nurb(k))?,
             _ => {}
         }
-        Ok(self.made_nurb.0.get_or_init(|| Box::new(kind)))
+        Ok(self.made_kind.fill(kind))
     }
 
     /// [`SurfOfExtrusion::base_with_nurb`] of this surface (a surface of extrusion),
-    /// with the made NURB kept ([`Surface::kind_with_nurb`]): an extrusion with a NURB
-    /// lends its base; one without lends the kept made copy, which is the copy
-    /// `base_with_nurb` makes (the same exact copy and `MakeNurb`, so the same NURB bit
-    /// for bit). When `MakeNurb` fails, `base_with_nurb` runs again for its error.
+    /// which makes a missing NURB once and keeps it on the extrusion.
     ///
     /// # Errors
     ///
     /// `SM_ERR` when this surface is not a surface of extrusion; those of
-    /// [`SurfOfExtrusion::base_with_nurb`] and [`Surface::kind_with_nurb`].
+    /// [`SurfOfExtrusion::base_with_nurb`].
     pub(crate) fn extrusion_base_with_nurb(&self, k: &Kernel) -> Result<Cow<'_, BSplineSurface>> {
         let SurfaceKind::SurfOfExtrusion(s) = &self.kind else {
             return Err(SolidError::sm_err(OP_KIND_WITH_NURB));
         };
-        if s.base().gw_nurb().is_some() {
-            return s.base_with_nurb(k);
-        }
-        match self.kind_with_nurb(k)? {
-            SurfaceKind::SurfOfExtrusion(made) if made.base().gw_nurb().is_some() => {
-                Ok(Cow::Borrowed(made.base()))
-            }
-            _ => s.base_with_nurb(k),
-        }
+        s.base_with_nurb(k)
     }
 
-    /// Whether a made NURB is kept ([`NurbMemo`]; for tests).
+    /// Whether a made kind is kept ([`MadeKindSlot`]; for tests).
     #[cfg(test)]
     pub(crate) fn has_made_nurb(&self) -> bool {
-        self.made_nurb.0.get().is_some()
+        self.made_kind.get().is_some()
     }
 
-    /// The concrete kind, by value.
+    /// Whether `self` and `other` share one made-kind cell (stand for the same surface
+    /// object; for tests).
+    #[cfg(test)]
+    pub(crate) fn shares_made_kind_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.made_kind.0, &other.made_kind.0)
+    }
+
+    /// The concrete kind, by value (a made kind, [`Surface::kind`], when one is kept).
     #[must_use]
-    pub fn into_kind(self) -> SurfaceKind {
+    pub fn into_kind(mut self) -> SurfaceKind {
+        self.take_made_kind_for_edit();
         self.kind
     }
 
@@ -1344,6 +1534,11 @@ impl Surface {
             Some(tol) => Ok(Some(tol)),
             // UNPORTED(topology.face_p2): SmFace::GetTolerance (a bare face handle
             // without the tolerance its B-rep records here)
+            // Proof (unreachable): a B-rep face's surface always carries the face
+            // tolerance: Brep::add_face_record and each set_owner(Some(face)) rebind (merge
+            // adapter, sweep store, brep p7, primitive merge) call
+            // sync_face_surface_tolerance; 0 hits in the green difftest sweep, only
+            // hand-built owners in unit tests reach this.
             None => Err(SolidError::unported(
                 "SmFace::GetTolerance",
                 "topology.face_p2",
@@ -1425,7 +1620,7 @@ impl Surface {
     ///
     /// Those of the kind's `IsKindOf`.
     pub fn is_kind_of(&self, t: i64) -> Result<bool> {
-        match &self.kind {
+        match self.kind() {
             SurfaceKind::BSpline(s) => s.is_kind_of(t),
             SurfaceKind::CurveBounded(s) => Ok(s.is_kind_of(t)),
             SurfaceKind::Step(_) => Ok(StepSurface::is_kind_of(t)),
@@ -1452,7 +1647,8 @@ impl Surface {
     /// for the other ported kinds (the base default is `SM_ERR`).
     pub fn copy(&self, k: &Kernel) -> Result<Self> {
         self.check_evaluation_copy_depth(0)?;
-        match &self.kind {
+        self.make_revolution_nurb_for_copy(k)?;
+        match self.kind() {
             SurfaceKind::BSpline(s) => Ok(Self::from(s.copy())),
             SurfaceKind::CurveBounded(_) | SurfaceKind::Step(_) => base_copy(),
             SurfaceKind::SrfInVolume(s) => Ok(Self::from(s.copy(k)?)),
@@ -1466,6 +1662,24 @@ impl Surface {
         }
     }
 
+    /// The start of a cone's, sphere's, torus's or surface of revolution's copy
+    /// constructor: `SmBSplineSurface(const SmBSplineSurface&)` reads the source's NURB
+    /// through `GetOrCreateGwNurbPointer`, which makes a missing one on the source
+    /// (status ignored) and keeps it there ([`Surface::kind_with_nurb`]). A plane and an
+    /// extrusion do this in their own `copy`.
+    fn make_revolution_nurb_for_copy(&self, k: &Kernel) -> Result<()> {
+        if matches!(
+            self.kind(),
+            SurfaceKind::Cone(_)
+                | SurfaceKind::Sphere(_)
+                | SurfaceKind::Torus(_)
+                | SurfaceKind::SurfOfRevolution(_)
+        ) {
+            self.kind_with_nurb(k)?;
+        }
+        Ok(())
+    }
+
     /// A copy with analytic information where possible (`CopyAndAddAnalytics`).
     ///
     /// # Errors
@@ -1473,7 +1687,8 @@ impl Surface {
     /// Those of the kind's override (the base default is [`Surface::copy`]).
     pub fn copy_and_add_analytics(&self, k: &Kernel) -> Result<Self> {
         self.check_evaluation_copy_depth(0)?;
-        match &self.kind {
+        self.make_revolution_nurb_for_copy(k)?;
+        match self.kind() {
             SurfaceKind::BSpline(s) => s.copy_and_add_analytics(k),
             SurfaceKind::CurveBounded(_) | SurfaceKind::Step(_) | SurfaceKind::SrfInVolume(_) => {
                 base_copy_and_add_analytics()
@@ -1488,6 +1703,91 @@ impl Surface {
             // the base body: the virtual Copy
             SurfaceKind::OffsetSurface(s) => Ok(Self::from(s.copy(k)?)),
         }
+    }
+
+    /// A copy mirrored about the XY plane of `mirror_plane` (`CreateMirrorSurface`).
+    ///
+    /// Every `SmBSplineSurface`-derived kind (plane, cone, sphere, torus, surface of
+    /// revolution or extrusion) inherits the B-spline override: the result is a plain
+    /// B-spline surface over the NURB the kind makes first. The offset surface and the
+    /// surface in a volume mirror what they wrap; the base default is `SM_ERR`.
+    ///
+    /// # Errors
+    ///
+    /// `SM_ERR` for the curve bounded and the STEP surface; those of the kind's NURB
+    /// construction and of the override.
+    pub fn create_mirror_surface(&self, k: &Kernel, mirror_plane: &Axis2Placement) -> Result<Self> {
+        self.check_evaluation_copy_depth(0)?;
+        // the copy constructor's `GetOrCreateGwNurbPointer` makes the NURB of the
+        // source first; a kind without one makes it on a copy
+        let base = match &self.kind {
+            SurfaceKind::BSpline(s) => s.create_mirror_surface(mirror_plane)?,
+            SurfaceKind::Plane(s) => {
+                if s.base().gw_nurb().is_some() {
+                    s.base().create_mirror_surface(mirror_plane)?
+                } else {
+                    let mut c = s.copy();
+                    c.make_nurb()?;
+                    c.base().create_mirror_surface(mirror_plane)?
+                }
+            }
+            SurfaceKind::SurfOfRevolution(s) => {
+                if s.base().gw_nurb().is_some() {
+                    s.base().create_mirror_surface(mirror_plane)?
+                } else {
+                    let mut c = s.copy();
+                    c.make_nurb(k)?;
+                    c.base().create_mirror_surface(mirror_plane)?
+                }
+            }
+            SurfaceKind::Cone(s) => {
+                if s.rev().base().gw_nurb().is_some() {
+                    s.rev().base().create_mirror_surface(mirror_plane)?
+                } else {
+                    let mut c = s.as_ref().clone();
+                    c.make_nurb(k)?;
+                    c.rev().base().create_mirror_surface(mirror_plane)?
+                }
+            }
+            SurfaceKind::Sphere(s) => {
+                if s.base().base().gw_nurb().is_some() {
+                    s.base().base().create_mirror_surface(mirror_plane)?
+                } else {
+                    let mut c = s.copy();
+                    c.make_nurb(k)?;
+                    c.base().base().create_mirror_surface(mirror_plane)?
+                }
+            }
+            SurfaceKind::Torus(s) => {
+                if s.base().base().gw_nurb().is_some() {
+                    s.base().base().create_mirror_surface(mirror_plane)?
+                } else {
+                    let mut c = s.copy();
+                    c.make_nurb(k)?;
+                    c.base().base().create_mirror_surface(mirror_plane)?
+                }
+            }
+            SurfaceKind::SurfOfExtrusion(s) => {
+                if s.base().gw_nurb().is_some() {
+                    s.base().create_mirror_surface(mirror_plane)?
+                } else {
+                    let mut c = s.copy()?;
+                    c.make_nurb(k)?;
+                    c.base().create_mirror_surface(mirror_plane)?
+                }
+            }
+            SurfaceKind::OffsetSurface(s) => {
+                return s.create_mirror_surface(k, mirror_plane).map(Self::from);
+            }
+            SurfaceKind::SrfInVolume(s) => {
+                return s.create_mirror_surface(k, mirror_plane).map(Self::from);
+            }
+            SurfaceKind::CurveBounded(_) | SurfaceKind::Step(_) => {
+                // SmSurface::CreateMirrorSurface: SE(SM_ERR)
+                return Err(SolidError::sm_err(OP_MIRROR));
+            }
+        };
+        Ok(Self::from(base))
     }
 
     // ---- evaluation -----------------------------------------------------------------
@@ -1520,11 +1820,7 @@ impl Surface {
                 s.evaluate(uv, highest_u_deriv, highest_v_deriv, flags.only_upper_half)
             }
             // Preserve the cone's analytic position correction and inherited NURB derivatives.
-            SurfaceKind::Cone(s) => Ok(s
-                .evaluate(k, uv, highest_u_deriv, highest_v_deriv, flags)?
-                .chunks(highest_v_deriv + 1)
-                .map(<[Vec3]>::to_vec)
-                .collect()),
+            SurfaceKind::Cone(s) => s.evaluate_rows(k, uv, highest_u_deriv, highest_v_deriv, flags),
             SurfaceKind::SurfOfRevolution(s) => {
                 s.base()
                     .evaluate(uv, highest_u_deriv, highest_v_deriv, flags)
@@ -1660,13 +1956,15 @@ impl Surface {
 
     // ---- simple queries -------------------------------------------------------------
 
-    /// The natural parameter domain (`GetNaturalUVDomain`), without a kernel: unlike
-    /// upstream, which makes a missing NURB first, a lazy cone, sphere, torus or surface
-    /// of revolution (no NURB yet) answers its NURB-less base's empty domain. Callers
-    /// that hold a kernel use [`Surface::natural_uv_domain_with_nurb`].
+    /// The natural parameter domain (`GetNaturalUVDomain`) as far as it is built, without
+    /// a kernel: unlike upstream, which makes a missing NURB first, a lazy cone, sphere,
+    /// torus or surface of revolution (no NURB yet) answers its NURB-less base's empty
+    /// domain. Callers that hold a kernel use [`Surface::natural_uv_domain_with_nurb`];
+    /// this is for surfaces known to be built (B-splines, planes, made NURBs) and for
+    /// kernel-free code.
     #[must_use]
-    pub fn natural_uv_domain(&self) -> Extent2d {
-        match &self.kind {
+    pub fn natural_uv_domain_if_built(&self) -> Extent2d {
+        match self.kind() {
             SurfaceKind::BSpline(s) => s.natural_uv_domain(),
             SurfaceKind::CurveBounded(s) => s.natural_uv_domain(),
             SurfaceKind::Step(s) => s.natural_uv_domain(),
@@ -1685,7 +1983,7 @@ impl Surface {
     /// else the base default, the natural domain).
     #[must_use]
     pub fn step_uv_domain(&self) -> Extent2d {
-        match &self.kind {
+        match self.kind() {
             SurfaceKind::Plane(s) => s.step_uv_domain(),
             SurfaceKind::Cone(s) => s.rev().step_uv_domain(),
             SurfaceKind::Sphere(s) => s.step_uv_domain(),
@@ -1704,7 +2002,7 @@ impl Surface {
     /// The degree in `param`'s direction (`GetDegree`).
     #[must_use]
     pub fn degree(&self, param: SurfParamType) -> usize {
-        match &self.kind {
+        match self.kind() {
             SurfaceKind::BSpline(s) => s.degree(param),
             SurfaceKind::CurveBounded(_) | SurfaceKind::Step(_) => base_degree(),
             SurfaceKind::SrfInVolume(s) => s.degree(param),
@@ -1720,15 +2018,15 @@ impl Surface {
 
     /// [`Surface::degree`] as upstream's `GetDegree`, which makes a missing NURB
     /// (`GetOrCreateGwNurbPointer`): a surface of extrusion (the recogniser's lazy
-    /// generator) or a cone without one reads the degree of the NURB `MakeNurb` gives
-    /// it, on a temporary copy, where [`Surface::degree`] would answer `0`. A failed
-    /// make leaves no NURB, so `0`, as upstream.
+    /// generator), cone, sphere, torus or surface of revolution without one makes it and
+    /// keeps it ([`Surface::kind_with_nurb`]), where [`Surface::degree`] would answer
+    /// `0`. A failed make leaves no NURB, so `0`, as upstream.
     ///
     /// # Errors
     ///
     /// [`SolidError::Unported`] from the make.
     pub fn degree_with_nurb(&self, k: &Kernel, param: SurfParamType) -> Result<usize> {
-        match &self.kind {
+        match self.kind() {
             SurfaceKind::SurfOfExtrusion(s) if s.base().gw_nurb().is_none() => {
                 match s.base_with_nurb(k) {
                     Ok(base) => Ok(base.degree(param)),
@@ -1736,17 +2034,83 @@ impl Surface {
                     Err(_) => Ok(0), // FS
                 }
             }
-            // (a sphere's or a torus's NURB is quadratic both ways, so its 0 never
-            // reads as linear either)
-            SurfaceKind::Cone(s) if s.rev().base().gw_nurb().is_none() => {
-                let mut copy = s.clone();
-                match copy.make_nurb(k) {
-                    Ok(()) => Ok(copy.rev().base().degree(param)),
-                    Err(e) if e.is_unported() => Err(e),
-                    Err(_) => Ok(0), // FS
+            _ => {
+                if self.revolution_nurb_missing() {
+                    self.kind_with_nurb(k)?;
                 }
+                Ok(self.degree(param))
             }
-            _ => Ok(self.degree(param)),
+        }
+    }
+
+    /// The B-spline part of a cone, sphere, torus or surface of revolution with its NURB
+    /// (`GetOrCreateGwNurbPointer`): a missing one is made and kept on this surface
+    /// ([`Surface::kind_with_nurb`]; status ignored, so a failed make leaves the part
+    /// without NURB). `None` for the other kinds.
+    ///
+    /// # Errors
+    ///
+    /// [`SolidError::Unported`] from `MakeNurb`.
+    pub(crate) fn revolution_base_with_nurb(&self, k: &Kernel) -> Result<Option<&BSplineSurface>> {
+        if self.revolution_nurb_missing() {
+            self.kind_with_nurb(k)?;
+        }
+        Ok(match self.kind() {
+            SurfaceKind::Cone(s) => Some(s.rev().base()),
+            SurfaceKind::Sphere(s) => Some(s.base().base()),
+            SurfaceKind::Torus(s) => Some(s.base().base()),
+            SurfaceKind::SurfOfRevolution(s) => Some(s.base()),
+            _ => None,
+        })
+    }
+
+    /// The natural domain of a cone, sphere, torus or surface of revolution without NURB,
+    /// read from the NURB `MakeNurb` gives an exact copy (status ignored: a failed make
+    /// reads the NURB-less part), which this surface does not keep; `None` for a surface
+    /// that has its NURB or is of another kind. For the port's own bookkeeping, where
+    /// upstream makes no NURB ([`Surface::stand_in_key_domain`]).
+    ///
+    /// # Errors
+    ///
+    /// [`SolidError::Unported`] from `MakeNurb`.
+    pub(crate) fn revolution_natural_uv_domain_without_keeping(
+        &self,
+        k: &Kernel,
+    ) -> Result<Option<Extent2d>> {
+        if !self.revolution_nurb_missing() {
+            return Ok(None);
+        }
+        let mut kind = clone_kind_exact(self.kind());
+        Ok(match &mut kind {
+            SurfaceKind::Cone(s) => {
+                ignore_status(s.make_nurb(k))?;
+                Some(s.rev().base().natural_uv_domain())
+            }
+            SurfaceKind::Sphere(s) => {
+                ignore_status(s.make_nurb(k))?;
+                Some(s.base().base().natural_uv_domain())
+            }
+            SurfaceKind::Torus(s) => {
+                ignore_status(s.make_nurb(k))?;
+                Some(s.base().base().natural_uv_domain())
+            }
+            SurfaceKind::SurfOfRevolution(s) => {
+                ignore_status(s.make_nurb(k))?;
+                Some(s.base().natural_uv_domain())
+            }
+            _ => None,
+        })
+    }
+
+    /// Whether this surface is a cone, sphere, torus or surface of revolution without
+    /// NURB (one [`Surface::kind_with_nurb`] makes and keeps).
+    fn revolution_nurb_missing(&self) -> bool {
+        match self.kind() {
+            SurfaceKind::Cone(s) => s.rev().base().gw_nurb().is_none(),
+            SurfaceKind::Sphere(s) => s.base().base().gw_nurb().is_none(),
+            SurfaceKind::Torus(s) => s.base().base().gw_nurb().is_none(),
+            SurfaceKind::SurfOfRevolution(s) => s.base().gw_nurb().is_none(),
+            _ => false,
         }
     }
 
@@ -1754,7 +2118,7 @@ impl Surface {
     /// (`GetNumberControlPoints`).
     #[must_use]
     pub fn number_control_points(&self, k: &Kernel, param: SurfParamType) -> usize {
-        match &self.kind {
+        match self.kind() {
             SurfaceKind::BSpline(s) => s.number_control_points(param),
             SurfaceKind::CurveBounded(_)
             | SurfaceKind::Step(_)
@@ -1778,7 +2142,7 @@ impl Surface {
     ///
     /// Those of the kind's override.
     pub fn max_analytic_domain(&self, k: &Kernel) -> Result<Extent2d> {
-        match &self.kind {
+        match self.kind() {
             SurfaceKind::BSpline(s) => s.max_analytic_domain(k),
             SurfaceKind::CurveBounded(_) | SurfaceKind::Step(_) => Ok(base_max_analytic_domain()),
             SurfaceKind::SrfInVolume(s) => s.max_analytic_domain(k),
@@ -1795,7 +2159,7 @@ impl Surface {
     /// Whether the surface is bilinear (`IsBilinear`).
     #[must_use]
     pub fn is_bilinear(&self, k: &Kernel) -> bool {
-        match &self.kind {
+        match self.kind() {
             SurfaceKind::BSpline(s) => s.is_bilinear(),
             SurfaceKind::CurveBounded(_)
             | SurfaceKind::Step(_)
@@ -1819,7 +2183,7 @@ impl Surface {
     ///
     /// Those of the kind's override.
     pub fn is_parallel_to_vector(&self, k: &Kernel, vector: Vec3) -> Result<bool> {
-        match &self.kind {
+        match self.kind() {
             SurfaceKind::BSpline(s) => s.is_parallel_to_vector(vector),
             SurfaceKind::CurveBounded(_)
             | SurfaceKind::Step(_)
@@ -1848,7 +2212,7 @@ impl Surface {
         param: SurfParamType,
         ivl: Option<&Extent1d>,
     ) -> Result<(Vec<f64>, Vec<usize>)> {
-        match &self.kind {
+        match self.kind() {
             SurfaceKind::BSpline(s) => s.knots(param, ivl),
             SurfaceKind::CurveBounded(_) => base_knots(),
             SurfaceKind::Step(s) => s.knots(param, ivl),
@@ -1865,9 +2229,10 @@ impl Surface {
 
     /// [`Surface::knots`] as upstream's `GetKnots`, which reaches the NURB through
     /// `GetOrCreateGwNurbPointer` (a STEP surface: its base's `GetDegree`): a surface of
-    /// extrusion, cone, sphere or torus without its NURB answers from the NURB its
-    /// virtual `MakeNurb` gives a temporary copy, where [`Surface::knots`] reads the
-    /// NURB-less base. A failed make answers as [`Surface::knots`].
+    /// extrusion, cone, sphere, torus or surface of revolution without its NURB makes
+    /// it and keeps it ([`Surface::kind_with_nurb`]) and answers from it, where
+    /// [`Surface::knots`] reads the NURB-less base. A failed make answers as
+    /// [`Surface::knots`].
     ///
     /// # Errors
     ///
@@ -1878,51 +2243,28 @@ impl Surface {
         param: SurfParamType,
         ivl: Option<&Extent1d>,
     ) -> Result<(Vec<f64>, Vec<usize>)> {
-        // the made copy's knots, or `None` when the make fails (status ignored)
-        fn made<T>(
-            r: Result<T>,
-            knots: impl FnOnce(&T) -> Result<(Vec<f64>, Vec<usize>)>,
-        ) -> Result<Option<(Vec<f64>, Vec<usize>)>> {
-            match r {
-                Ok(t) => knots(&t).map(Some),
-                Err(e) if e.is_unported() => Err(e),
-                Err(_) => Ok(None),
-            }
+        // (a cone, sphere, torus or surface of revolution makes its NURB and keeps it,
+        // `kind_with_nurb`; a failed make leaves none, status ignored)
+        if self.revolution_nurb_missing() {
+            self.kind_with_nurb(k)?;
         }
-        let kept = match &self.kind {
-            SurfaceKind::Step(s) => return s.knots_with_nurb(k, param, ivl),
+        match self.kind() {
+            SurfaceKind::Step(s) => s.knots_with_nurb(k, param, ivl),
             SurfaceKind::SurfOfExtrusion(s) if s.base().gw_nurb().is_none() => {
-                made(s.base_with_nurb(k), |b| b.knots(param, ivl))?
+                match s.base_with_nurb(k) {
+                    Ok(b) => b.knots(param, ivl),
+                    Err(e) if e.is_unported() => Err(e),
+                    Err(_) => self.knots(param, ivl),
+                }
             }
-            SurfaceKind::Cone(s) if s.rev().base().gw_nurb().is_none() => {
-                let mut copy = s.clone();
-                made(copy.make_nurb(k).map(|()| copy), |c| {
-                    c.rev().base().knots(param, ivl)
-                })?
-            }
-            SurfaceKind::Sphere(s) if s.base().base().gw_nurb().is_none() => {
-                let mut copy = s.clone();
-                made(copy.make_nurb(k).map(|()| copy), |c| {
-                    c.base().base().knots(param, ivl)
-                })?
-            }
-            SurfaceKind::Torus(s) if s.base().base().gw_nurb().is_none() => {
-                let mut copy = s.clone();
-                made(copy.make_nurb(k).map(|()| copy), |c| {
-                    c.base().base().knots(param, ivl)
-                })?
-            }
-            _ => None,
-        };
-        match kept {
-            Some(knots) => Ok(knots),
-            None => self.knots(param, ivl),
+            _ => self.knots(param, ivl),
         }
     }
 
     /// `uv` of the STEP parameterisation in the NURBS parameterisation
     /// (`ConvertUVFromSTEPToNURBS`: the cone's, sphere's, torus's or surface of revolution's
-    /// override, else the base default, the identity).
+    /// override, the surface in volume's (its base surface's), else the base default,
+    /// the identity).
     ///
     /// # Errors
     ///
@@ -1932,6 +2274,8 @@ impl Surface {
             SurfaceKind::Cone(s) => s.convert_uv_from_step_to_nurbs(k, step_uv),
             SurfaceKind::Sphere(s) => s.convert_uv_from_step_to_nurbs(k, step_uv),
             SurfaceKind::Torus(s) => s.convert_uv_from_step_to_nurbs(k, step_uv),
+            // SmSrfInVolume forwards to its base surface
+            SurfaceKind::SrfInVolume(s) => s.convert_uv_from_step_to_nurbs(k, step_uv),
             SurfaceKind::SurfOfRevolution(s) => s.convert_uv_from_step_to_nurbs(k, step_uv),
             // (GetNaturalUVDomain makes a missing NURB)
             SurfaceKind::SurfOfExtrusion(_) => match self.kind_with_nurb(k)? {
@@ -1944,7 +2288,8 @@ impl Surface {
 
     /// `uv` of the NURBS parameterisation in the STEP parameterisation
     /// (`ConvertUVFromNURBSToSTEP`: the cone's, sphere's, torus's or surface of revolution's
-    /// override, else the base default, the identity).
+    /// override, the surface in volume's (its base surface's), else the base default,
+    /// the identity).
     ///
     /// # Errors
     ///
@@ -1954,6 +2299,8 @@ impl Surface {
             SurfaceKind::Cone(s) => s.convert_uv_from_nurbs_to_step(k, nurbs_uv),
             SurfaceKind::Sphere(s) => s.convert_uv_from_nurbs_to_step(k, nurbs_uv),
             SurfaceKind::Torus(s) => s.convert_uv_from_nurbs_to_step(k, nurbs_uv),
+            // SmSrfInVolume forwards to its base surface
+            SurfaceKind::SrfInVolume(s) => s.convert_uv_from_nurbs_to_step(k, nurbs_uv),
             SurfaceKind::SurfOfRevolution(s) => s.convert_uv_from_nurbs_to_step(k, nurbs_uv),
             // (GetNaturalUVDomain makes a missing NURB)
             SurfaceKind::SurfOfExtrusion(_) => match self.kind_with_nurb(k)? {
@@ -1983,7 +2330,7 @@ impl Surface {
         uv_guess: Option<Point2>,
         context: (&mut dyn SurfaceSolveContext<O>, Option<O>),
     ) -> Result<(Point2, LocationType)> {
-        match &self.kind {
+        match self.kind() {
             SurfaceKind::BSpline(s) => s.step_inversion_on_with_context(
                 k,
                 self,
@@ -2069,13 +2416,21 @@ impl Surface {
                 s.base()
                     .step_inversion(k, anal_domain, point_on_surf, tol_3d, uv_guess)
             }
-            SurfaceKind::Torus(_) => {
-                // DISPATCH GAP (#76): the non-planar branch converts through the torus's
-                // virtual ConvertUVFromSTEPToNURBS / ConvertUVFromNURBSToSTEP.
-                Err(SolidError::unported(
-                    "SurfaceKind::Torus::STEPInversion conversions",
-                    "surface.surface_p2",
-                ))
+            // a torus record read with a non-planar generator flag: the inherited
+            // general-solver branch converts through the torus's virtual
+            // ConvertUVFromSTEPToNURBS / ConvertUVFromNURBSToSTEP
+            SurfaceKind::Torus(s) => {
+                let r = s.base().step_inversion_non_planar(
+                    k,
+                    anal_domain,
+                    point_on_surf,
+                    tol_3d,
+                    uv_guess,
+                    Some(self),
+                    |uv| s.convert_uv_from_step_to_nurbs(k, uv),
+                    |uv| s.convert_uv_from_nurbs_to_step(k, uv),
+                )?;
+                Ok((r.uv, r.location))
             }
         }
     }
@@ -2127,10 +2482,7 @@ impl Surface {
                     distance_tolerance,
                     target_distance,
                     requested,
-                    Some(OperandObject::Surface(
-                        0,
-                        self.natural_uv_domain_with_nurb(k)?,
-                    )),
+                    Some(OperandObject::Surface(0, self.stand_in_key_domain(k)?)),
                     &|_, uv| s.evaluate_step_point(uv),
                     &|k, uv| self.evaluate_point(k, uv),
                     &|k, domain, operation, point, guess| {
@@ -2152,10 +2504,7 @@ impl Surface {
                     distance_tolerance,
                     target_distance,
                     requested,
-                    Some(OperandObject::Surface(
-                        0,
-                        self.natural_uv_domain_with_nurb(k)?,
-                    )),
+                    Some(OperandObject::Surface(0, self.stand_in_key_domain(k)?)),
                     &|_, uv| s.evaluate_step_point(uv),
                     &|k, uv| self.evaluate_point(k, uv),
                     &|k, domain, operation, point, guess| {
@@ -2177,10 +2526,7 @@ impl Surface {
                     distance_tolerance,
                     target_distance,
                     requested,
-                    Some(OperandObject::Surface(
-                        0,
-                        self.natural_uv_domain_with_nurb(k)?,
-                    )),
+                    Some(OperandObject::Surface(0, self.stand_in_key_domain(k)?)),
                     &|_, uv| s.evaluate_step_point(uv),
                     &|k, uv| self.evaluate_point(k, uv),
                     &|k, domain, operation, point, guess| {
@@ -2204,10 +2550,7 @@ impl Surface {
                     distance_tolerance,
                     target_distance,
                     requested,
-                    Some(OperandObject::Surface(
-                        0,
-                        self.natural_uv_domain_with_nurb(k)?,
-                    )),
+                    Some(OperandObject::Surface(0, self.stand_in_key_domain(k)?)),
                 )?
                 .without_objects()),
             // SmSurfOfExtrusion::DropPointFast: its solutions name this surface, as the
@@ -2222,10 +2565,7 @@ impl Surface {
                     distance_tolerance,
                     target_distance,
                     requested,
-                    Some(OperandObject::Surface(
-                        0,
-                        self.natural_uv_domain_with_nurb(k)?,
-                    )),
+                    Some(OperandObject::Surface(0, self.stand_in_key_domain(k)?)),
                 )?
                 .without_objects()),
             SurfaceKind::BSpline(_)
@@ -2316,7 +2656,7 @@ impl Surface {
         k: &Kernel,
         new_step_uv_domain: &Extent2d,
     ) -> Result<()> {
-        self.made_nurb.reset();
+        self.take_made_kind_for_edit();
         self.boundary_memo = BoundaryMemo::new();
         match &mut self.kind {
             SurfaceKind::BSpline(s) => s.adjust_step_uv_domain(new_step_uv_domain),
@@ -2341,7 +2681,7 @@ impl Surface {
     ///
     /// Those of the kind's override (the base default is `SM_ERR`).
     pub fn reverse(&mut self, k: &Kernel, param: SurfParamType) -> Result<()> {
-        self.made_nurb.reset();
+        self.take_made_kind_for_edit();
         self.boundary_memo = BoundaryMemo::new();
         match &mut self.kind {
             SurfaceKind::BSpline(s) => s.reverse(param),
@@ -2405,7 +2745,7 @@ impl Surface {
     ///
     /// Those of the kind's override (the base default is `SM_ERR`).
     pub fn reparameterize(&mut self, k: &Kernel, new_domain: &Extent2d) -> Result<()> {
-        self.made_nurb.reset();
+        self.take_made_kind_for_edit();
         self.boundary_memo = BoundaryMemo::new();
         match &mut self.kind {
             SurfaceKind::BSpline(s) => s.reparameterize(new_domain),
@@ -2427,60 +2767,131 @@ impl Surface {
     /// B-spline swap, whose virtual `ToggleSwapUVBit` flips its swap flag and whose
     /// `SetCanonical` rebuilds its analytic data, status ignored).
     ///
+    /// Notifies nobody: [`Surface::swap_uv_notifying`] sends the edit notifications.
+    ///
     /// # Errors
     ///
     /// Those of the kind's override (the base default is `SM_ERR`).
     pub fn swap_uv(&mut self, k: &Kernel) -> Result<()> {
-        self.made_nurb.reset();
+        self.swap_uv_notifying(k, &mut |_, _, _| Ok(()))
+    }
+
+    /// [`Surface::swap_uv`] with upstream's edit notifications: each B-spline swap's
+    /// `SetCanonical` (every kind built on `SmBSplineSurface`) and `SmSrfInVolume::SwapUV`
+    /// send `Notify(SM_NO_PRE_EDIT` / `SM_NO_POST_EDIT, this, SM_NO_GET_OWNER(this),
+    /// NULL)` on the edited surface; an offset surface notifies through its extended
+    /// and base surfaces. Each goes first through `SmSurface::Notify`, whose
+    /// `SM_NO_PRE_EDIT` deletes that surface's trimmed surface cache (one in use stays
+    /// with its caller), then to `notify` with the edited surface's identity slot and
+    /// type code (`SmAObject::Notify`, the caller's).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Surface::swap_uv`] and of `notify`.
+    pub(crate) fn swap_uv_notifying(
+        &mut self,
+        k: &Kernel,
+        notify: &mut SurfaceEditNotify<'_>,
+    ) -> Result<()> {
+        self.take_made_kind_for_edit();
         self.boundary_memo = BoundaryMemo::new();
-        match &mut self.kind {
-            SurfaceKind::BSpline(s) => s.swap_uv(),
+        let type_code = self.type_code();
+        let Self {
+            kind,
+            notify_identity: slot,
+            cache_slot,
+            ..
+        } = self;
+        // SetCanonical's (or SmSrfInVolume's) Notify of this surface
+        // (the arms that notify more than this surface's SetCanonical do not use it)
+        let mut own = |op| edit_notify(cache_slot, slot, type_code, notify, op);
+        match kind {
+            SurfaceKind::BSpline(s) => s.swap_uv_notifying(&mut own),
             SurfaceKind::CurveBounded(_) | SurfaceKind::Step(_) => base_edit(),
-            SurfaceKind::SrfInVolume(s) => s.swap_uv(k),
-            SurfaceKind::Plane(s) => s.swap_uv(),
+            SurfaceKind::SrfInVolume(s) => {
+                // check input - Can not swap UV on an unowned surface
+                let base = s.owned_surface_mut()?;
+                edit_notify(
+                    cache_slot,
+                    slot,
+                    type_code,
+                    notify,
+                    NotifyOperation::PreEdit,
+                )?;
+                // base surface Swap
+                base.swap_uv_notifying(k, notify)?;
+                edit_notify(
+                    cache_slot,
+                    slot,
+                    type_code,
+                    notify,
+                    NotifyOperation::PostEdit,
+                )
+            }
+            SurfaceKind::Plane(s) => s.swap_uv_notifying(&mut own),
             SurfaceKind::Cone(s) => {
-                // SmBSplineSurface::SwapUV: the NURB swap, the inherited
-                // SmSurfOfRevolution::ToggleSwapUVBit, then SetCanonical's virtual
+                // SmBSplineSurface::SwapUV: the inherited
+                // SmSurfOfRevolution::ToggleSwapUVBit before SetCanonical's notifications
+                // (restored on failure), the NURB swap, then SetCanonical's virtual
                 // RebuildSTEPFromNURBParameters (the cone's, status ignored)
-                s.base_mut().swap_uv()?;
                 s.rev.toggle_swap_uv_bit();
+                if let Err(e) = s.base_mut().swap_uv_notifying(&mut own) {
+                    s.rev.toggle_swap_uv_bit();
+                    return Err(e);
+                }
                 ignore_status(s.rebuild_step_from_nurb_parameters(k))
             }
             SurfaceKind::Sphere(s) => {
-                // SmBSplineSurface::SwapUV: the NURB swap, the inherited
-                // SmSurfOfRevolution::ToggleSwapUVBit, then SetCanonical's virtual
+                // SmBSplineSurface::SwapUV: the inherited
+                // SmSurfOfRevolution::ToggleSwapUVBit before SetCanonical's notifications
+                // (restored on failure), the NURB swap, then SetCanonical's virtual
                 // RebuildSTEPFromNURBParameters (the sphere's, status ignored)
-                s.base.base_mut().swap_uv()?;
                 s.base.toggle_swap_uv_bit();
+                if let Err(e) = s.base.base_mut().swap_uv_notifying(&mut own) {
+                    s.base.toggle_swap_uv_bit();
+                    return Err(e);
+                }
                 ignore_status(s.rebuild_step_from_nurb_parameters(k))
             }
             SurfaceKind::Torus(s) => {
-                // SmBSplineSurface::SwapUV: the NURB swap, the inherited
-                // SmSurfOfRevolution::ToggleSwapUVBit, then SetCanonical's virtual
+                // SmBSplineSurface::SwapUV: the inherited
+                // SmSurfOfRevolution::ToggleSwapUVBit before SetCanonical's notifications
+                // (restored on failure), the NURB swap, then SetCanonical's virtual
                 // RebuildSTEPFromNURBParameters (the torus's, status ignored)
-                s.base.base_mut().swap_uv()?;
                 s.base.toggle_swap_uv_bit();
+                if let Err(e) = s.base.base_mut().swap_uv_notifying(&mut own) {
+                    s.base.toggle_swap_uv_bit();
+                    return Err(e);
+                }
                 ignore_status(s.rebuild_step_from_nurb_parameters(k))
             }
             SurfaceKind::SurfOfRevolution(s) => {
-                // As in `reverse`: the stored NURB stands for GetOrCreateGwNurbPointer.
-                s.base_mut().swap_uv()?;
+                // As in `reverse`: the stored NURB stands for GetOrCreateGwNurbPointer;
+                // the bit toggles before SetCanonical's notifications (restored on failure).
                 s.toggle_swap_uv_bit();
+                if let Err(e) = s.base_mut().swap_uv_notifying(&mut own) {
+                    s.toggle_swap_uv_bit();
+                    return Err(e);
+                }
                 ignore_status(s.rebuild_step_from_nurb_parameters(k))
             }
             SurfaceKind::SurfOfExtrusion(s) => {
                 // SmBSplineSurface::SwapUV: GetCanonical's GetOrCreateGwNurbPointer (the
-                // extrusion's MakeNurb when missing, status ignored), the NURB swap and
-                // the extrusion's ToggleSwapUVBit (its RebuildSTEPFromNURBParameters is
-                // the base's: no work)
+                // extrusion's MakeNurb when missing, status ignored), the extrusion's
+                // ToggleSwapUVBit before SetCanonical's notifications (restored on
+                // failure) and the NURB swap (its RebuildSTEPFromNURBParameters is the
+                // base's: no work)
                 if s.base().gw_nurb().is_none() {
                     ignore_status(s.make_nurb(k))?;
                 }
-                s.base_mut().swap_uv()?;
                 s.toggle_swap_uv_bit();
-                Ok(())
+                let status = s.base_mut().swap_uv_notifying(&mut own);
+                if status.is_err() {
+                    s.toggle_swap_uv_bit();
+                }
+                status
             }
-            SurfaceKind::OffsetSurface(s) => s.swap_uv(k),
+            SurfaceKind::OffsetSurface(s) => s.swap_uv_notifying(k, notify),
         }
     }
 
@@ -2508,7 +2919,7 @@ impl Surface {
         scale: Option<Vec3>,
         depth: usize,
     ) -> Result<()> {
-        self.made_nurb.reset();
+        self.take_made_kind_for_edit();
         self.boundary_memo = BoundaryMemo::new();
         match &mut self.kind {
             SurfaceKind::Cone(s) => s.transform(k, rotate_n_move, scale),
@@ -2549,7 +2960,7 @@ impl Surface {
         trim_domain: &mut Extent2d,
         options: TrimOptions,
     ) -> Result<()> {
-        self.made_nurb.reset();
+        self.take_made_kind_for_edit();
         self.boundary_memo = BoundaryMemo::new();
         match &mut self.kind {
             SurfaceKind::BSpline(s) => s.trim_with_domain_with(trim_domain, options),
@@ -2581,7 +2992,7 @@ impl Surface {
         param: f64,
         surf_param: SurfParamType,
     ) -> Result<(Self, Self)> {
-        match &self.kind {
+        match self.kind() {
             SurfaceKind::BSpline(s) => {
                 let (l, r) = s.split_at(param, surf_param)?;
                 Ok((Self::from(l), Self::from(r)))
@@ -2962,8 +3373,70 @@ impl Surface {
         ang_tol_rad: Option<f64>,
         context: Option<SurfaceIntersectContext<'_, O>>,
     ) -> Result<SurfaceIntersection> {
+        let mut out = SurfaceIntersection::default();
+        self.global_surface_intersect_into(
+            k,
+            uv_domain,
+            other,
+            other_uv_domain,
+            use_surface_edges,
+            approx_tol_3d,
+            ang_tol_rad,
+            context,
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
+    /// [`Surface::global_surface_intersect`] with the outputs upstream leaves in the
+    /// caller's arrays also on a failure (`SmApiIntersectSurfaces` hands its array to
+    /// `GlobalSurfaceIntersect` and keeps what is in it): on an error, the curves the
+    /// failing special-case intersection appended before it (the general intersection
+    /// resets the arrays first).
+    #[allow(clippy::too_many_arguments)]
+    pub fn global_surface_intersect_with_partial(
+        &self,
+        k: &Kernel,
+        uv_domain: &Extent2d,
+        other: &Self,
+        other_uv_domain: &Extent2d,
+        use_surface_edges: [bool; 2],
+        approx_tol_3d: Option<f64>,
+        ang_tol_rad: Option<f64>,
+    ) -> (SurfaceIntersection, Result<()>) {
+        let mut out = SurfaceIntersection::default();
+        let status = self.global_surface_intersect_into(
+            k,
+            uv_domain,
+            other,
+            other_uv_domain,
+            use_surface_edges,
+            approx_tol_3d,
+            ang_tol_rad,
+            None::<SurfaceIntersectContext<'_, crate::surface::surface::p4::NoObject>>,
+            &mut out,
+        );
+        (out, status)
+    }
+
+    /// [`Surface::global_surface_intersect_in`] into `out` (upstream's output arrays):
+    /// the kind's override fills it; on an error `out` keeps what the failing
+    /// special-case intersection appended before it.
+    #[allow(clippy::too_many_arguments)]
+    fn global_surface_intersect_into<O: SolutionObject + Copy + PartialEq>(
+        &self,
+        k: &Kernel,
+        uv_domain: &Extent2d,
+        other: &Self,
+        other_uv_domain: &Extent2d,
+        use_surface_edges: [bool; 2],
+        approx_tol_3d: Option<f64>,
+        ang_tol_rad: Option<f64>,
+        context: Option<SurfaceIntersectContext<'_, O>>,
+        out: &mut SurfaceIntersection,
+    ) -> Result<()> {
         match self.kind_with_nurb(k)? {
-            SurfaceKind::Plane(p) => crate::surface::plane::p2::global_surface_intersect_in(
+            SurfaceKind::Plane(p) => crate::surface::plane::p2::global_surface_intersect_into(
                 k,
                 self,
                 p,
@@ -2974,10 +3447,11 @@ impl Surface {
                 approx_tol_3d,
                 ang_tol_rad,
                 context,
+                out,
             ),
             // SmCone::GlobalSurfaceIntersect: its special cases, else the base
             // SmSurface::GlobalSurfaceIntersect of this surface
-            SurfaceKind::Cone(c) => c.global_surface_intersect_on(
+            SurfaceKind::Cone(c) => c.global_surface_intersect_on_into(
                 Some(self),
                 k,
                 uv_domain,
@@ -2986,8 +3460,8 @@ impl Surface {
                 use_surface_edges,
                 approx_tol_3d,
                 ang_tol_rad,
-                |req| {
-                    base_global_surface_intersect_in(
+                |req, out| {
+                    base_global_surface_intersect_into(
                         req.kernel,
                         self,
                         req.domain,
@@ -2997,12 +3471,14 @@ impl Surface {
                         req.approx_tol_3d,
                         req.ang_tol_rad,
                         context,
+                        out,
                     )
                 },
+                out,
             ),
             // SmSphere::GlobalSurfaceIntersect: its special cases, else the base
             // SmSurface::GlobalSurfaceIntersect of this surface
-            SurfaceKind::Sphere(s) => s.global_surface_intersect_with(
+            SurfaceKind::Sphere(s) => s.global_surface_intersect_with_into(
                 k,
                 uv_domain,
                 other,
@@ -3010,8 +3486,8 @@ impl Surface {
                 use_surface_edges,
                 approx_tol_3d,
                 ang_tol_rad,
-                |k| {
-                    base_global_surface_intersect_in(
+                |k, out| {
+                    base_global_surface_intersect_into(
                         k,
                         self,
                         uv_domain,
@@ -3021,56 +3497,65 @@ impl Surface {
                         approx_tol_3d,
                         ang_tol_rad,
                         context,
+                        out,
                     )
                 },
+                out,
             ),
             // the inherited SmSurfOfRevolution::GlobalSurfaceIntersect: the plane
             // special case runs the inherited IntersectWithPlane with the torus's iso
             // circles, the sphere, cone and surface of revolution cases the inherited
             // intersections with the torus's domain conversion; each then takes the
-            // general intersection when it needs more (its curves follow: upstream
-            // appends to the same arrays); any other surface takes the general
-            // intersection
+            // general intersection when it needs more (which resets the output arrays
+            // first: SmSurfaceIntersector::DoIntersection); any other surface takes the
+            // general intersection
             SurfaceKind::Torus(t) => {
+                // (each special case resets the outputs on entry)
+                *out = SurfaceIntersection::default();
                 // IntersectWithSphere / IntersectWithCone: a planar generator, else
                 // the general intersection
-                let revolved = |other: &dyn Revolved| -> Result<(bool, SurfaceIntersection)> {
+                let revolved = |other: &dyn Revolved, out: &mut SurfaceIntersection| {
                     if !t.base().planar_generator {
-                        return Ok((true, SurfaceIntersection::default()));
+                        return Ok(true);
                     }
-                    intersect_revolved(
+                    intersect_revolved_into(
                         t.as_ref(),
                         k,
                         uv_domain,
                         other,
                         other_uv_domain,
                         approx_tol_3d,
+                        out,
                     )
                 };
-                let (more, mut out) = match other.kind_with_nurb(k)? {
+                let more = match other.kind_with_nurb(k)? {
                     // the plane's boxes take its face's tolerance
-                    SurfaceKind::Plane(p) => t.intersect_with_plane_owned(
+                    SurfaceKind::Plane(p) => t.intersect_with_plane_owned_into(
                         k,
                         p,
                         crate::surface::plane::p2::PlaneOwner::of(other)?,
                         other_uv_domain,
                         approx_tol_3d,
+                        out,
                     )?,
-                    SurfaceKind::Sphere(o) => revolved(o.as_ref())?,
-                    SurfaceKind::Cone(o) if o.type_code() == CONE_TYPE => revolved(o.as_ref())?,
+                    SurfaceKind::Sphere(o) => revolved(o.as_ref(), out)?,
+                    SurfaceKind::Cone(o) if o.type_code() == CONE_TYPE => {
+                        revolved(o.as_ref(), out)?
+                    }
                     // (IntersectWithSurfOfRevolution checks the generator itself)
-                    SurfaceKind::SurfOfRevolution(o) => intersect_revolved(
+                    SurfaceKind::SurfOfRevolution(o) => intersect_revolved_into(
                         t.as_ref(),
                         k,
                         uv_domain,
                         o.as_ref(),
                         other_uv_domain,
                         approx_tol_3d,
+                        out,
                     )?,
-                    _ => (true, SurfaceIntersection::default()),
+                    _ => true,
                 };
                 if more {
-                    let more = base_global_surface_intersect_in(
+                    base_global_surface_intersect_into(
                         k,
                         self,
                         uv_domain,
@@ -3080,16 +3565,12 @@ impl Surface {
                         approx_tol_3d,
                         ang_tol_rad,
                         context,
+                        out,
                     )?;
-                    out.curves_3d.extend(more.curves_3d);
-                    out.surface1_uv_curves.extend(more.surface1_uv_curves);
-                    out.surface2_uv_curves.extend(more.surface2_uv_curves);
-                    out.curve_types.extend(more.curve_types);
-                    out.deviations.extend(more.deviations);
                 }
-                Ok(out)
+                Ok(())
             }
-            SurfaceKind::SurfOfRevolution(s) => s.global_surface_intersect_in(
+            SurfaceKind::SurfOfRevolution(s) => s.global_surface_intersect_into(
                 self,
                 k,
                 uv_domain,
@@ -3099,23 +3580,30 @@ impl Surface {
                 approx_tol_3d,
                 ang_tol_rad,
                 context,
+                out,
             ),
-            SurfaceKind::SurfOfExtrusion(s) => s.global_surface_intersect_on_in(
-                k,
-                self,
-                uv_domain,
-                other,
-                other_uv_domain,
-                use_surface_edges,
-                approx_tol_3d,
-                ang_tol_rad,
-                context,
-            ),
+            // (its special cases append nothing before an error: the result replaces
+            // the outputs, which stay empty on an error)
+            SurfaceKind::SurfOfExtrusion(s) => {
+                *out = SurfaceIntersection::default();
+                *out = s.global_surface_intersect_on_in(
+                    k,
+                    self,
+                    uv_domain,
+                    other,
+                    other_uv_domain,
+                    use_surface_edges,
+                    approx_tol_3d,
+                    ang_tol_rad,
+                    context,
+                )?;
+                Ok(())
+            }
             SurfaceKind::BSpline(_)
             | SurfaceKind::CurveBounded(_)
             | SurfaceKind::Step(_)
             | SurfaceKind::OffsetSurface(_)
-            | SurfaceKind::SrfInVolume(_) => base_global_surface_intersect_in(
+            | SurfaceKind::SrfInVolume(_) => base_global_surface_intersect_into(
                 k,
                 self,
                 uv_domain,
@@ -3125,6 +3613,7 @@ impl Surface {
                 approx_tol_3d,
                 ang_tol_rad,
                 context,
+                out,
             ),
         }
     }
@@ -3453,8 +3942,18 @@ pub trait SurfaceEvaluate {
         guess: Option<Point2>,
     ) -> Result<Option<(Point2, f64)>>;
 
-    /// `GetNaturalUVDomain`.
-    fn natural_uv_domain(&self) -> Extent2d;
+    /// `GetNaturalUVDomain` without a kernel (a lazy analytic [`Surface`] answers its
+    /// NURB-less base's empty domain, see [`Surface::natural_uv_domain_if_built`]).
+    fn natural_uv_domain_if_built(&self) -> Extent2d;
+
+    /// `GetNaturalUVDomain`, virtual: a lazy analytic [`Surface`] makes its NURB first
+    /// and reads that NURB's domain ([`Surface::natural_uv_domain_with_nurb`]). Code
+    /// generic over a surface type reads the domain through this.
+    ///
+    /// # Errors
+    ///
+    /// [`SolidError::Unported`] from the make.
+    fn natural_uv_domain_with_nurb(&self, k: &Kernel) -> Result<Extent2d>;
 
     /// `Evaluate` (see [`Surface::evaluate`]).
     ///
@@ -3484,13 +3983,18 @@ pub trait SurfaceEvaluate {
     /// Those of the comparison.
     fn surface_approx_eq(&self, k: &Kernel, other: &Self) -> Result<bool>;
 
-    /// `GetKnots`.
+    /// `GetKnots`, virtual: a lazy surface makes its NURB first
+    /// ([`Surface::knots_with_nurb`]).
     ///
     /// # Errors
     ///
     /// Those of the knot query.
-    fn knots(&self, param: SurfParamType, ivl: Option<&Extent1d>)
-        -> Result<(Vec<f64>, Vec<usize>)>;
+    fn knots(
+        &self,
+        k: &Kernel,
+        param: SurfParamType,
+        ivl: Option<&Extent1d>,
+    ) -> Result<(Vec<f64>, Vec<usize>)>;
 
     /// `IsKindOf`.
     ///
@@ -3574,8 +4078,13 @@ impl SurfaceEvaluate for Surface {
         self.approx_eq(k, other)
     }
 
-    fn natural_uv_domain(&self) -> Extent2d {
-        Self::natural_uv_domain(self)
+    fn natural_uv_domain_if_built(&self) -> Extent2d {
+        // (kernel-free: a lazy analytic answers its NURB-less base's empty domain)
+        Surface::natural_uv_domain_if_built(self)
+    }
+
+    fn natural_uv_domain_with_nurb(&self, k: &Kernel) -> Result<Extent2d> {
+        Surface::natural_uv_domain_with_nurb(self, k)
     }
 
     fn evaluate(
@@ -3595,10 +4104,11 @@ impl SurfaceEvaluate for Surface {
 
     fn knots(
         &self,
+        k: &Kernel,
         param: SurfParamType,
         ivl: Option<&Extent1d>,
     ) -> Result<(Vec<f64>, Vec<usize>)> {
-        Self::knots(self, param, ivl)
+        Self::knots_with_nurb(self, k, param, ivl)
     }
 
     fn is_kind_of(&self, t: i64) -> Result<bool> {
@@ -3683,8 +4193,13 @@ impl SurfaceEvaluate for BSplineSurface {
         Ok(self.approx_eq(other))
     }
 
-    fn natural_uv_domain(&self) -> Extent2d {
-        Self::natural_uv_domain(self)
+    fn natural_uv_domain_if_built(&self) -> Extent2d {
+        BSplineSurface::natural_uv_domain(self)
+    }
+
+    fn natural_uv_domain_with_nurb(&self, _k: &Kernel) -> Result<Extent2d> {
+        // (a B-spline surface is its own NURB)
+        Ok(BSplineSurface::natural_uv_domain(self))
     }
 
     fn evaluate(
@@ -3704,6 +4219,7 @@ impl SurfaceEvaluate for BSplineSurface {
 
     fn knots(
         &self,
+        _k: &Kernel,
         param: SurfParamType,
         ivl: Option<&Extent1d>,
     ) -> Result<(Vec<f64>, Vec<usize>)> {
@@ -3762,7 +4278,8 @@ pub const fn base_natural_uv_domain() -> Extent2d {
 /// `SmSurface::GetSTEPUVDomain`: the natural domain of `surface`.
 #[must_use]
 pub fn base_step_uv_domain(surface: &Surface) -> Extent2d {
-    surface.natural_uv_domain()
+    // (kernel-free: a lazy analytic answers its NURB-less base's empty domain)
+    surface.natural_uv_domain_if_built()
 }
 
 /// `SmSurface::GetDegree`: reports `SM_ERR` and returns `SM_ERR` (1001) as the
@@ -3849,6 +4366,38 @@ pub(crate) fn base_global_surface_intersect_in<O: SolutionObject + Copy + Partia
     }
 }
 
+/// [`base_global_surface_intersect_in`] into `out`: `SmSurfaceIntersector::DoIntersection`
+/// resets the output arrays first, then sets them. Its only append before a later error
+/// (`GrazingBoxProcess`'s touching point, whose UV degenerate curves cannot fail for a
+/// corner inside the domains) is not reached, so on an error `out` is empty.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn base_global_surface_intersect_into<O: SolutionObject + Copy + PartialEq>(
+    k: &Kernel,
+    this: &Surface,
+    uv_domain: &Extent2d,
+    other: &Surface,
+    other_uv_domain: &Extent2d,
+    use_surface_edges: [bool; 2],
+    approx_tol_3d: Option<f64>,
+    ang_tol_rad: Option<f64>,
+    context: Option<SurfaceIntersectContext<'_, O>>,
+    out: &mut SurfaceIntersection,
+) -> Result<()> {
+    *out = SurfaceIntersection::default();
+    *out = base_global_surface_intersect_in(
+        k,
+        this,
+        uv_domain,
+        other,
+        other_uv_domain,
+        use_surface_edges,
+        approx_tol_3d,
+        ang_tol_rad,
+        context,
+    )?;
+    Ok(())
+}
+
 /// `SmSurface::GetMaxAnalyticDomain`: reports `SM_ERR` and returns an initialised
 /// (empty) domain.
 #[must_use]
@@ -3914,6 +4463,34 @@ pub fn derivative_limit(pos: Point3) -> f64 {
 #[must_use]
 pub const fn normal_limit() -> f64 {
     1.0e-8
+}
+
+/// The edit notification hook of [`Surface::swap_uv_notifying`]: called with the
+/// edited surface's identity slot, its type code and `SM_NO_PRE_EDIT` /
+/// `SM_NO_POST_EDIT`.
+pub(crate) type SurfaceEditNotify<'a> =
+    dyn FnMut(&mut IdentitySlot, i64, NotifyOperation) -> Result<()> + 'a;
+
+/// `SmSurface::Notify` of an edited surface ([`Surface::swap_uv_notifying`]): its
+/// `SM_NO_PRE_EDIT` deletes the stored trimmed surface cache
+/// (`SmCacheMgr::DeleteObjectsCache(SM_OC_TRIMSRF, this)`; a cache in use stays with
+/// its caller), then `notify` gets the event (`SmAObject::Notify`).
+fn edit_notify(
+    cache_slot: &CacheSlot,
+    slot: &mut IdentitySlot,
+    type_code: i64,
+    notify: &mut SurfaceEditNotify<'_>,
+    operation: NotifyOperation,
+) -> Result<()> {
+    if operation == NotifyOperation::PreEdit {
+        cache_slot.with(|s| {
+            if matches!(s.trim, TrimCacheSlot::Stored(_)) {
+                s.trim = TrimCacheSlot::Empty;
+                s.face_modified_while_out = false;
+            }
+        });
+    }
+    notify(slot, type_code, operation)
 }
 
 /// `SmSurface::Notify`: drops the surface's trimmed-surface cache before an edit and
@@ -6115,8 +6692,11 @@ pub fn cc_local_solve<O: SolutionObject>(
 /// # Errors
 ///
 /// Those of `SmExtent3d::ComputeConeBoundTo`; [`SolidError::Unported`] once the
-/// patch's polar box is needed (a dispatch gap: the `SmBezierPatch` of a tree node is
-/// held by the surface cache).
+/// patch's polar box is needed (the `SmBezierPatch` of a tree node is held by the
+/// surface cache, which this signature does not take). Production solves never
+/// reach that: every `SmCSGlobalSolver` the port builds holds its surface cache and
+/// runs [`cs_are_perpen_disjoint_in`]; this cache-less form serves solvers built
+/// without one (tests, the `surface.surface_p2` runner's node-only cases).
 pub fn cs_are_perpen_disjoint<O>(
     curve_tree: &Tree<O>,
     curve_node: &TreeNode<O>,
@@ -6131,12 +6711,12 @@ pub fn cs_are_perpen_disjoint<O>(
             return Ok(false);
         }
 
-        // SmBezierPatch::GetPolarBox is SurfaceCache::polar_box, but the patch data
-        // lives in the surface cache, which the tree reaches once the tree
-        // construction hands it over.
-        // DISPATCH GAP: SmBezierPatch::GetPolarBox (surface.surface_cache_p1, ported;
-        // no UNPORTED marker: the callee is ported, the tree cannot reach the cache's data yet) (then IsDisjointWithCone, and for a curve span node the chord cone test
-        // smgu_ConesAreDisjointPerpen with the span's turning angle plus 3 degrees)
+        // SmBezierPatch::GetPolarBox is SurfaceCache::polar_box_unstored, but the patch
+        // data lives in the surface cache, which a solver built with one passes to
+        // cs_are_perpen_disjoint_in (every production CS solve; see the doc). Without
+        // the cache the polar box is out of reach (then IsDisjointWithCone, and for a
+        // curve span node the chord cone test smgu_ConesAreDisjointPerpen with the
+        // span's turning angle plus 3 degrees).
         let _ = (curve_tree, cone_vec);
         return Err(SolidError::unported(
             "SmBezierPatch::GetPolarBox",
@@ -6407,6 +6987,87 @@ mod tests {
         )
     }
 
+    /// `SetCanonical`'s `SM_NO_PRE_EDIT` / `SM_NO_POST_EDIT` of each edited surface, in
+    /// upstream's order: the B-spline kinds notify themselves (the stored trimmed
+    /// surface cache deleted at `SM_NO_PRE_EDIT`), an offset only its base surface (it
+    /// has no extended one here), a surface in a volume itself around its base.
+    #[test]
+    fn swap_uv_notifying_names_each_edited_surface() {
+        use crate::surface::volume::{Volume, VolumeKind};
+        use NotifyOperation::{PostEdit, PreEdit};
+        let k = Kernel::default();
+        let mut ctx = Context::default();
+        let mut run = |s: &mut Surface| {
+            let mut events = Vec::new();
+            s.swap_uv_notifying(&k, &mut |slot, type_code, op| {
+                events.push((ctx.geometry_key(slot)?, type_code, op));
+                Ok(())
+            })
+            .map(|()| events)
+        };
+
+        for mut s in [
+            bilinear(),
+            Surface::from(Plane::from_normal(Vec3::ZERO, Vec3::Z)),
+        ] {
+            s.attach_trim_cache(|_| {}).unwrap();
+            assert!(s.has_trim_cache());
+            let ty = s.type_code();
+            let events = run(&mut s).unwrap();
+            let key = s.notify_key().unwrap();
+            assert_eq!(events, vec![(key, ty, PreEdit), (key, ty, PostEdit)]);
+            assert!(!s.has_trim_cache());
+            // the plain entry point notifies nobody
+            s.swap_uv(&k).unwrap();
+        }
+
+        let mut off = Surface::from(OffsetSurface::new(&k, 1.0, bilinear(), true, 0).unwrap());
+        let events = run(&mut off).unwrap();
+        assert!(off.notify_key().is_none());
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| e.1 == BSplineSurface::TYPE));
+        assert_eq!(events[0].0, events[1].0);
+        assert_eq!((events[0].2, events[1].2), (PreEdit, PostEdit));
+
+        // SmSrfInVolume::SwapUV: its own PRE/POST around its base surface's
+        let in_volume = |owner_flag| {
+            Surface::from(
+                SrfInVolume::new(
+                    &k,
+                    bilinear(),
+                    true,
+                    Volume::new(VolumeKind::Base),
+                    0,
+                    owner_flag,
+                )
+                .unwrap(),
+            )
+        };
+        let mut siv = in_volume(3);
+        let ty = siv.type_code();
+        let events = run(&mut siv).unwrap();
+        let own = siv.notify_key().unwrap();
+        let SurfaceKind::SrfInVolume(v) = &siv.kind else {
+            panic!("not a surface in a volume");
+        };
+        let base = v.surface().notify_key().unwrap();
+        assert_ne!(own, base);
+        let b = BSplineSurface::TYPE;
+        assert_eq!(
+            events,
+            vec![
+                (own, ty, PreEdit),
+                (base, b, PreEdit),
+                (base, b, PostEdit),
+                (own, ty, PostEdit)
+            ]
+        );
+        // an unowned surface is refused before any notification
+        let mut unowned = in_volume(2);
+        assert!(run(&mut unowned).is_err());
+        assert!(unowned.notify_key().is_none());
+    }
+
     #[test]
     fn evaluation_copy_leaf_depth_boundary_matches_general_walk() {
         for surface in [
@@ -6444,6 +7105,7 @@ mod tests {
         ));
         // The general iso constructor checks before clamping through nested bases.
         assert!(crate::curve::iso_curve::IsoCurve::from_surface(
+            &Kernel::default(),
             surface,
             SurfParamType::U,
             0.5,
@@ -6745,7 +7407,7 @@ mod tests {
         assert_eq!(s.type_code(), B_SPLINE_SURFACE_TYPE);
         assert!(s.is_kind_of(TYPE).unwrap());
         assert!(s.owner().is_none());
-        let d = s.natural_uv_domain();
+        let d = s.natural_uv_domain_if_built();
         assert_eq!(s.step_uv_domain().min(), d.min());
         assert_eq!(s.degree(SurfParamType::U), 1);
         let p = s.evaluate_point(k, Point2::new(1.0, 1.0)).unwrap();
@@ -6770,8 +7432,8 @@ mod tests {
         let (a, b) = s
             .split_at(&Kernel::default(), 0.5, SurfParamType::U)
             .unwrap();
-        assert!(a.natural_uv_domain().u_max() <= 0.5 + 1e-12);
-        assert!(b.natural_uv_domain().u_min() >= 0.5 - 1e-12);
+        assert!(a.natural_uv_domain_if_built().u_max() <= 0.5 + 1e-12);
+        assert!(b.natural_uv_domain_if_built().u_min() >= 0.5 - 1e-12);
         assert_eq!(
             s.convert_uv_from_step_to_nurbs(&Kernel::default(), Point2::new(0.1, 0.2))
                 .unwrap(),
@@ -7208,7 +7870,7 @@ mod kernel_dispatch_tests {
                 surface.type_code(),
                 if cylinder { CYLINDER_TYPE } else { CONE_TYPE }
             );
-            let uv = surface.natural_uv_domain().evaluate(0.25, 0.5);
+            let uv = surface.natural_uv_domain_if_built().evaluate(0.25, 0.5);
             let expected = cone.evaluate_point(&kernel, uv).unwrap();
             assert_eq!(surface.evaluate_point(&kernel, uv).unwrap(), expected);
             assert_eq!(surface.copy(k).unwrap().type_code(), surface.type_code());
@@ -7225,8 +7887,15 @@ mod kernel_dispatch_tests {
             let derivatives =
                 evaluate_1st_derivatives(&kernel, &surface, uv, Side::Left, Side::Left).unwrap();
             assert_eq!(derivatives.0, expected);
-            let iso = IsoCurve::from_surface(surface.clone(), SurfParamType::U, uv.x, true, true)
-                .unwrap();
+            let iso = IsoCurve::from_surface(
+                &kernel,
+                surface.clone(),
+                SurfParamType::U,
+                uv.x,
+                true,
+                true,
+            )
+            .unwrap();
             assert_eq!(
                 Curve::from(iso).evaluate_point(&kernel, uv.y).unwrap(),
                 expected
@@ -7376,5 +8045,114 @@ mod issue_892_tests {
         };
         let volume = brep_volume(&k, &mut plate, 1e-6, &attributes).unwrap();
         assert!((volume - 118.0).abs() < 1e-6, "volume {volume}");
+    }
+}
+
+#[cfg(test)]
+mod made_kind_tests {
+    use super::*;
+    use crate::math::{Point3, Vec3};
+    use crate::surface::torus::TorusOptions;
+
+    /// A torus without NURB (the constructor makes none), inside out so that the made
+    /// kind must keep the flag the copy constructor resets.
+    fn lazy_torus(k: &Kernel) -> Surface {
+        let mut t = Torus::new(
+            k,
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Extent2d::from_bounds(0.0, 0.0, 270.0, 180.0),
+            5.0,
+            1.0,
+            TorusOptions {
+                swap_uv: false,
+                inside_out: false,
+                circle_nurb: None,
+            },
+        )
+        .unwrap();
+        t.inside_out = true;
+        Surface::from(t)
+    }
+
+    fn torus_of(s: &Surface) -> &Torus {
+        let SurfaceKind::Torus(t) = s.kind() else {
+            panic!("a torus");
+        };
+        t
+    }
+
+    #[test]
+    fn a_const_query_keeps_the_made_kind_on_the_surface() {
+        let k = Kernel::default();
+        let s = lazy_torus(&k);
+        assert!(torus_of(&s).base().base().gw_nurb().is_none());
+        let eval_copy = s.clone_for_evaluation().unwrap();
+
+        // GetNaturalUVDomain makes the NURB (GetOrCreateGwNurbPointer) and keeps it
+        let domain = s.natural_uv_domain_with_nurb(&k).unwrap();
+        assert!(s.has_made_nurb());
+        let made = torus_of(&s);
+        assert!(
+            made.base().base().gw_nurb().is_some(),
+            "kind() sees the NURB"
+        );
+        assert!(
+            made.base().have_polar_conversion(),
+            "and the rebuilt converter"
+        );
+        assert!(made.inside_out, "the made kind is an exact copy");
+        assert_eq!(s.natural_uv_domain_if_built(), domain);
+
+        // the made object is the one an in-place MakeNurb gives
+        let mut in_place = lazy_torus(&k);
+        let SurfaceKind::Torus(t) = in_place.kind_mut() else {
+            panic!("a torus");
+        };
+        t.make_nurb(&k).unwrap();
+        assert!(
+            s.approx_eq(&k, &in_place).unwrap(),
+            "operator== sees the NURB"
+        );
+        assert_eq!(in_place.natural_uv_domain_if_built(), domain);
+
+        // the evaluation copy taken before stands for the same object
+        assert!(eval_copy.shares_made_kind_with(&s));
+        assert!(torus_of(&eval_copy).base().base().gw_nurb().is_some());
+
+        // the copy constructor copies the made object
+        let copy = s.clone();
+        assert!(!copy.shares_made_kind_with(&s));
+        assert!(torus_of(&copy).base().base().gw_nurb().is_some());
+    }
+
+    #[test]
+    fn an_edit_detaches_the_made_kind_from_evaluation_copies() {
+        let k = Kernel::default();
+        let s = lazy_torus(&k);
+        let mut edited = s.clone_for_evaluation().unwrap();
+        s.kind_with_nurb(&k).unwrap();
+        assert!(edited.shares_made_kind_with(&s));
+
+        // the edit applies to the made object (it keeps its NURB) on a cell of its own
+        let SurfaceKind::Torus(t) = edited.kind_mut() else {
+            panic!("a torus");
+        };
+        assert!(t.base().base().gw_nurb().is_some());
+        t.inside_out = false;
+        assert!(!edited.shares_made_kind_with(&s));
+        assert!(!edited.has_made_nurb());
+        assert!(torus_of(&s).inside_out, "the original is untouched");
+        assert!(s.has_made_nurb());
+    }
+
+    #[test]
+    fn copy_makes_the_source_nurb_first() {
+        let k = Kernel::default();
+        let s = lazy_torus(&k);
+        let copy = s.copy(&k).unwrap();
+        assert!(s.has_made_nurb(), "the source keeps the NURB the copy made");
+        assert!(torus_of(&copy).base().base().gw_nurb().is_some());
     }
 }

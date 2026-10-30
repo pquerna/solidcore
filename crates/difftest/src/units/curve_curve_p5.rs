@@ -30,7 +30,8 @@ use solidcore::curve::curve::p2::{Curve, CurvePropertyType};
 use solidcore::curve::curve::p4::{CcIntersectEnfo, CcTangentIntEnfo, FindCcNormalEnfo};
 use solidcore::curve::curve::p5::{
     crvs_cleanup, find_additional_cp_guess, is_point_solution_across_closed_seam_boundary,
-    local_property_analysis, make_curve_cache, remove_duplicate_curves, validate_curve_cache,
+    local_property_analysis, make_curve_cache, make_curve_cache_with_zone_tol,
+    remove_duplicate_curves, validate_curve_cache,
 };
 use solidcore::curve::curve_cache::CurveCache;
 use solidcore::curve::ellipse::{Ellipse, EllipseOptions};
@@ -50,6 +51,8 @@ use solidcore::math::EFF_ZERO_SQ;
 use solidcore::nurbs::b_spline_curve::BSplineCurve;
 use solidcore::nurbs::math::{NOW, NOZ};
 use solidcore::nurbs::nurbs_crv::allocate_nurb_curve;
+use solidcore::topology::brep::p5::create_wire_edge_from_curve;
+use solidcore::topology::{edge, Brep};
 use solidcore::SolidError;
 use solidcore_ffi::units::curve_curve_p5::{self as ffi, Op};
 
@@ -77,6 +80,11 @@ struct BSplineIn {
     cpts: Vec<[f64; 4]>,
     p: usize,
     u: Vec<f64>,
+    /// Knots written back over the curve's own NURB after construction, so the
+    /// constructor's knot fix-up is undone (curve block kind `5`). Omitted when false,
+    /// so existing case identities are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    raw_knots: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +255,11 @@ enum OpIn {
         vecs: Vec<[f64; 3]>,
         calls: Vec<CallIn>,
     },
+    /// The cache of the curve of a wire edge whose tolerance is `tol`.
+    EdgeCache {
+        curve: CurveIn,
+        tol: f64,
+    },
 }
 
 // ---- C++ input --------------------------------------------------------------------
@@ -273,6 +286,7 @@ fn resolve(c: &CurveIn) -> Result<CurveIn, HarnessError> {
         cpts: cur.cpts().iter().map(|p| [p.x, p.y, p.z, p.w]).collect(),
         p: cur.degree(),
         u: cur.knots().to_vec(),
+        raw_knots: false,
     }))
 }
 
@@ -291,7 +305,8 @@ fn curve_block(v: &mut Vec<f64>, c: &CurveIn) -> Result<(), HarnessError> {
         CurveIn::Bspline(bs) => {
             let n = bs.cpts.len().saturating_sub(1);
             let m = bs.u.len().saturating_sub(1);
-            v.extend([0.0, bs.dim as f64, b(bs.oob)]);
+            let kind = if bs.raw_knots { 5.0 } else { 0.0 };
+            v.extend([kind, bs.dim as f64, b(bs.oob)]);
             v.extend([n as f64, bs.p as f64, m as f64]);
             for c in &bs.cpts {
                 v.extend_from_slice(c);
@@ -345,6 +360,7 @@ fn op_of(op: &OpIn) -> Op {
         OpIn::Cci { .. } => Op::Cci,
         OpIn::CcTan { .. } => Op::CcTan,
         OpIn::Normal { .. } => Op::Normal,
+        OpIn::EdgeCache { .. } => Op::EdgeCache,
     }
 }
 
@@ -469,6 +485,10 @@ fn cpp_input(op: &OpIn) -> Result<(Op, Vec<f64>), HarnessError> {
                 v.extend([c.x[0], c.x[1], b(c.jac)]);
             }
         }
+        OpIn::EdgeCache { curve, tol } => {
+            curve_block(&mut v, curve)?;
+            v.push(*tol);
+        }
     }
     Ok((op_of(op), v))
 }
@@ -563,6 +583,13 @@ fn build(k: &Kernel, c: &CurveIn) -> Result<Curve, HarnessError> {
             }
             cur.knots_mut().copy_from_slice(&bs.u);
             let mut c = BSplineCurve::from_nurb(cur, bs.dim, false);
+            if bs.raw_knots {
+                // undo the constructor's fix-up, as the shim does
+                c.get_or_create_gw_nurb()
+                    .map_err(|e| harness(format!("curve: {e}")))?
+                    .knots_mut()
+                    .copy_from_slice(&bs.u);
+            }
             c.set_out_of_bounds_enabled(bs.oob);
             Ok(Curve::from(c))
         }
@@ -592,7 +619,7 @@ fn pv(o: &mut Vec<f64>, v: Vec3) {
 /// cannot return.
 fn status(e: &SolidError) -> f64 {
     match e {
-        SolidError::InvalidInput { .. } => 1007.0,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.0,
         SolidError::Upstream { code, .. } => f64::from(*code),
         _ => -1.0,
     }
@@ -670,7 +697,7 @@ fn put_points(k: &Kernel, o: &mut Vec<f64>, c: &Curve) {
 
 #[allow(clippy::too_many_lines)]
 fn rust(op: &OpIn) -> Result<Output, HarnessError> {
-    let k = Kernel::default();
+    let mut k = Kernel::default();
     let mut o: Vec<f64> = Vec::new();
     match op {
         OpIn::Cleanup { curves, tol } => {
@@ -759,6 +786,25 @@ fn rust(op: &OpIn) -> Result<Output, HarnessError> {
                 _ => (false, tri!(o, make_curve_cache::<()>(&k, &c, None))),
             };
             o.extend([0.0, b(reused), cache.span_count() as f64]);
+            for i in 0..cache.span_count() {
+                let span = tri!(o, cache.span(i));
+                o.extend([span.aux.interval.min(), span.aux.interval.max()]);
+            }
+        }
+        OpIn::EdgeCache { curve, tol } => {
+            let c = build(&k, curve)?;
+            let mut brep = tri!(o, Brep::new_with_infinite_region());
+            let ivl = c.natural_interval();
+            let e = tri!(o, create_wire_edge_from_curve(&mut k, &mut brep, c, ivl));
+            tri!(o, edge::set_tolerance(&mut brep, e, *tol, false, false));
+            let edge_curve = tri!(o, edge::curve(&brep, e)).ok_or_else(|| harness("edge curve"))?;
+            // the cache is the edge curve's own: its tolerance is the edge's
+            let zone_tol_3d = tri!(o, edge::tolerance(&brep, e));
+            let cache = tri!(
+                o,
+                make_curve_cache_with_zone_tol::<()>(&k, edge_curve, None, Some(zone_tol_3d))
+            );
+            o.extend([0.0, cache.span_count() as f64]);
             for i in 0..cache.span_count() {
                 let span = tri!(o, cache.span(i));
                 o.extend([span.aux.interval.min(), span.aux.interval.max()]);
@@ -968,6 +1014,7 @@ fn gen_bspline(rng: &mut Rng) -> BSplineIn {
         cpts,
         p,
         u,
+        raw_knots: false,
     }
 }
 
@@ -1005,6 +1052,7 @@ fn gen_linear_bspline(rng: &mut Rng, p: [f64; 3], q: [f64; 3], deg: usize, even:
         cpts,
         p: deg,
         u,
+        raw_knots: false,
     }
 }
 

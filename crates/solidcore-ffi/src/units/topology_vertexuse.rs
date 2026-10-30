@@ -269,26 +269,74 @@ pub(crate) fn brep_block_at(input: &[f64], path: &str) -> Result<usize, FfiError
     Ok(rd.at)
 }
 
-/// A B-rep block.
-fn brep_block(rd: &mut Reader<'_>, path: &str) -> Result<(), FfiError> {
-    let kind = rd.index(9)?;
-    match kind {
-        0 => {
-            let p = Path::new(path);
-            if p.extension().and_then(|e| e.to_str()) != Some("smb") || !p.is_file() {
-                return Err(bad("B-rep file: need an existing .smb file"));
+/// Most edges of a kind-14 edge-loop face block.
+pub const MAX_EDGE_LOOP_EDGES: usize = 64;
+
+/// A one-face block with an edge loop of explicit curves (`support/edge_loop_face_fixture.h`):
+/// `origin[3] normal[3] u0 v0 u1 v1 face_tol n_edges (curve t0 t1 tol)*n_edges`. A curve is
+/// `1 a[3] b[3]` (`SmLine`) or `3 p1[3] d1[3] p2[3] d2[3]` (`SmHermiteCurve`).
+fn edge_loop_face_block(rd: &mut Reader<'_>) -> Result<(), FfiError> {
+    rd.vec3()?;
+    rd.nonzero3()?;
+    let d = rd.finites(4)?;
+    let (Some(&u0), Some(&v0), Some(&u1), Some(&v1)) = (d.first(), d.get(1), d.get(2), d.get(3))
+    else {
+        return Err(bad("edge-loop face: domain too short"));
+    };
+    if u0 >= u1 || v0 >= v1 {
+        return Err(bad("edge-loop face: domain not ordered"));
+    }
+    // SmZoneTol3d: any finite value (a tolerance is stored as |v|)
+    rd.finite()?;
+    let n = rd.index(MAX_EDGE_LOOP_EDGES)?;
+    if n == 0 {
+        return Err(bad("edge-loop face: need at least one edge"));
+    }
+    for _ in 0..n {
+        let kind = rd.index(3)?;
+        match kind {
+            // SmLine(a, b)
+            1 => {
+                rd.vec3()?;
+                rd.vec3()?;
             }
-            rd.flag()?;
-        }
-        1 => {
-            let (a, b) = curve(rd)?;
-            let t0 = rd.finite()?;
-            let t1 = rd.finite()?;
-            if !(a <= t0 && t0 < t1 && t1 <= b) {
-                return Err(bad("wire edge interval outside the curve's"));
+            // SmHermiteCurve(p1, d1, p2, d2, 3)
+            3 => {
+                for _ in 0..4 {
+                    rd.vec3()?;
+                }
             }
+            _ => return Err(bad("edge-loop face: unsupported curve kind")),
         }
-        2 | 4 => {
+        let t0 = rd.finite()?;
+        let t1 = rd.finite()?;
+        if t0 >= t1 {
+            return Err(bad("edge-loop face: edge interval not ordered"));
+        }
+        rd.finite()?;
+    }
+    Ok(())
+}
+
+/// The input checks [`eval`] makes on a B-rep block before any shim call (pure Rust,
+/// no C++ is run): a runner whose Rust side builds the block itself refuses exactly the
+/// blocks [`eval`] refuses.
+///
+/// # Errors
+///
+/// [`FfiError::InvalidArgument`] for a block [`eval`] rejects.
+pub fn validate_block(path: &str, input: &[f64]) -> Result<(), FfiError> {
+    let mut rd = Reader::new(input);
+    brep_block(&mut rd, path)?;
+    let block = input.get(..rd.at).ok_or_else(|| bad("input too short"))?;
+    check_block_magnitudes(block)
+}
+
+/// Most faces of a kind-10 block.
+pub const MAX_FACES: usize = 4;
+
+/// The `surface u0 v0 u1 v1` face of a kind-2 (or kind-10) block.
+fn face_block(rd: &mut Reader<'_>) -> Result<(), FfiError> {
             let dom = surface(rd)?;
             let d = rd.finites(4)?;
             let (Some(&a), Some(&b2), Some(&c), Some(&e)) =
@@ -311,6 +359,68 @@ fn brep_block(rd: &mut Reader<'_>, path: &str) -> Result<(), FfiError> {
                     }
                 }
             }
+    Ok(())
+}
+
+/// A canonical analytic face of a kind-10 block: `kind scale a b c ox oy oz axis f0u f0v
+/// f1u f1v` (kind 10 cylinder, 11 sphere, 12 torus, 13 cone).
+fn analytic_face_block(rd: &mut Reader<'_>) -> Result<(), FfiError> {
+    let kind = rd.index(13)?;
+    let scale = rd.finite()?;
+    let a = rd.finite()?;
+    let b = rd.finite()?;
+    let c = rd.finite()?;
+    if !(1e-3..=1e3).contains(&scale) || !(1e-3..=1e2).contains(&a) || !(0.0..=1e2).contains(&c) {
+        return Err(bad("analytic face: size out of range"));
+    }
+    let ok = match kind {
+        10 | 11 => true,
+        // a torus with a minor radius below its major one, a cone of semi-angle in (0, 90)
+        12 => b > 0.0 && b < a,
+        13 => b > 0.0 && b < 90.0,
+        _ => false,
+    };
+    if !ok {
+        return Err(bad("analytic face: bad kind or shape"));
+    }
+    let o = rd.vec3()?;
+    if o.iter().any(|x| x.abs() > 1e4) {
+        return Err(bad("analytic face: origin out of range"));
+    }
+    rd.index(2)?;
+    let f = rd.finites(4)?;
+    let (Some(&f0u), Some(&f0v), Some(&f1u), Some(&f1v)) = (f.first(), f.get(1), f.get(2), f.get(3))
+    else {
+        return Err(bad("analytic face: domain too short"));
+    };
+    if f.iter().any(|t| !(0.0..=1.0).contains(t)) || f0u >= f1u || f0v >= f1v {
+        return Err(bad("analytic face: domain fractions not ordered in [0, 1]"));
+    }
+    Ok(())
+}
+
+/// A B-rep block.
+fn brep_block(rd: &mut Reader<'_>, path: &str) -> Result<(), FfiError> {
+    // 14 is the highest block kind (the edge-loop face, kind 14)
+    let kind = rd.index(14)?;
+    match kind {
+        0 => {
+            let p = Path::new(path);
+            if p.extension().and_then(|e| e.to_str()) != Some("smb") || !p.is_file() {
+                return Err(bad("B-rep file: need an existing .smb file"));
+            }
+            rd.flag()?;
+        }
+        1 => {
+            let (a, b) = curve(rd)?;
+            let t0 = rd.finite()?;
+            let t1 = rd.finite()?;
+            if !(a <= t0 && t0 < t1 && t1 <= b) {
+                return Err(bad("wire edge interval outside the curve's"));
+            }
+        }
+        2 | 4 => {
+            face_block(rd)?;
             if kind == 4 {
                 // kind 4 adds an inner vertex loop at these fractions of the domain
                 for _ in 0..2 {
@@ -318,6 +428,20 @@ fn brep_block(rd: &mut Reader<'_>, path: &str) -> Result<(), FfiError> {
                     if !(0.0..=1.0).contains(&t) {
                         return Err(bad("vertex loop fraction outside [0, 1]"));
                     }
+                }
+            }
+        }
+        10 => {
+            // faces of one B-rep: kind-2 faces or canonical analytic ones
+            let nf = rd.index(MAX_FACES)?;
+            if nf == 0 {
+                return Err(bad("face list: need at least one face"));
+            }
+            for _ in 0..nf {
+                if rd.input.get(rd.at).is_some_and(|&k| k >= 10.0) {
+                    analytic_face_block(rd)?;
+                } else {
+                    face_block(rd)?;
                 }
             }
         }
@@ -347,6 +471,7 @@ fn brep_block(rd: &mut Reader<'_>, path: &str) -> Result<(), FfiError> {
                 rd.input.get(rd.at..).ok_or_else(|| bad("short ellipse face"))?
             )?;
         }
+        14 => edge_loop_face_block(rd)?,
         3 => {}
         _ => return Err(bad("unsupported B-rep kind")),
     }

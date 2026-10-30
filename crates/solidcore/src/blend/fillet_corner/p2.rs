@@ -947,10 +947,10 @@ impl FilletCorner {
             .ok_or_else(|| invalid(OP, "corner vertex without fillet geometry"))?;
         let fillet_srf = pseudo
             .geom(orig_fg)?
-            .fillet_surface()?
+            .fillet_surface(None)?
             .ok_or_else(|| invalid(OP, "fillet geometry without fillet surface"))?;
 
-        let srf_domain = fillet_srf.natural_uv_domain();
+        let srf_domain = fillet_srf.natural_uv_domain_with_nurb(k)?;
         // u runs the long way, v goes across the fillet. (statuses ignored)
         let srf_pt00 =
             unchecked_point(fillet_srf.evaluate_point(k, srf_domain.evaluate(0.0, 0.0)))?;
@@ -1315,7 +1315,11 @@ impl FilletCorner {
     ) -> Result<bool> {
         match self.analytic_corner_surface(env) {
             Ok(made) => Ok(made),
-            Err(e @ (SolidError::Unported { .. } | SolidError::InvalidInput { .. })) => Err(e),
+            Err(
+                e @ (SolidError::Unported { .. }
+                | SolidError::InvalidInput { .. }
+                | SolidError::PortInvariant { .. }),
+            ) => Err(e),
             // `return sErr` / `return SM_ERR_NULL_POINTER` as an SmBoolean
             Err(_) => Ok(true),
         }
@@ -1454,7 +1458,7 @@ impl FilletCorner {
                         .ok_or_else(|| invalid(OP, "fillet edge use without fillet geometry"))?;
                     let fs = solver_ref(env, fillet_geom, OP)?;
                     (
-                        env.pseudo.geom(fillet_geom)?.fillet_surface()?.cloned(),
+                        env.pseudo.geom(fillet_geom)?.fillet_surface(None)?.cloned(),
                         fs.this_approx_tol_3d(),
                         fs.this_ang_tol_rad(),
                     )
@@ -1757,7 +1761,7 @@ impl FilletCorner {
         let opposite_fillet = env
             .pseudo
             .geom(opposite_fg)?
-            .fillet_surface()?
+            .fillet_surface(None)?
             .cloned()
             .ok_or_else(null)?;
         let opposite_fs = solver_of_geom(env, opposite_fg, OP)?;
@@ -1798,7 +1802,7 @@ impl FilletCorner {
         // Then determine the orientation of pFilletSurface. But first, drop two end
         // points of pOppositeEdge onto pOppositeFillet
         let mut offset_orientation2 = 1.0;
-        let uv_domain = opposite_fillet.natural_uv_domain();
+        let uv_domain = opposite_fillet.natural_uv_domain_with_nurb(env.k)?;
         let drop_uv = |p: Point3| -> Result<Point2> {
             let sols = opposite_fillet.global_point_solve::<ObjectHandle>(
                 env.k,
@@ -2124,7 +2128,7 @@ impl FilletCorner {
         // set output
         env.pseudo
             .geom(new_fg)?
-            .fillet_surface()?
+            .fillet_surface(None)?
             .cloned()
             .ok_or_else(|| invalid(OP, "new fillet geometry without fillet surface"))
     }
@@ -2199,7 +2203,11 @@ fn unitize_ser(v: Vec3, operation: &'static str) -> Result<Vec3> {
 fn soft<T>(r: Result<T>) -> Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
-        Err(e @ (SolidError::Unported { .. } | SolidError::InvalidInput { .. })) => Err(e),
+        Err(
+            e @ (SolidError::Unported { .. }
+            | SolidError::InvalidInput { .. }
+            | SolidError::PortInvariant { .. }),
+        ) => Err(e),
         Err(_) => Ok(None),
     }
 }

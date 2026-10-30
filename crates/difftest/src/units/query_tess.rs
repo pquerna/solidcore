@@ -472,7 +472,7 @@ fn link(i: i64) -> Option<NodeId> {
 /// The `SmStatus` of a Rust error; `-1` for one upstream cannot return.
 fn status(e: &SolidError) -> i64 {
     match e {
-        SolidError::InvalidInput { .. } => 1007,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007,
         SolidError::Upstream { code, .. } => i64::from(*code),
         _ => -1,
     }
@@ -528,7 +528,7 @@ fn poly_of(k: &Kernel, p: &PolyIn) -> Result<(PolyBrep, Vec<PolyEdgeId>), Harnes
     let sh = b.add_shell(r).map_err(|e| hs(&e))?;
     let f = b.add_face(k, sh, p.face_tol, None).map_err(|e| hs(&e))?;
     let label = (p.label > 0).then_some(ObjectKey(p.label));
-    b.face_set_original_face(f, label, false).map_err(|e| hs(&e))?;
+    b.face_set_original_face(f, label, false, None).map_err(|e| hs(&e))?;
     let mut edges = Vec::new();
     for l in &p.loops {
         let mut vs = Vec::new();

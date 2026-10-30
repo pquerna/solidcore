@@ -34,9 +34,11 @@
 //! Deviations:
 //! - **Object model** as in `blend.fillet_standard_solver_p1` (the solvers are its
 //!   structs). The tangent-rollover guess of `SmConstantRadiusFS::LoadInitialValues`
-//!   comes from [`ConstantRadiusOps::tangent_rollover_guess`]: the geometry for the
-//!   surfaces of `SmFilletGeom::RailEdgeuseIntersect` supplies its rails' guesses
-//!   (`blend::fillet_solver::surfaces`); context-free callers have none.
+//!   comes from [`ConstantRadiusOps::tangent_rollover_guess`]: every scope that sets
+//!   the solver's geometry for the surfaces (`SmFilletGeom::RailEdgeuseIntersect`, the
+//!   corners' `ReCalcFilletGeom` scopes) hands the solver that geometry's rail guesses,
+//!   taken when the scope starts (`blend::fillet_solver::surfaces`); context-free
+//!   callers have none.
 //! - **Virtual dispatch.** `SetupOffsetExtension` is dispatched on the solver's class
 //!   through [`ConstantRadiusOps`]: `SmSurfaceSurfaceFS` has its own version
 //!   (`blend.fillet_standard_solver_p1`); every other constant-radius solver uses the
@@ -201,7 +203,9 @@ fn interval_at<'a>(ivls: &'a mut ExtentNd, i: usize, op: &'static str) -> Result
 /// out of bounds) are kept.
 fn as_sm_err(e: SolidError, op: &'static str) -> SolidError {
     match e {
-        SolidError::Unported { .. } | SolidError::InvalidInput { .. } => e,
+        SolidError::Unported { .. }
+        | SolidError::InvalidInput { .. }
+        | SolidError::PortInvariant { .. } => e,
         _ => SolidError::sm_err(op),
     }
 }
@@ -361,14 +365,15 @@ pub trait ConstantRadiusOps {
     /// The tangent-rollover guess of rail `rail`'s other surface: in the
     /// tangent-rollover case (`GetFilletGeomForSurfaces()` of type
     /// `SM_FG_TANGENT_ROLLOVER`) the UV position stored in a rail vertex use's
-    /// intersection point (`None`: no such point, or no such geometry). Context-free
-    /// callers have no geometry for the surfaces.
+    /// intersection point (`None`: no such point, or no such geometry). The geometry
+    /// for the surfaces is the solver's, set by the scope that lent its surfaces
+    /// ([`FilletSolver::tangent_rollover_guess`]); context-free callers have none.
     ///
     /// # Errors
-    /// `SM_ERR_NULL_POINTER` without the geometry's rail.
+    /// `SM_ERR_NULL_POINTER` without the geometry's rail; [`SolidError::InvalidInput`]
+    /// for a geometry for the surfaces set outside a lending scope.
     fn tangent_rollover_guess(&self, rail: usize) -> Result<Option<Point2>> {
-        let _ = rail;
-        Ok(None)
+        self.constant_radius().solver.tangent_rollover_guess(rail)
     }
 
     /// `SetupOffsetExtension(pSurf, rDomain)` of the solver's class.
@@ -663,7 +668,7 @@ fn cr_initial_body<S: ConstantRadiusOps + ?Sized>(
                 k,
                 base2,
                 face_owner(brep.as_deref_mut(), base2_id),
-                &base2.natural_uv_domain(),
+                &base2.natural_uv_domain_with_nurb(k)?,
                 pnt,
                 EFF_ZERO_SQ,
             )?;
@@ -681,7 +686,7 @@ fn cr_initial_body<S: ConstantRadiusOps + ?Sized>(
         // Before we add the rGuessT values, drop point to other offset surface
         // to get a better guess
         let uv_guess = Point2::new(srf2_guess_uv.x, srf2_guess_uv.y);
-        let mut domain = base2.natural_uv_domain();
+        let mut domain = base2.natural_uv_domain_with_nurb(k)?;
         solver.setup_offset_extension(k, base2, &mut domain)?; // expands sDomain
 
         if let Some((sol_uv, dist)) = offset_local_point_solve(k, surface2, &domain, pnt, uv_guess)?
@@ -698,7 +703,7 @@ fn cr_initial_body<S: ConstantRadiusOps + ?Sized>(
                 k,
                 base2,
                 face_owner(brep, base2_id),
-                &base2.natural_uv_domain(),
+                &base2.natural_uv_domain_with_nurb(k)?,
                 pnt,
                 EFF_ZERO_SQ,
             )?;
@@ -715,7 +720,7 @@ fn cr_initial_body<S: ConstantRadiusOps + ?Sized>(
 
     // Start setting the return values:
     // the next two entries in rIntervals and rPeriodicities.
-    let mut domain = base2.natural_uv_domain();
+    let mut domain = base2.natural_uv_domain_with_nurb(k)?;
     solver.setup_offset_extension(k, base2, &mut domain)?; // expands sDomain
 
     let surface2_index = guess_t.len();
@@ -1101,7 +1106,7 @@ pub fn point_on_plane_solve(
     let mut guess_t = vec![uv1.x, uv1.y];
 
     let mut surface1 = rail_offset(solver.solver(), 0)?.clone();
-    let domain_before = surface1.surface.natural_uv_domain();
+    let domain_before = surface1.surface.natural_uv_domain_with_nurb(k)?;
     let surf1_index = 0; // UV values of Surface1
     let rail_index = 0;
 
@@ -1122,7 +1127,7 @@ pub fn point_on_plane_solve(
     // evaluations of crSurface1 made, unless the solver's own offset was extended
     // later in the call, as by the custom solvers' GuessPointOnPlaneSolve)
     let own = &mut rail_offset_mut(solver.solver_mut(), 0)?.surface;
-    if own.natural_uv_domain() == domain_before {
+    if own.natural_uv_domain_with_nurb(k)? == domain_before {
         own.take_extension_of(&surface1.surface);
     }
     let init = init?;
@@ -1656,8 +1661,12 @@ impl VariableRadiusFs {
         let solver = &self.curve_based.solver;
         let surf1 = Surface::from(rail_offset(solver, 0)?.surface.clone());
         let surf2 = Surface::from(rail_offset(solver, 1)?.surface.clone());
-        let mut domain1 = rail_offset(solver, 0)?.surface.natural_uv_domain();
-        let mut domain2 = rail_offset(solver, 1)?.surface.natural_uv_domain();
+        let mut domain1 = rail_offset(solver, 0)?
+            .surface
+            .natural_uv_domain_with_nurb(k)?;
+        let mut domain2 = rail_offset(solver, 1)?
+            .surface
+            .natural_uv_domain_with_nurb(k)?;
         solver.setup_offset_extension(k, &surf1, &mut domain1)?;
         solver.setup_offset_extension(k, &surf2, &mut domain2)?;
         // Setup FilletIntersector (no current fillet geometry: the default NULL)
@@ -1982,7 +1991,7 @@ impl VariableRadiusFs {
             let other_rail = 1 - rail_index;
             let solver = &self.curve_based.solver;
             let surface2 = solver.rail(other_rail)?;
-            let domain = surface2.base_surface().natural_uv_domain();
+            let domain = surface2.base_surface().natural_uv_domain_with_nurb(k)?;
             let size = solver.surface_extension_factor * domain.size();
             let extended = Extent2d::from_points(
                 Point2::new(domain.min().x - size.x, domain.min().y - size.y),
@@ -2090,24 +2099,6 @@ impl FilletSolverOps for VariableRadiusFs {
 
     fn solver_mut(&mut self) -> &mut FilletSolver {
         &mut self.curve_based.solver
-    }
-
-    /// `SmFilletSolver::RailEdgeuseIntersect` with `geometry` as the geometry for
-    /// surfaces (`SmFilletGeom::RailEdgeuseIntersect`).
-    fn rail_edgeuse_intersect_on_geometry(
-        &mut self,
-        k: &Kernel,
-        geometry: &mut crate::blend::fillet_geom::p1::FilletGeom,
-        _rollover: crate::blend::fillet_solver::p1::RolloverGuesses,
-        target: &mut Brep,
-        rail_index: usize,
-        edgeuse: EdgeuseId,
-        guess: f64,
-        tsect: &mut TsectPnt,
-    ) -> Result<Option<f64>> {
-        crate::blend::fillet_solver::surfaces::slot_rail_edgeuse_intersect(
-            self, k, geometry, target, rail_index, edgeuse, guess, tsect,
-        )
     }
 
     /// `SmVariableRadiusFS::GetJacobianSize`: 5.
@@ -2252,25 +2243,6 @@ impl FilletSolverOps for ConstantDistanceFs {
 
     fn solver_mut(&mut self) -> &mut FilletSolver {
         &mut self.solver
-    }
-
-    /// `SmFilletSolver::RailEdgeuseIntersect` with `geometry` as the geometry for
-    /// surfaces (`SmFilletGeom::RailEdgeuseIntersect`): this solver reads its rails
-    /// through its own slots, as `SmVariableRadiusFS` does.
-    fn rail_edgeuse_intersect_on_geometry(
-        &mut self,
-        k: &Kernel,
-        geometry: &mut crate::blend::fillet_geom::p1::FilletGeom,
-        _rollover: crate::blend::fillet_solver::p1::RolloverGuesses,
-        target: &mut Brep,
-        rail_index: usize,
-        edgeuse: EdgeuseId,
-        guess: f64,
-        tsect: &mut TsectPnt,
-    ) -> Result<Option<f64>> {
-        crate::blend::fillet_solver::surfaces::slot_rail_edgeuse_intersect(
-            self, k, geometry, target, rail_index, edgeuse, guess, tsect,
-        )
     }
 
     /// `SmConstantDistanceFS::GetJacobianSize`: 5.
@@ -2583,8 +2555,16 @@ impl SurfaceSurfaceFs {
     /// As [`SurfaceSurfaceFs::calc_fillet_geom`] before the pseudo-B-rep.
     pub fn calc_fillet_start(&mut self, k: &Kernel) -> Result<Option<SurfaceSurfaceStart>> {
         const OP: &str = OP_SS_CALC;
-        let domain1 = self.base.surface(0)?.surface.natural_uv_domain();
-        let domain2 = self.base.surface(1)?.surface.natural_uv_domain();
+        let domain1 = self
+            .base
+            .surface(0)?
+            .surface
+            .natural_uv_domain_with_nurb(k)?;
+        let domain2 = self
+            .base
+            .surface(1)?
+            .surface
+            .natural_uv_domain_with_nurb(k)?;
 
         // Need to solve for start point using guess point
         let [g0, g1] = self.uv_guesses;

@@ -5,10 +5,11 @@
 //! does: read from an upstream `.smb` test file (optionally rebuilding its UV trim
 //! curves), a wire edge from a B-spline curve (`CreateWireEdgeFromCurve`), a face from a
 //! B-spline surface or a plane (`CreateFaceFromSurface`), or the wire network of
-//! `prog_test` `my_test_topology`. There is no Rust B-rep reader or builder yet (units
-//! `topology.brep_*`), so the Rust side imports the graph the shim exports in traversal
-//! order (raw members, including each vertex use's cached gap states and UV point) into a
-//! [`Brep`] and runs the ported functions on it; their results are compared as traversal
+//! `prog_test` `my_test_topology`. The Rust side builds a wire edge, face or network
+//! source itself ([`crate::own_builder`], renumbered into the shim's traversal order).
+//! For an `.smb` file it imports the graph the shim exports in traversal order (raw
+//! members, including each vertex use's cached gap states and UV point) into a [`Brep`].
+//! It runs the ported functions on that B-rep; their results are compared as traversal
 //! indices, flags, statuses and values. `init_gaps` has the C++ side compute the cached
 //! gaps before the op, so that resets are observable.
 //!
@@ -958,7 +959,7 @@ fn target(ty: i64, index: i64) -> Option<EntityRef> {
 // ---- generation -------------------------------------------------------------------------
 
 /// The upstream `.smb` files used (all B-spline geometry).
-/// (`SmallBox.smb` and `Platform.smb` crash upstream's `SmBrep::ReadFromFile`; see
+/// (`SmallBox.smp` and `Platform.smp` crash upstream's `SmBrep::ReadFromFile`; see
 /// `plan/findings.md`.)
 const FILES: [&str; 15] = [
     "Mouse.smb",
@@ -1076,7 +1077,7 @@ pub(crate) fn domain(s: &SrfIn) -> [f64; 4] {
 pub(crate) fn gen_brep(rng: &mut Rng) -> BrepIn {
     match rng.below(10) {
         0..=5 => BrepIn::File {
-            file: (*rng.choose(&FILES).unwrap_or(&"SmallBox.smb")).to_string(),
+            file: (*rng.choose(&FILES).unwrap_or(&"SmallBox.smp")).to_string(),
             rebuild: rng.chance(0.25),
         },
         6 => {
@@ -1308,7 +1309,7 @@ impl From<HarnessError> for Fail {
 fn slot<T>(r: Result<T, SolidError>, f: impl FnOnce(T) -> i64) -> Result<i64, SolidError> {
     match r {
         Ok(v) => Ok(f(v)),
-        Err(SolidError::InvalidInput { .. }) => Ok(NULL_DEREF),
+        Err(SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }) => Ok(NULL_DEREF),
         Err(e) => Err(e),
     }
 }
@@ -1353,12 +1354,41 @@ fn notify_operation(code: u8) -> Result<NotifyOperation, HarnessError> {
     })
 }
 
+/// A Rust B-rep, whether each face's surface is held exactly, and its entity counts.
+type OwnBrep = (Brep, Vec<bool>, [usize; 10]);
+
+/// The Rust B-rep of a case, whether each face's surface is held exactly, and its
+/// entity counts, or the output of a failed build. Shim-built sources are built by the
+/// Rust kernel ([`crate::own_builder`] under `sc_topology_fixture.h`'s conventions);
+/// only `.smb` file sources are still imported from the C++ export ([`import_raw`]).
+fn rust_brep(
+    i: &Inputs,
+) -> Result<crate::own_builder::RustBrep<OwnBrep>, HarnessError> {
+    use crate::own_builder::{build_as, counts, failed_output, Built, Conventions};
+    let mut k = Kernel::default();
+    let conv = &Conventions::TOPOLOGY_FIXTURE;
+    match build_as(&mut k, &i.brep, i.validate_only, i.init_gaps, conv)? {
+        Some(Built::Brep(b)) => {
+            let c = counts(&b);
+            Ok(Ok((*b, vec![true; c[3]], c)))
+        }
+        Some(Built::Failed(e)) => Ok(Err(failed_output(&e))),
+        None => {
+            let ex = export(i)?;
+            let Some(c) = ffi::counts(&ex) else {
+                return Ok(Err(build_failure(&ex)));
+            };
+            let (b, exact) = import_raw(&ex)?;
+            Ok(Ok((b, exact, c)))
+        }
+    }
+}
+
 fn run_rust(i: &Inputs) -> Result<Output, HarnessError> {
-    let ex = export(i)?;
-    let Some(c) = ffi::counts(&ex) else {
-        return Ok(build_failure(&ex));
+    let (mut b, exact, c) = match rust_brep(i)? {
+        Ok(x) => x,
+        Err(o) => return Ok(o),
     };
-    let (mut b, exact) = import_raw(&ex)?;
     let Some(op) = resolve(&i.op, c) else {
         return Ok(Output::err("no_vertexuse"));
     };
@@ -1621,7 +1651,7 @@ fn run_rust_op(b: &mut Brep, op: &OpIn) -> Result<Output, Fail> {
             };
             match r {
                 Ok(x) => out.extend(x),
-                Err(SolidError::InvalidInput { .. }) => {
+                Err(SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }) => {
                     return Ok(Output::new().values("state", vec![NULL_DEREF as f64]))
                 }
                 Err(e) => return Err(e.into()),
@@ -1635,7 +1665,7 @@ fn run_rust_op(b: &mut Brep, op: &OpIn) -> Result<Output, Fail> {
                 type_code: vu1::TYPE,
                 key: ObjectKey(1),
             };
-            let mut records = std::collections::BTreeMap::new();
+            let mut records = solidcore::topology::topology::NotifyRecords::new();
             records.insert(this.key, Topology::new());
             let mut attrs = AttributeStore::default();
             vu1::notify(
@@ -1655,7 +1685,7 @@ fn run_rust_op(b: &mut Brep, op: &OpIn) -> Result<Output, Fail> {
         OpIn::UvPoint { vu, ok_to_make } => {
             match vu1::compute_uv_point(&k, b, vid(*vu), *ok_to_make) {
                 Ok(p) => vec![0.0, p.x, p.y],
-                Err(SolidError::InvalidInput { .. }) => vec![NULL_DEREF as f64],
+                Err(SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }) => vec![NULL_DEREF as f64],
                 Err(e) => vec![
                     status_of(&e)?,
                     solidcore::math::UNDEF_DOUBLE,
@@ -1701,7 +1731,7 @@ fn run_rust_op(b: &mut Brep, op: &OpIn) -> Result<Output, Fail> {
                     );
                     out
                 }
-                Err(SolidError::InvalidInput { .. }) => vec![NULL_DEREF as f64],
+                Err(SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }) => vec![NULL_DEREF as f64],
                 Err(e) => return Err(e.into()),
             }
         }
@@ -1717,7 +1747,7 @@ fn run_rust_op(b: &mut Brep, op: &OpIn) -> Result<Output, Fail> {
                     if *want_u { i64::from(m.u) } else { -1 },
                     if *want_v { i64::from(m.v) } else { -1 },
                 ],
-                Err(SolidError::InvalidInput { .. }) => vec![NULL_DEREF],
+                Err(SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }) => vec![NULL_DEREF],
                 Err(e) => return Err(e.into()),
             };
             return Ok(Output::new().ints("q", q));
@@ -1728,7 +1758,7 @@ fn run_rust_op(b: &mut Brep, op: &OpIn) -> Result<Output, Fail> {
                 gap_states(b, &mut out);
                 out
             }
-            Err(SolidError::InvalidInput { .. }) => vec![NULL_DEREF as f64],
+            Err(SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }) => vec![NULL_DEREF as f64],
             Err(e) => return Err(e.into()),
         },
     };

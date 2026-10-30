@@ -8,6 +8,8 @@
 //! | [`SolidError`]              | non-`SM_SUCCESS` `SmStatus` values               |
 //! | [`SolidError::InvalidInput`]| `SM_ERR_INVALID_INPUT`                           |
 //! | [`SolidError::Upstream`]    | any other `SM_ERR_*` code, carried numerically   |
+//! | [`SolidError::PortInvariant`] | none: a port-side invariant or adapter failure  |
+//! | [`SolidError::sm_status`]   | the `SmStatus` an error stands for, when exact    |
 //! | [`SM_ERR`], [`SM_ERR_WARNING`], [`SolidError::sm_err`] | `SM_ERR`, `SM_ERR_WARNING`, `SE(SM_ERR)` |
 //! | [`SM_ERR_NULL_POINTER`], [`SolidError::null_pointer`] | `SM_ERR_NULL_POINTER`, `NER(...)` on `NULL` |
 //! | [`SolidError::Nlib`], [`SolidError::nlib`] | NLib error flag + `NL_ERROR.eno` (`N_ErrSet`) |
@@ -168,6 +170,21 @@ pub enum SolidError {
         code: NlibCode,
     },
 
+    /// A port-side invariant or adapter failure with no upstream `SmStatus`: an owner,
+    /// handle or identity the port could not resolve where upstream follows a pointer
+    /// (e.g. a B-rep cache owner that is not in the source B-rep under the caller's
+    /// identities). It signals a caller error or a solidcore defect, never a status an
+    /// upstream caller handles, so [`SolidError::sm_status`] is `None`. Code that
+    /// treated these as [`SolidError::InvalidInput`] before the variant existed matches
+    /// both, so results and difftest statuses are unchanged.
+    #[error("{operation}: port invariant: {reason}")]
+    PortInvariant {
+        /// Operation whose invariant failed.
+        operation: &'static str,
+        /// What did not hold.
+        reason: &'static str,
+    },
+
     /// An operation-local read-only solve needs its mutable caller to prepare geometry.
     /// This control signal is not an unported dependency or a native status.
     #[error("{operation}: geometry preparation required")]
@@ -268,6 +285,18 @@ pub const SM_ERR_WARNING: i32 = 1023;
 /// ignore (its usual mapping is [`SolidError::InvalidInput`]).
 pub const SM_ERR_INVALID_INPUT: i32 = 1007;
 
+/// Upstream `SmStatus` value `SM_ERR_OUT_OF_MEMORY` (`SmMessages.h`), as carried by
+/// [`SolidError::Upstream`] where an `SM_API` wrapper returns it for an output array
+/// that cannot grow.
+pub const SM_ERR_OUT_OF_MEMORY: i32 = 1002;
+
+/// SMLib fork status `SM_ERR_OFFSET_WALLS_TOUCH` (tangency-labs/smlib a759622,
+/// `SmMessages.h`; not in the pinned upstream), as carried by [`SolidError::Upstream`]:
+/// an offset (a shell, a solid offset) whose walls would meet, because loops of an offset
+/// face touch without crossing. Returned only with the opt-in
+/// `Kernel::fixes.offset_walls_touch_refused`.
+pub const SM_ERR_OFFSET_WALLS_TOUCH: i32 = 1042;
+
 fn fmt_entity(entity: Option<EntityRef>) -> String {
     entity.map_or_else(String::new, |e| format!(" at {e}"))
 }
@@ -312,6 +341,42 @@ impl SolidError {
         Self::InvalidInput { operation, reason }
     }
 
+    /// [`SolidError::PortInvariant`]: a port-side invariant or adapter failure with no
+    /// upstream status.
+    #[must_use]
+    pub const fn port_invariant(operation: &'static str, reason: &'static str) -> Self {
+        Self::PortInvariant { operation, reason }
+    }
+
+    /// The upstream `SmStatus` this error stands for, when it stands for one exactly:
+    ///
+    /// - [`SolidError::Upstream`]: its `code`.
+    /// - [`SolidError::Nlib`]: [`SM_ERR`]. The `Sm*` callers of an NLib routine
+    ///   surface its failure as `SER(SM_ERR)` (`if (NL_YES == N_...) SER(SM_ERR)`;
+    ///   `nl_ser`), never as the `NL_*_ERR` number.
+    /// - Every other variant: `None`. [`SolidError::InvalidInput`],
+    ///   [`SolidError::NotFound`], [`SolidError::Degenerate`],
+    ///   [`SolidError::NotConverged`] and [`SolidError::Unsupported`] are used both for
+    ///   mapped upstream statuses and for port-side checks, so they are not exact; a
+    ///   port that must surface a status exactly returns [`SolidError::Upstream`] with
+    ///   it. [`SolidError::PortInvariant`], [`SolidError::Unported`] and
+    ///   [`SolidError::PreparationRequired`] never stand for one.
+    #[must_use]
+    pub const fn sm_status(&self) -> Option<i32> {
+        match self {
+            Self::Upstream { code, .. } => Some(*code),
+            Self::Nlib { .. } => Some(SM_ERR),
+            Self::InvalidInput { .. }
+            | Self::NotFound { .. }
+            | Self::Degenerate { .. }
+            | Self::NotConverged { .. }
+            | Self::Unsupported { .. }
+            | Self::PortInvariant { .. }
+            | Self::PreparationRequired { .. }
+            | Self::Unported { .. } => None,
+        }
+    }
+
     /// [`SolidError::Unported`]: a call into `upstream` (a C++ symbol) of `unit`,
     /// which is not ported yet. Every site carries `// UNPORTED(<unit>): <symbol>`.
     #[must_use]
@@ -342,6 +407,7 @@ impl SolidError {
             | Self::Degenerate { operation, .. }
             | Self::NotConverged { operation, .. }
             | Self::Unsupported { operation, .. }
+            | Self::PortInvariant { operation, .. }
             | Self::Upstream { operation, .. }
             | Self::Nlib { operation, .. }
             | Self::PreparationRequired { operation } => operation,
@@ -358,6 +424,7 @@ impl SolidError {
             Self::InvalidInput { .. }
             | Self::NotConverged { .. }
             | Self::Unsupported { .. }
+            | Self::PortInvariant { .. }
             | Self::Nlib { .. }
             | Self::Unported { .. }
             | Self::PreparationRequired { .. } => None,
@@ -379,6 +446,87 @@ mod tests {
             Err(request.clone())
         );
         assert_eq!(SolidError::nl_ser("native")(request.clone()), request);
+    }
+
+    #[test]
+    fn sm_status_is_some_only_for_exact_upstream_statuses() {
+        let f = FaceId::from_index(1);
+        let cases = [
+            (SolidError::sm_err("op"), Some(SM_ERR)),
+            (SolidError::null_pointer("op"), Some(SM_ERR_NULL_POINTER)),
+            (
+                SolidError::Upstream {
+                    operation: "op",
+                    code: SM_ERR_INVALID_INPUT,
+                    entity: Some(EntityRef::Face(f)),
+                },
+                Some(1007),
+            ),
+            (
+                SolidError::Upstream {
+                    operation: "op",
+                    code: SM_ERR_WARNING,
+                    entity: None,
+                },
+                Some(1023),
+            ),
+            (SolidError::nlib("op", NlibCode::Knot), Some(SM_ERR)),
+            (SolidError::nlib("op", NlibCode::Convergence), Some(SM_ERR)),
+            (SolidError::invalid_input("op", "bad"), None),
+            (
+                SolidError::NotFound {
+                    operation: "op",
+                    entity: EntityRef::Face(f),
+                },
+                None,
+            ),
+            (
+                SolidError::Degenerate {
+                    operation: "op",
+                    entity: None,
+                },
+                None,
+            ),
+            (
+                SolidError::NotConverged {
+                    operation: "op",
+                    iterations: 3,
+                },
+                None,
+            ),
+            (
+                SolidError::Unsupported {
+                    operation: "op",
+                    reason: "r",
+                },
+                None,
+            ),
+            (SolidError::port_invariant("op", "owner"), None),
+            (SolidError::PreparationRequired { operation: "op" }, None),
+            (SolidError::unported("SmX::Y", "geom.x"), None),
+        ];
+        for (e, status) in cases {
+            assert_eq!(e.sm_status(), status, "{e:?}");
+        }
+    }
+
+    #[test]
+    fn port_invariant_display_and_accessors() {
+        let e =
+            SolidError::port_invariant("topology::brep_cache", "edge owner is not in source B-rep");
+        assert_eq!(
+            e.to_string(),
+            "topology::brep_cache: port invariant: edge owner is not in source B-rep"
+        );
+        assert_eq!(e.operation(), "topology::brep_cache");
+        assert_eq!(e.entity(), None);
+        assert!(!e.is_unported());
+        // an ignored upstream status swallows it as it did the `InvalidInput` it was
+        assert_eq!(ignored::<()>(Err(e.clone())), Ok(None));
+        assert_eq!(
+            SolidError::nl_ser("native")(e),
+            SolidError::sm_err("native")
+        );
     }
 
     #[test]

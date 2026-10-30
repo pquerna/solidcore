@@ -71,10 +71,17 @@
 //!   lazy `GetNaturalUVDomain` would;
 //!   [`SurfOfExtrusion::gen_dir_param_extent`] reads the NURB as it is (an empty
 //!   interval without one). `Reparameterize` and a non-identity `Transform` make it.
-//!   Inherited `Surface` evaluation and iso-curve queries use a temporary, bounded
-//!   copy via `base_with_nurb`; they do not change the stored copy state. A lazy
+//!   Inherited `Surface` evaluation and iso-curve queries go through
+//!   `base_with_nurb`, which makes a missing NURB once on a bounded exact copy and
+//!   keeps it in the surface's NURB slot, as upstream keeps it on the object (later
+//!   readers, copies and `operator==` see it). Upstream's in-place `MakeNurb` also
+//!   adjusts the generator's STEP interval to the analytic U interval and makes a lazy
+//!   line generator's NURB; that generator state stays on the copy and is not kept.
+//!   `Clone` copies the NURB the surface has (knots fixed up, as the copy
+//!   constructor), but cannot make a missing one first as upstream's copy constructor
+//!   does (`MakeNurb` needs the [`Kernel`]). A lazy
 //!   B-spline generator (as returned by the extrusion recogniser) uses the analytic
-//!   domain, swapped when needed, for `Surface::natural_uv_domain`; other lazy
+//!   domain, swapped when needed, for `Surface::natural_uv_domain_if_built`; other lazy
 //!   generator kinds still require an explicit `MakeNurb` for that domain query.
 //! - **Out-of-bounds evaluation.** `SmTemporaryChangeValue` gives the generator the
 //!   surface's out-of-bounds flag for the evaluation / drop; only a B-spline generator
@@ -346,6 +353,21 @@ impl SurfOfExtrusion {
             curve_point: self.curve_point,
             curve_vec: self.curve_vec,
         })
+    }
+
+    /// [`SurfOfExtrusion::clone_for_evaluation`] for a copy that stands for this surface
+    /// object (upstream's pointer to it): it shares this surface's NURB cell, so a NURB a
+    /// read-only query makes through the copy is kept on this surface too.
+    pub(crate) fn clone_for_evaluation_shared(&self, depth: usize) -> Result<Self> {
+        let mut copy = self.clone_for_evaluation(depth)?;
+        copy.base = self.base.clone_exact_shared();
+        Ok(copy)
+    }
+
+    /// Detaches a NURB cell shared with evaluation copies
+    /// ([`SurfOfExtrusion::clone_for_evaluation_shared`]).
+    pub(crate) fn detach_nurb(&mut self) {
+        self.base.detach_nurb();
     }
 
     /// `SmSurfOfExtrusion_TYPE` (`SURF_BASE_TYPE + 30`).
@@ -727,15 +749,20 @@ impl SurfOfExtrusion {
         &mut self.base
     }
 
-    /// The inherited NURB for a query, made on a bounded temporary copy when missing.
-    /// An existing (possibly reparameterised) NURB is borrowed unchanged.
+    /// The inherited NURB for a query (`GetOrCreateGwNurbPointer` from a `const`
+    /// method): an existing (possibly reparameterised) NURB is borrowed unchanged; a
+    /// missing one is made by [`SurfOfExtrusion::make_nurb`] on a bounded exact copy
+    /// and kept on this surface, as upstream keeps it on the object (the copy's
+    /// generator adjustments are not kept; see the module docs, **Lazy NURB**).
     pub(crate) fn base_with_nurb(&self, k: &Kernel) -> Result<Cow<'_, BSplineSurface>> {
-        if self.base.gw_nurb().is_some() {
-            return Ok(Cow::Borrowed(&self.base));
+        if self.base.gw_nurb().is_none() {
+            let mut copy = self.clone_for_evaluation(0)?;
+            copy.make_nurb(k)?;
+            if let Some(made) = copy.base.nurb.take() {
+                self.base.nurb.fill(made);
+            }
         }
-        let mut copy = self.clone_for_evaluation(0)?;
-        copy.make_nurb(k)?;
-        Ok(Cow::Owned(copy.base))
+        Ok(Cow::Borrowed(&self.base))
     }
 
     /// The inherited NURB as `GetOrCreateGwNurbPointer` leaves it for a query whose
@@ -2304,12 +2331,15 @@ mod tests {
         )
         .unwrap();
         assert!(lazy.base().gw_nurb().is_none());
-        let mut surf = Surface::from(lazy);
+        let surf = Surface::from(lazy);
+        // a lazy exact copy: makes its own NURB afresh
         let fresh = |surf: &Surface| {
             let SurfaceKind::SurfOfExtrusion(e) = surf.kind() else {
                 panic!("an extrusion");
             };
-            Surface::from(e.clone_exact())
+            let mut c = e.clone_exact();
+            c.base.nurb.take();
+            Surface::from(c)
         };
         let eval = |surf: &Surface, uv: Point2| -> Vec<u64> {
             let mut out = Vec::new();
@@ -2338,22 +2368,18 @@ mod tests {
                 );
             }
         }
-        assert!(surf.has_made_nurb(), "the made NURB is kept");
-        // mutate, then evaluate: the kept NURB must not survive the edit
-        let SurfaceKind::SurfOfExtrusion(e) = surf.kind_mut() else {
+        // the made NURB is kept on the extrusion itself (no side memo), as upstream
+        // keeps it on the object
+        assert!(!surf.has_made_nurb());
+        let SurfaceKind::SurfOfExtrusion(e) = surf.kind() else {
             panic!("an extrusion");
         };
-        e.extrusion_vec = Vec3::new(0.0, 0.5, 3.0);
-        assert!(!surf.has_made_nurb(), "an edit empties the kept NURB");
-        for &uv in &uvs {
-            assert_eq!(
-                eval(&surf, uv),
-                eval(&fresh(&surf), uv),
-                "after the edit at {uv:?}"
-            );
-        }
-        // a copy starts without one
-        assert!(!surf.clone().has_made_nurb());
+        assert!(e.base().gw_nurb().is_some(), "the made NURB is kept");
+        // a copy carries it (the copy constructor copies the source's NURB)
+        let SurfaceKind::SurfOfExtrusion(c) = surf.clone().into_kind() else {
+            panic!("an extrusion");
+        };
+        assert!(c.base().gw_nurb().is_some());
     }
 
     /// A planar quadratic B-spline in the z = 0 plane.
@@ -2633,16 +2659,16 @@ mod tests {
         )
         .unwrap();
         assert!(lazy.base().gw_nurb().is_none());
-        let made = lazy.base_with_nurb(&k).unwrap().into_owned();
+        let made = lazy.clone_exact().base_with_nurb(&k).unwrap().into_owned();
         let surf = Surface::from(lazy.clone_exact());
         for param in [SurfParamType::U, SurfParamType::V] {
             let want = made.knots(param, None).unwrap();
+            if param == SurfParamType::U {
+                assert!(surf.knots(param, None).is_err(), "the stored base has none");
+            }
             assert_eq!(surf.knots_with_nurb(&k, param, None).unwrap(), want);
-            assert_ne!(
-                surf.knots(param, None).ok(),
-                Some(want),
-                "the stored base has none"
-            );
+            // the made NURB is kept: the stored base now answers it too
+            assert_eq!(surf.knots(param, None).ok(), Some(want));
         }
         // a STEP surface's knots: its domain ends, each `degree + 1` times
         let step = Surface::from(StepSurface::new(Surface::from(lazy), true).unwrap());
@@ -2650,6 +2676,56 @@ mod tests {
         let degree = made.degree(SurfParamType::U);
         assert!(degree > 0);
         assert!(mults.iter().all(|&m| m == degree + 1), "{mults:?}");
+    }
+
+    /// The virtual `GetKnots` of `SurfaceMaxDistanceBetween` (through `SurfaceEvaluate`),
+    /// `SnapToKnots` and `GetDomainWithContinuity` make a lazy extrusion's NURB first
+    /// instead of failing on the NURB-less base.
+    #[test]
+    fn lazy_extrusion_knot_callers_make_the_nurb() {
+        use crate::geom::geom_utility::p2::ContinuityType;
+        use crate::math::Vec2;
+        use crate::surface::surface::p2::SurfaceEvaluate;
+        use crate::surface::surface::Surface;
+        let k = k();
+        let lazy = SurfOfExtrusion::new(
+            &k,
+            arc_gen(),
+            Point3::ZERO,
+            Vec3::new(0.0, 0.0, 2.0),
+            Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
+            false,
+        )
+        .unwrap();
+        assert!(lazy.base().gw_nurb().is_none());
+        let made = lazy.clone_exact().base_with_nurb(&k).unwrap().into_owned();
+        let surf = Surface::from(lazy.clone_exact());
+        assert!(
+            surf.knots(SurfParamType::U, None).is_err(),
+            "the stored base has none"
+        );
+        for param in [SurfParamType::U, SurfParamType::V] {
+            let want = made.knots(param, None).unwrap();
+            assert_eq!(
+                SurfaceEvaluate::knots(&surf, &k, param, None).unwrap(),
+                want
+            );
+        }
+        let (u_knots, _) = made.knots(SurfParamType::U, None).unwrap();
+        let first = u_knots[0];
+        let snapped = surf
+            .snap_to_knots(&k, Point2::new(first + 1e-12, 0.5), 1e-9)
+            .unwrap();
+        assert_eq!(snapped.x, first);
+        let dom = surf
+            .domain_with_continuity(
+                &k,
+                ContinuityType::G1,
+                Point2::new(0.5, 0.5),
+                Vec2::new(1.0, 0.0),
+            )
+            .unwrap();
+        assert!(dom.min().x <= 0.5 && dom.max().x >= 0.5, "{dom:?}");
     }
 
     #[test]

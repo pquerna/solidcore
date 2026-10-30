@@ -8,7 +8,8 @@
 //! | [`ProjectedCurve`]                           | `SmProjectedCurve`                               |
 //! | [`OwnsCurve`]                                | `m_bOwnsCurve` (`SmBoolean`: `FALSE`, `TRUE`, `UNSURE`) |
 //! | [`ProjectedCurve::new`]                      | `SmProjectedCurve(const SmCurve*, ...)`          |
-//! | `Clone`, [`ProjectedCurve::copy`]            | copy constructor, `Copy`                         |
+//! | `Clone`                                      | the copy constructor                             |
+//! | [`ProjectedCurve::copy`]                     | `Copy`                                           |
 //! | `Drop` (implicit)                            | `~SmProjectedCurve`                              |
 //! | [`ProjectedCurve::approx_eq`]                | `operator==`                                     |
 //! | [`ProjectedCurve::set_canonical`]            | `SetCanonical`                                   |
@@ -39,11 +40,14 @@
 //!   ownership flag is kept as [`OwnsCurve`] because upstream's edits test it
 //!   (`EditParameterization`, `ReverseParameterization` and `Trim` refuse a
 //!   `FALSE` owner, `Transform` anything below `UNSURE`). The copy constructor
-//!   copies the base curve when it is owned (`Copy`) and shares the pointer
-//!   otherwise; here both are a copy, with the same values. When the owned base
+//!   (`Clone`) copies an owned base curve (`Copy`, whose B-spline copy fixes its
+//!   knots up) and a borrowed one exactly (no knot fix-up, owner kept), the values
+//!   upstream has when it shares the pointer; [`ProjectedCurve::copy`] (`Copy`) does
+//!   the same. When the owned base
 //!   curve has no `Copy` (a Hermite curve, `SM_ERR`) upstream ignores the status
 //!   and returns a projected curve with a null base curve, which crashes on first
-//!   use; [`ProjectedCurve::copy`] returns that `SM_ERR` instead.
+//!   use; [`ProjectedCurve::copy`] returns that `SM_ERR` instead, and `Clone` (which
+//!   cannot fail) copies such a base anyway.
 //! - **Curve base.** The class derives from `SmCurve`; its base state is the
 //!   dimension, always 3 (`SmCurve(3)`). `SmCurve::operator==` (same type, same
 //!   dimension) is implied by the Rust type. `SetContext`, the context arguments
@@ -65,21 +69,18 @@
 //!   [`SolidError::InvalidInput`] (upstream reads an uninitialised local).
 //! - `GetRootCurve`, `DrawPolygon`, `GetMemoryUsed`, `WriteToDB`, `AssertValid`
 //!   and `Dump` are not part of this unit.
-//! - Upstream behaviours kept as they are (see `plan/findings.md`):
-//!   `MakeOrthoNormal` unitizes the projection vector only when it is *zero*
-//!   (giving `(0, 0, 1)`) and fails for every non-zero vector, leaving it as
-//!   given; for rotations it discards the result of `NormalInPlane`. `Transform`
+//! - Upstream behaviours kept as they are (see `plan/findings.md`): `Transform`
 //!   fails unless the ownership flag is `UNSURE`. `ReadFromDB` does not call
 //!   `MakeOrthoNormal`.
 
 use crate::curve::curve::p2::{self as curve_base, Curve, PROJECTED_CURVE_TYPE};
-use crate::error::{Result, SolidError};
+use crate::error::{Result, SolidError, SM_ERR_INVALID_INPUT};
 use crate::geom::axis2_placement::Axis2Placement;
 use crate::geom::extent1d::Extent1d;
 use crate::geom::geom_utility::p2::ContinuityType;
 use crate::geom::vector3d::{Point3, Vec3};
 use crate::kernel::Kernel;
-use crate::math::EFF_ZERO;
+use crate::math::{EFF_ZERO, EFF_ZERO_SQ};
 use crate::nurbs::b_spline_curve::ProjectionType;
 use crate::nurbs::b_spline_curve_n_lib::TrimMode;
 use crate::surface::surface::p2::{check_geometry_nesting, NestedGeometry};
@@ -102,7 +103,7 @@ pub enum OwnsCurve {
 }
 
 /// A curve projected onto a plane (`SmProjectedCurve`).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ProjectedCurve {
     /// `m_cpCurve`: the curve being projected.
     curve: Box<Curve>,
@@ -119,6 +120,38 @@ pub struct ProjectedCurve {
     proj_type: ProjectionType,
     /// `m_bOwnsCurve`.
     owns_curve: OwnsCurve,
+}
+
+/// The copy constructor: an owned base curve is copied ([`Curve::clone`], whose
+/// B-spline copy fixes its knots up), a borrowed one exactly (the bounded exact copy:
+/// no knot fix-up, owner kept), which is what sharing the borrowed pointer upstream
+/// amounts to. Every other member is copied verbatim, and the enclosing
+/// [`Curve::clone`] still resets *its* owner and identity.
+///
+/// The exact branch recurses over the copied base without a depth argument; that is
+/// sound because every path that stores a base curve keeps the graph within
+/// [`MAX_GEOMETRY_NESTING`](crate::surface::surface::p2::MAX_GEOMETRY_NESTING):
+/// [`ProjectedCurve::new`] and [`ProjectedCurve::set_canonical`] check it,
+/// [`ProjectedCurve::read_from_db`] reads its base through [`Curve::read_from_db`]
+/// (bounded by [the database reader's nesting
+/// limit](crate::topology::database_io::MAX_READ_NESTING)), and propagates from
+/// bounded instances.
+impl Clone for ProjectedCurve {
+    fn clone(&self) -> Self {
+        let curve = if self.owns_curve == OwnsCurve::No {
+            self.curve.clone_exact_bounded()
+        } else {
+            (*self.curve).clone()
+        };
+        Self {
+            curve: Box::new(curve),
+            proj_point: self.proj_point,
+            proj_vec: self.proj_vec,
+            aux_data: self.aux_data,
+            proj_type: self.proj_type,
+            owns_curve: self.owns_curve,
+        }
+    }
 }
 
 impl ProjectedCurve {
@@ -287,10 +320,13 @@ impl ProjectedCurve {
     /// # Errors
     ///
     /// When the base curve is owned, those of its [`Curve::copy`] (`SM_ERR` for a
-    /// Hermite curve; upstream ignores it, see the module notes).
+    /// Hermite curve; upstream ignores it, see the module notes); when it is borrowed,
+    /// those of [`Curve::clone_for_evaluation`] (geometry nested too deeply).
     pub fn copy(&self, k: &Kernel) -> Result<Self> {
         let curve = if self.owns_curve == OwnsCurve::No {
-            self.curve.as_ref().clone()
+            // upstream shares the borrowed base curve: an exact copy that keeps its
+            // owner (`Curve::clone` would fix its knots up)
+            self.curve.clone_for_evaluation()?
         } else {
             // copy the Curve
             self.curve.copy(k)?
@@ -337,19 +373,20 @@ impl ProjectedCurve {
         self.make_ortho_normal()
     }
 
-    /// `MakeOrthoNormal`, as upstream: the projection vector is unitized only
-    /// when it is initialised and zero (becoming `(0, 0, 1)`); for rotations the
-    /// auxiliary vector likewise.
+    /// Unitizes the projection vector and, for rotations, replaces the auxiliary
+    /// vector by its unit component normal to the projection vector
+    /// (`MakeOrthoNormal`).
     ///
     /// # Errors
     ///
     /// `SM_ERR` when the projection vector (or, for rotations, the auxiliary
-    /// vector) is uninitialised or non-zero.
+    /// vector) is uninitialised or zero; `SM_ERR_INVALID_INPUT` when the auxiliary
+    /// vector is parallel to the projection vector (it becomes `(0, 0, 1)`).
     pub fn make_ortho_normal(&mut self) -> Result<()> {
         // when ProjVec is nonZero - unitize it
         let proj_init = self.proj_vec.is_initialized();
         let proj_zero = self.proj_vec.is_zero(EFF_ZERO);
-        if proj_init && proj_zero {
+        if proj_init && !proj_zero {
             self.proj_vec = self.proj_vec.unitize_or_z();
         } else {
             return Err(SolidError::sm_err(OP));
@@ -360,10 +397,18 @@ impl ProjectedCurve {
             // when xAuxData is nonZero - make orthonormal to ProjVec
             let aux_init = self.aux_data.is_initialized();
             let aux_zero = self.aux_data.is_zero(EFF_ZERO);
-            if aux_init && aux_zero {
-                // upstream discards the NormalInPlane result
-                let _ = self.proj_vec.normal_in_plane(self.aux_data);
+            if aux_init && !aux_zero {
+                self.aux_data = self.proj_vec.normal_in_plane(self.aux_data);
+                // SER(Unitize()): a zero vector becomes (0, 0, 1) and fails
+                let zero = self.aux_data.length_squared() < EFF_ZERO_SQ;
                 self.aux_data = self.aux_data.unitize_or_z();
+                if zero {
+                    return Err(SolidError::Upstream {
+                        operation: OP,
+                        code: SM_ERR_INVALID_INPUT,
+                        entity: None,
+                    });
+                }
             } else {
                 return Err(SolidError::sm_err(OP));
             }
@@ -801,6 +846,7 @@ mod tests {
             Err(SolidError::InvalidInput { .. })
         ));
         assert_eq!(format!("{projected:?}"), before);
+        // a zero projection vector fails, the fields are set anyway
         assert!(projected
             .set_canonical(
                 base(),
@@ -810,11 +856,22 @@ mod tests {
                 ProjectionType::Parallel,
                 OwnsCurve::Yes,
             )
+            .is_err());
+        assert_eq!(projected.proj_type(), ProjectionType::Parallel);
+        assert!(projected
+            .set_canonical(
+                base(),
+                Vec3::ZERO,
+                Vec3::Z,
+                Vec3::ZERO,
+                ProjectionType::Parallel,
+                OwnsCurve::Yes,
+            )
             .is_ok());
     }
 
     #[test]
-    fn nonzero_proj_vec_is_kept_and_rejected() {
+    fn nonzero_proj_vec_is_unitized() {
         let mut c = ProjectedCurve::new(
             base(),
             Some(Vec3::new(0.0, 0.0, 0.0)),
@@ -824,12 +881,38 @@ mod tests {
             OwnsCurve::No,
         )
         .unwrap();
-        assert_eq!(c.proj_vec(), Vec3::new(0.0, 0.0, 2.0));
-        assert!(c.make_ortho_normal().is_err());
+        assert_eq!(c.proj_vec(), Vec3::Z);
+        assert!(c.make_ortho_normal().is_ok());
     }
 
     #[test]
-    fn zero_proj_vec_becomes_z() {
+    fn rotation_aux_is_made_orthonormal() {
+        let mut c = ProjectedCurve::new(
+            base(),
+            Some(Vec3::new(0.0, 0.0, 0.0)),
+            Some(Vec3::new(0.0, 0.0, 2.0)),
+            Some(Vec3::new(3.0, 0.0, 5.0)),
+            ProjectionType::Rotation,
+            OwnsCurve::No,
+        )
+        .unwrap();
+        assert_eq!(c.proj_vec(), Vec3::Z);
+        assert!((c.aux_data() - Vec3::X).length() < 1e-15);
+        assert!(c.make_ortho_normal().is_ok());
+        // an auxiliary vector along the projection vector has no normal part
+        c.aux_data = Vec3::new(0.0, 0.0, 4.0);
+        assert!(matches!(
+            c.make_ortho_normal(),
+            Err(SolidError::Upstream {
+                code: SM_ERR_INVALID_INPUT,
+                ..
+            })
+        ));
+        assert_eq!(c.aux_data(), Vec3::Z);
+    }
+
+    #[test]
+    fn zero_proj_vec_is_rejected() {
         let mut c = ProjectedCurve::new(
             base(),
             Some(Vec3::new(0.0, 0.0, 0.0)),
@@ -839,9 +922,8 @@ mod tests {
             OwnsCurve::No,
         )
         .unwrap();
-        assert_eq!(c.proj_vec(), Vec3::Z);
-        assert_eq!(c.aux_data(), Vec3::Z);
-        // (0, 0, 1) is not zero: a second call fails, as upstream
+        assert_eq!(c.proj_vec(), Vec3::ZERO);
+        assert_eq!(c.aux_data(), Vec3::ZERO);
         assert!(c.make_ortho_normal().is_err());
     }
 

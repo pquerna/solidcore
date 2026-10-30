@@ -226,6 +226,25 @@ struct BrepCase {
     brep: Brep,
 }
 
+/// The Rust side's case: the source read by the Rust reader or built by the Rust kernel
+/// in the shim's traversal order ([`crate::own_reader::edgeuse_graph_brep`]), never
+/// imported from the C++ export; `Err(output)` when the Rust build fails, as
+/// [`brep_case`] reports the shim's failed build.
+fn own_case(brep: &BrepIn) -> Result<Result<BrepCase, Output>, HarnessError> {
+    let path = path_of(Some(brep))?;
+    let block = brep_block_of(Some(brep), false, false)?;
+    let brep = match crate::own_reader::edgeuse_graph_brep(&mut Kernel::default(), brep)? {
+        Ok(b) => b,
+        Err(e) => return Ok(Err(crate::own_builder::failed_output(&e))),
+    };
+    Ok(Ok(BrepCase {
+        path,
+        block,
+        counts: crate::own_builder::counts(&brep),
+        brep,
+    }))
+}
+
 /// Builds the case's B-rep on both sides; `Err(output)` when it cannot be built.
 fn brep_case(brep: &BrepIn) -> Result<Result<BrepCase, Output>, HarnessError> {
     let path = path_of(Some(brep))?;
@@ -445,7 +464,7 @@ fn cpp(i: &Inputs) -> Result<Output, HarnessError> {
 
 fn status(e: &SolidError) -> f64 {
     match e {
-        SolidError::InvalidInput { .. } => 1007.0,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.0,
         SolidError::Upstream { code, .. } => f64::from(*code),
         _ => -1.0,
     }
@@ -536,7 +555,8 @@ impl FilletSolverOps for TestSolver {
             let dom = slot_mut(&mut self.base, other)?
                 .surface
                 .base_surface()
-                .natural_uv_domain();
+                // (runner helper without a kernel in scope)
+                .natural_uv_domain_if_built();
             let idx2 = guess_t.len();
             set_ext(
                 intervals,
@@ -717,7 +737,8 @@ fn put_crv(k: &Kernel, o: &mut Vec<f64>, c: Option<&Curve>) {
 /// `put_srf` of the shim: `1 u0 v0 u1 v1` and the 3 x 3 grid of points.
 fn put_srf(k: &Kernel, o: &mut Vec<f64>, s: &Surface) {
     o.push(1.0);
-    let d = s.natural_uv_domain();
+    // (runner helper that does not return Result)
+    let d = s.natural_uv_domain_if_built();
     o.extend([d.min().x, d.min().y, d.max().x, d.max().y]);
     for a in [0.0, 0.5, 1.0] {
         for bb in [0.0, 0.5, 1.0] {
@@ -740,7 +761,7 @@ fn put_stored(
 ) -> Result<(), SolidError> {
     let geom = fb.geom(g)?;
     let surface = geom
-        .fillet_surface()?
+        .fillet_surface(None)?
         .ok_or_else(|| SolidError::invalid_input("difftest", "no fillet surface"))?;
     put_srf(k, o, surface);
     let rails = [
@@ -1010,7 +1031,7 @@ fn rust_run(i: &Inputs, o: &mut Vec<f64>) -> Result<Result<(), SolidError>, Harn
             rail,
             ptype,
         } => {
-            let Ok(mut c) = brep_case(brep)? else {
+            let Ok(mut c) = own_case(brep)? else {
                 return Err(harness("B-rep failed on the Rust side only"));
             };
             o.push(0.0);
@@ -1119,7 +1140,7 @@ fn rust_run(i: &Inputs, o: &mut Vec<f64>) -> Result<Result<(), SolidError>, Harn
             let (target, n_eus) = if let Some(a) = analytic {
                 (analytic_brep(&k, a)?, WIRE_EDGEUSES)
             } else {
-                let Ok(c) = brep_case(brep)? else {
+                let Ok(c) = own_case(brep)? else {
                     return Err(harness("B-rep failed on the Rust side only"));
                 };
                 let n = n_eu(&c);
@@ -1188,7 +1209,7 @@ fn rust_run(i: &Inputs, o: &mut Vec<f64>) -> Result<Result<(), SolidError>, Harn
             }
         }
         Inputs::Record { cfg, brep, eu } => {
-            let Ok(c) = brep_case(brep)? else {
+            let Ok(c) = own_case(brep)? else {
                 return Err(harness("B-rep failed on the Rust side only"));
             };
             o.push(0.0);
@@ -1342,7 +1363,7 @@ fn rust(i: &Inputs) -> Result<Output, HarnessError> {
     check_sizes(i)?;
     // the C++ side reports a B-rep that cannot be built
     if let Some(brep) = i.brep() {
-        if let Err(out) = brep_case(brep)? {
+        if let Err(out) = own_case(brep)? {
             return Ok(out);
         }
     }

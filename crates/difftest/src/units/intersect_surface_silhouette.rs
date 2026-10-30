@@ -346,7 +346,7 @@ fn rust_curve(d: &CurveData) -> Result<BSplineCurve, HarnessError> {
 /// cannot return.
 fn status(e: &SolidError) -> f64 {
     match e {
-        SolidError::InvalidInput { .. } => 1007.0,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.0,
         SolidError::Upstream { code, .. } => f64::from(*code),
         _ => -1.0,
     }
@@ -427,7 +427,8 @@ fn build_cache(
     let handle = BoundaryCurve::default();
     let mut cache = SurfaceCache::new(
         surface.clone(),
-        surface.natural_uv_domain(),
+        // (runner helper without a kernel in scope)
+        surface.natural_uv_domain_if_built(),
         SurfaceCacheOptions::default(),
     );
     cache.set_surface_handle(Some(handle));

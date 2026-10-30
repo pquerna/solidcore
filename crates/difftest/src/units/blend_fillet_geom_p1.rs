@@ -34,7 +34,6 @@
 //! harness error; HANG-20 bounds the four global-solver ops at `MAX_SOLVER_MAGNITUDE`).
 //! Every run has at least [`MIN_GENERATED`] generated cases.
 
-use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1182,7 +1181,7 @@ fn uv(p: [f64; 2]) -> Point2 {
 /// The `SmStatus` of a Rust error; `-1` for one upstream cannot return.
 pub(crate) fn status(e: &SolidError) -> f64 {
     match e {
-        SolidError::InvalidInput { .. } => 1007.0,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.0,
         SolidError::Upstream { code, .. } => f64::from(*code),
         _ => -1.0,
     }
@@ -1364,8 +1363,8 @@ pub(crate) fn natural_face(
     b: &mut Brep,
     surface: Surface,
 ) -> Result<FaceId, HarnessError> {
-    let domain = surface.natural_uv_domain();
-    let mut records = BTreeMap::new();
+    let domain = surface.natural_uv_domain_with_nurb(k).map_err(|e| HarnessError::new(e.to_string()))?;
+    let mut records = solidcore::topology::topology::NotifyRecords::new();
     let mut attributes = AttributeStore::default();
     let key_of = super::topology_brep_p8::key_of;
     let mut env = NotifyEnv {
@@ -1922,7 +1921,7 @@ impl RustModel {
                 o.push(self.edge_index(Some(e)));
             }
             dump_bcurve(o, g.center_line_curve());
-            dump_surface(o, g.fillet_surface().map_err(h)?)?;
+            dump_surface(o, g.fillet_surface(None).map_err(h)?)?;
             o.push(g.ref_eus.len() as f64);
             for &eu in &g.ref_eus {
                 self.put_eu(o, Some(eu));
@@ -3323,6 +3322,7 @@ impl UnitDiff for Runner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     /// Mutates generated and fixture programs and feeds them to the FFI: every program
     /// the guards accept must run without crashing (a crash kills the test process) or

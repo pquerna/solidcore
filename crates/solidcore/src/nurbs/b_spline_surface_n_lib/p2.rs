@@ -594,6 +594,7 @@ fn interpolated_tangent_field_curve(
 ) -> Result<BSplineCurve> {
     let base_uv = as_sm_curve(uv_curve);
     let field = TangentField::new(
+        k,
         &base_uv,
         surface,
         TangentDirType::Interpolate,
@@ -1366,9 +1367,8 @@ impl BSplineSurface {
             let tol_min = EFF_ZERO_SQRT * (1.0 + vl.abs());
             let tol_max = EFF_ZERO_SQRT * (1.0 + vr.abs());
 
-            // upstream sets only idxMin in this direction (also for the upper boundary)
             let mut idx_min: Option<usize> = None;
-            let idx_max: Option<usize> = None;
+            let mut idx_max: Option<usize> = None;
 
             let knots: Vec<f64> = self
                 .knots(SurfParamType::V, None)
@@ -1390,6 +1390,7 @@ impl BSplineSurface {
                         let prev = at(&knots, i - 1, OP)?;
                         if vl < prev {
                             vl = prev;
+                            idx_min = Some(i - 1);
                         }
                     }
                 }
@@ -1401,14 +1402,14 @@ impl BSplineSurface {
                             req_vr = knot;
                         }
                         vr = knot;
-                        idx_min = Some(i);
+                        idx_max = Some(i);
                     } else {
                         vr = knot + 10.0 * tol_max;
-                        idx_min = Some(i);
+                        idx_max = Some(i);
                         let next = at(&knots, i + 1, OP)?;
                         if vr > next {
                             vr = next;
-                            idx_min = Some(i + 1);
+                            idx_max = Some(i + 1);
                         }
                     }
                 }
@@ -2116,7 +2117,7 @@ fn corner_blend_n(
         // boundary surface case
         if negate_tan_curves.is_none() {
             // classify the ends of the curve against the surface UVDomain
-            let curr_uv_domain = curr_srf.natural_uv_domain();
+            let curr_uv_domain = curr_srf.natural_uv_domain_with_nurb(k)?;
             let tol_uv = curr_uv_domain.size() / 1000.0;
             let tol = min2(tol_uv.x, tol_uv.y);
             let start_bndries = curr_uv_domain.point_boundaries(curr_start_uv, tol);
@@ -2188,7 +2189,13 @@ fn corner_blend_n(
 
     // pass the call along to create the NSidedPatch
     let mut ders: Vec<Option<BSplineCurve>> = tan_curves.into_iter().map(Some).collect();
-    BSplineSurface::create_n_sided_patch(&mut boundaries, &mut ders, tangency_tol_radians, None)
+    BSplineSurface::create_n_sided_patch_with(
+        &mut boundaries,
+        &mut ders,
+        tangency_tol_radians,
+        None,
+        k.fixes.corner_blend_stays_inside_neighbours,
+    )
 }
 
 #[cfg(test)]

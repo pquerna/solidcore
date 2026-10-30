@@ -16,12 +16,13 @@
 //! HCR entries own their actual scene; no scene copy is kept. Native dependency
 //! errors and partial geometry are preserved. No numerical algorithm or recursion
 //! is introduced. Destruction releases the Rust-owned registry/attribute state;
-//! the unported native B-rep destructor is not emulated.
+//! the unported native B-rep destructor is not emulated. `RemoveFaces`,
+//! `RemoveAllTopology` and the sweep stitch edit through the context the store has
+//! already lent to the edit (the trait defaults lend it again and fail).
 
 pub(crate) mod classification;
 mod merge;
 
-use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{atomic::AtomicU64, Arc};
 
@@ -45,6 +46,8 @@ use crate::topology::edge::NotifyEnv;
 use crate::topology::topology::Topology;
 use crate::topology::topology_traverser::{self as traverser, Entity, FaceTraversalMarks};
 use crate::topology::{Brep, BrepId, EdgeId, FaceId};
+#[cfg(test)]
+use std::collections::BTreeMap;
 
 const OP: &str = "sweep::topology_sweep::store";
 
@@ -222,7 +225,7 @@ pub struct SweepStore<'a> {
     kernels: Vec<KernelEntry<'a>>,
     bodies: BodySlots<'a>,
     identities: Identities<'a>,
-    records: Storage<'a, BTreeMap<ObjectKey, Topology>>,
+    records: Storage<'a, crate::topology::topology::NotifyRecords>,
     attributes: Storage<'a, AttributeStore>,
     geometry_sequence: Arc<AtomicU64>,
     cleanup_errors: Vec<SolidError>,
@@ -339,7 +342,7 @@ impl<'a> SweepStore<'a> {
     /// Keep `next_handle` across sessions; registrations never reuse a handle.
     pub fn new(
         identities: &'a dyn SweepIdentities,
-        records: &'a mut BTreeMap<ObjectKey, Topology>,
+        records: &'a mut crate::topology::topology::NotifyRecords,
         attributes: &'a mut AttributeStore,
         next_handle: &'a mut u32,
     ) -> Self {
@@ -772,7 +775,7 @@ fn body_keys(
     identities: Identities<'_>,
     id: BrepId,
     body: &Brep,
-    records: &BTreeMap<ObjectKey, Topology>,
+    records: &crate::topology::topology::NotifyRecords,
 ) -> Vec<ObjectKey> {
     let mut keys = if let Some(provider) = identities.0 {
         provider.owned_auxiliary_objects(id, body)
@@ -815,7 +818,7 @@ fn body_keys(
 }
 
 struct RecordMarks<'a> {
-    records: &'a mut BTreeMap<ObjectKey, Topology>,
+    records: &'a mut crate::topology::topology::NotifyRecords,
     namespace: u32,
     identities: Identities<'a>,
 }
@@ -844,12 +847,11 @@ impl FaceTraversalMarks for RecordMarks<'_> {
     }
     fn mark(&mut self, k: &Kernel, e: Entity, mark: MarkType) {
         self.records
-            .entry(
+            .or_default(
                 self.identities
                     .object(self.namespace, traversal_entity(e))
                     .key,
             )
-            .or_default()
             .mark(Some(&k.context), mark);
     }
 }
@@ -1181,10 +1183,7 @@ impl SweepAccess for SweepStore<'_> {
             .get(c.0 as usize)
             .ok_or_else(|| invalid("unknown context"))?
             .kernel;
-        self.records
-            .entry(key)
-            .or_default()
-            .mark(Some(&k.context), mark);
+        self.records.or_default(key).mark(Some(&k.context), mark);
         Ok(())
     }
     fn collect_faces(
@@ -1213,6 +1212,66 @@ impl SweepAccess for SweepStore<'_> {
             None,
             None,
         )
+    }
+    /// `SmBrep::RemoveFaces`, notifying the store's lent context. The default's
+    /// kernel-callback variant would lend that context a second time.
+    fn remove_faces(&mut self, brep: BrepId, faces: &[FaceId]) -> Result<()> {
+        self.with_brep_mut(brep, |kernel, brep, _, env| {
+            let editing = brep.editing_enabled();
+            crate::topology::brep::p5::remove_faces_notified(kernel, brep, editing, faces, env)
+        })
+    }
+    /// `SmBrep::RemoveAllTopology`, notifying the store's lent context (as
+    /// [`Self::remove_faces`]).
+    fn remove_all_topology(&mut self, brep: BrepId) -> Result<()> {
+        self.with_brep_mut(brep, |kernel, brep, _, env| {
+            crate::topology::brep::p10::remove_all_topology_notified(kernel, brep, env)
+        })
+    }
+    /// `SmStitch(SmSweepStitchCallback, tol, TRUE, TRUE).DoStitching()`, editing
+    /// through the store's lent context (as [`Self::remove_faces`]). Split curves
+    /// take the caller's identities.
+    fn stitch(
+        &mut self,
+        brep: BrepId,
+        sweep: &mut super::TopologySweep,
+        tolerance: f64,
+        making_manifold_solid: bool,
+    ) -> Result<()> {
+        let identities = self.identities;
+        let new_curve = |edge: EdgeId, type_code: i64| {
+            identities
+                .0
+                .ok_or_else(|| invalid("new split curve needs its caller identity"))?
+                .new_curve(brep, edge, type_code)
+        };
+        self.with_brep_mut(brep, |kernel, model, _, env| {
+            let curve_identity = if identities.actual_curve_identities() {
+                crate::topology::brep::p9::CurveIdentity::Actual(
+                    &crate::topology::brep::p9::issue_curve_identity,
+                )
+            } else {
+                crate::topology::brep::p9::CurveIdentity::Checked(&new_curve)
+            };
+            let mut edits = crate::heal::stitch::p1::BorrowedStitchEdits {
+                env,
+                curve_identity,
+            };
+            let mut callback = super::access::SweepStitchCallback { brep, sweep };
+            let mut stitch =
+                crate::heal::stitch::p1::Stitch::new(&mut callback, tolerance, true, true);
+            stitch.making_manifold_solid = making_manifold_solid;
+            stitch.edits = Some(&mut edits);
+            stitch
+                .do_stitching(
+                    kernel,
+                    model,
+                    None,
+                    None,
+                    crate::heal::stitch::p2::MinGapRequest::default(),
+                )
+                .map(|_| ())
+        })
     }
 }
 
@@ -1936,7 +1995,7 @@ mod borrowed_tests {
         let mut k = Kernel::default();
         let mut b = Brep::new();
         b.set_key(ObjectKey(991));
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = AttributeStore::new();
         let mut next = 15;
         let mut store = SweepStore::new(&Identities, &mut records, &mut attributes, &mut next);
@@ -1948,7 +2007,7 @@ mod borrowed_tests {
     #[test]
     fn adopted_bodies_keep_their_identities_and_can_be_taken_back() {
         let mut k = Kernel::default();
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = AttributeStore::new();
         let mut next = 4;
         let mut store = SweepStore::new(&Identities, &mut records, &mut attributes, &mut next);
@@ -1987,7 +2046,7 @@ mod borrowed_tests {
         let mut b = Brep::new();
         let mut c = Brep::new();
         a.set_editing_enabled(true);
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = AttributeStore::new();
         let mut next_handle = 0;
         let mut store =
@@ -2048,7 +2107,7 @@ mod borrowed_tests {
         face.loops.push(LoopId::from_index(99));
         face.faceuse = Some(FaceuseId::from_index(99));
         let f = b.add_face_record(face).unwrap();
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = AttributeStore::new();
         let mut next_handle = 0;
         let mut store =
@@ -2155,7 +2214,7 @@ mod bounding_box_tests {
         let interval = curve.natural_interval();
         brep_p5::create_wire_edge_from_curve(&mut k, &mut b, curve, interval).unwrap();
         let vertex = b.vertices().ids().next().unwrap();
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attrs = AttributeStore::new();
         let mut next = 0;
         {
@@ -2207,7 +2266,7 @@ mod bounding_box_tests {
             BSplineSurface::from_data(2, 2, 2, 2, 5, 5, &net, &knots, &knots).unwrap(),
         );
         let domain = Extent2d::from_bounds(0.2, 0.25, 0.8, 0.75);
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attrs = AttributeStore::new();
         let face = {
             let key_of = |entity| Identities.topology(id, entity);
@@ -2293,7 +2352,7 @@ mod production_path_tests {
             k2.context.set_doing_boolean(true);
             let mut original = Brep::new_with_infinite_region().unwrap();
             let mut destination = Brep::new_with_infinite_region().unwrap();
-            let mut records = BTreeMap::new();
+            let mut records = crate::topology::topology::NotifyRecords::new();
             let mut attrs = AttributeStore::new();
             let mut next_handle = 0;
             let mut store =
@@ -2348,7 +2407,7 @@ mod production_path_tests {
     fn hcr_scene_access_and_idempotent_release() {
         let mut k = Kernel::default();
         let mut original = Brep::new_with_infinite_region().unwrap();
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attrs = AttributeStore::new();
         let mut next_handle = 0;
         let mut store = SweepStore::new(&Identities, &mut records, &mut attrs, &mut next_handle);
@@ -2434,7 +2493,7 @@ mod persistence_tests {
         )
         .unwrap();
         let mut b = Brep::new();
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attrs = AttributeStore::new();
         let mut next = 0;
         {
@@ -2518,7 +2577,7 @@ mod persistence_tests {
         edge.curve =
             Some(Line::from_points(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), 3).into());
         let edge = original.add_edge_record(edge).unwrap();
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attrs = AttributeStore::new();
         let mut next = 0;
         let old_temporary;
@@ -2610,7 +2669,7 @@ mod borrowed_wire_tests {
             let v = original
                 .add_vertex_record(crate::topology::Vertex::default())
                 .unwrap();
-            let mut records = BTreeMap::new();
+            let mut records = crate::topology::topology::NotifyRecords::new();
             let mut attributes = AttributeStore::new();
             let mut next = 0;
             let mut store = SweepStore::new(&Identities, &mut records, &mut attributes, &mut next);
@@ -2678,8 +2737,11 @@ mod borrowed_wire_tests {
                 (Kernel::default(), Kernel::default());
             let mut source_body = Brep::new_with_infinite_region().unwrap();
             let mut destination_body = Brep::new_with_infinite_region().unwrap();
-            let (mut records, mut attributes, mut next) =
-                (BTreeMap::new(), AttributeStore::new(), 29);
+            let (mut records, mut attributes, mut next) = (
+                crate::topology::topology::NotifyRecords::new(),
+                AttributeStore::new(),
+                29,
+            );
             let mut store = SweepStore::new(&Identities, &mut records, &mut attributes, &mut next);
             let source_context = store.register_kernel(&mut source_kernel).unwrap();
             let destination_context = if shared {

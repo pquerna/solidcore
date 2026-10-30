@@ -1163,7 +1163,7 @@ fn side(left: bool) -> Side {
 /// The `SmStatus` of a Rust error; `-1` for one upstream cannot return.
 fn status(e: &SolidError) -> f64 {
     match e {
-        SolidError::InvalidInput { .. } => 1007.0,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.0,
         SolidError::Upstream { code, .. } => f64::from(*code),
         _ => -1.0,
     }
@@ -1381,7 +1381,7 @@ fn rust_surface_op(k: &Kernel, op: &OpIn, t: &This) -> Result<Run, HarnessError>
             ];
             if let Some(x) = &s {
                 {
-                    push_dom(o, &x.natural_uv_domain());
+                    push_dom(o, &x.natural_uv_domain_with_nurb(k)?);
                     push_dom(o, &x.step_uv_domain());
                     o.extend([
                         x.degree(SurfParamType::U) as f64,
@@ -2882,10 +2882,22 @@ impl UnitDiff for Runner {
         };
         let mut cases = default_cases(self, &ctx)?;
         cases.extend(super::surface_cone_p1::common_cases(&ctx)?);
+        cases.extend(super::surface_sphere::const_make_cases());
+        cases.extend(super::surface_torus::const_make_cases());
+        cases.extend(super::surface_surf_of_revolution_p1::const_make_cases());
         Ok(cases)
     }
 
     fn run_cpp(&self, case: &Case) -> Result<Output, HarnessError> {
+        if case.inputs.get("common_const_make").is_some() {
+            if let Some(v) = case.inputs.get("common_sphere") { return super::surface_sphere::const_make_cpp(v.clone()); }
+            if let Some(v) = case.inputs.get("common_torus") { return super::surface_torus::const_make_cpp(v.clone()); }
+            if let Some(v) = case.inputs.get("common_revolution") { return super::surface_surf_of_revolution_p1::const_make_cpp(v.clone()); }
+        }
+        if case.inputs.get("common_const_make").is_some() {
+            let value = case.inputs.get("common_cone").ok_or_else(|| HarnessError::new("missing common_cone"))?;
+            return super::surface_cone_p1::const_make_cpp(value.clone());
+        }
         if let Some(value) = case.inputs.get("common_cone") {
             return super::surface_cone_p1::common_cpp(
                 value.clone(),
@@ -2909,6 +2921,15 @@ impl UnitDiff for Runner {
 
     fn run_rust(&self, case: &Case) -> Result<Output, HarnessError> {
         let k = &Kernel::default();
+        if case.inputs.get("common_const_make").is_some() {
+            if let Some(v) = case.inputs.get("common_sphere") { return super::surface_sphere::const_make_rust(v.clone()); }
+            if let Some(v) = case.inputs.get("common_torus") { return super::surface_torus::const_make_rust(v.clone()); }
+            if let Some(v) = case.inputs.get("common_revolution") { return super::surface_surf_of_revolution_p1::const_make_rust(v.clone()); }
+        }
+        if case.inputs.get("common_const_make").is_some() {
+            let value = case.inputs.get("common_cone").ok_or_else(|| HarnessError::new("missing common_cone"))?;
+            return super::surface_cone_p1::const_make_rust(value.clone());
+        }
         if let Some(value) = case.inputs.get("common_cone") {
             return super::surface_cone_p1::common_rust(
                 value.clone(),

@@ -29,11 +29,13 @@
 //! | [`vertices`], [`vertexuses`], [`edgeuses`], [`AttributeFilter`] | `SmEdge::GetVertices(SmTArray&, ULONG*)`, `GetVertexuses`, `GetEdgeuses` |
 //! | [`max_gap_3d`], [`max_up_dim_gap_3d`], [`max_down_dim_gap_3d`], [`EdgeGap`], [`MaxGap`] | `SmEdge::GetMaxGap3d`, `GetMaxUpDimGap3d`, `GetMaxDownDimGap3d` |
 //! | [`number_face_occurances`]              | `SmEdge::GetNumberFaceOccurances`                 |
+//! | [`edge_form`] (submodule)               | `SmEdge::IsOnFaceEdgeForm`, `sm_AssertTestEdge13` |
 //! | [`add_oriented_eu_pair`]                | `SmEdge::AddOrientedEUPair`                       |
 //! | [`vertex`], [`start_vertex`], [`end_vertex`], [`other_vertex`], [`start_end_vertices`] | `SmEdge::GetVertex`, `GetStartVertex`, `GetEndVertex`, `GetOtherVertex`, `GetVertices(SmVertex*&, SmVertex*&)` |
 //! | [`insert_manifold_edge_end`]            | `SmEdge::InsertManifoldEdgeEnd`                   |
 //! | [`is_lamina`], [`is_manifold`], [`is_spine`] | `SmEdge::IsLamina`, `IsManifold`, `IsSpine`  |
 //! | [`is_seam`], [`is_seam_of_surface`]     | the two `SmEdge::IsSeam`                          |
+//! | [`is_embedded`]                         | `SmEdge::IsEmbedded`                              |
 //! | `cover_other_coincident_face` (private) | `sm_CoverOtherCoincidentFace` (static)            |
 //! | [`is_topological`], [`Topological`]     | `SmEdge::IsTopological`                           |
 //! | [`is_tangent_edge`]                     | `SmEdge::IsTangentEdge`                           |
@@ -108,7 +110,7 @@
 //!   two face surfaces are moved out of their faces for the call and back, so the
 //!   covering surface keeps any expansion, as upstream.
 
-use std::collections::BTreeMap;
+pub mod edge_form;
 
 use crate::curve::curve::{Curve, CurveKind};
 use crate::error::{ignore_status, EntityRef, Result, SolidError};
@@ -135,7 +137,9 @@ use crate::topology::edgeuse::p2 as eu2;
 use crate::topology::edgeuse::p3 as eu3;
 use crate::topology::face::p2 as face2;
 use crate::topology::proto_topology::p1::owning_topology;
-use crate::topology::topology::{self as topo, Topology};
+#[cfg(test)]
+use crate::topology::topology::Topology;
+use crate::topology::topology::{self as topo};
 use crate::topology::vertexuse as vu1;
 use crate::topology::{
     Brep, Edge, EdgeId, EdgeuseId, FaceId, FaceuseId, LoopuseId, RegionId, ShellId, VertexId,
@@ -1594,6 +1598,48 @@ pub fn is_spine(b: &Brep, e: EdgeId) -> Result<bool> {
     }
 }
 
+/// `IsEmbedded(pOptFace, bFaceHasSeam)`: the edge has four edge uses on `face` (on any
+/// of its faces when `None`): an edge embedded within a single face, e.g. a crack. A
+/// seam is not embedded; with `face_has_seam` false the (expensive) seam test is
+/// skipped. An embedded edge can connect to other faces.
+///
+/// # Errors
+///
+/// Those of [`faces`], [`edgeuses`], the edge uses' faces and [`is_seam`].
+pub fn is_embedded(
+    k: &Kernel,
+    b: &mut Brep,
+    e: EdgeId,
+    face: Option<FaceId>,
+    face_has_seam: bool,
+) -> Result<bool> {
+    // search face or all faces connected to this edge when face is None
+    let tgt_faces = match face {
+        None => faces(b, e, None)?,
+        Some(f) => vec![f],
+    };
+    let uses = edgeuses(b, e, None, None)?;
+
+    // for every face
+    for tgt in tgt_faces {
+        // count the edgeuses that connect to this face
+        let mut count = 0usize;
+        for &eu in &uses {
+            if eu1::face(b, eu)? == Some(tgt) {
+                count += 1;
+            }
+        }
+
+        // when we found a face being embedded
+        if count == 4 && (!face_has_seam || !is_seam(k, b, e)?) {
+            return Ok(true);
+        }
+    }
+
+    // else - edge is not embedded
+    Ok(false)
+}
+
 /// `IsSeam()`: the edge is a seam of the surface of any of its faces
 /// ([`is_seam_of_surface`]).
 pub fn is_seam(k: &Kernel, b: &mut Brep, e: EdgeId) -> Result<bool> {
@@ -1795,7 +1841,10 @@ pub fn is_topological(
             .surface
             .as_ref()
             .ok_or_else(|| null("IsTopological: face without surface"))?;
-        Ok((f, s.clone()))
+        // Upstream reads `pFace->GetSurface()` itself. An evaluation copy keeps the
+        // face owner, whose tolerance `IsPlanar`'s pseudo box is expanded by; a plain
+        // clone drops it, so a curved B-spline face could pass as planar.
+        Ok((f, s.clone_for_evaluation()?))
     };
     // 1st edgeuse locals
     let (face1, surf1) = face_of(eu_a)?;
@@ -2240,7 +2289,7 @@ pub fn orient_edge_sequence(k: &Kernel, b: &mut Brep, edges: &[EdgeId]) -> Resul
 /// different B-reps, and must remain stable for newly allocated entities.
 pub struct NotificationStores<'a> {
     /// The topology records (`SmTopology` members) of the notified objects.
-    pub records: &'a mut BTreeMap<ObjectKey, Topology>,
+    pub records: &'a mut topo::NotifyRecords,
     /// The actual attribute store of the notified objects.
     pub attributes: &'a mut AttributeStore,
     /// The identity each topology entity is notified under.
@@ -2265,7 +2314,7 @@ pub struct NotifyEnv<'a> {
     /// (`geom::context`), so a store holding them belongs to one domain: not shared
     /// across two contexts, nor across a `Context::take_notify_lease` that is not given
     /// back.
-    pub records: &'a mut BTreeMap<ObjectKey, Topology>,
+    pub records: &'a mut topo::NotifyRecords,
     /// The attribute store (keyed like [`NotifyEnv::records`], and scoped the same way).
     pub attributes: &'a mut AttributeStore,
     /// The context of the objects (`GetContext`).
@@ -2292,7 +2341,7 @@ enum NotifyContext<'a> {
 /// Reborrowed notification data shared by legacy and kernel-context algorithms.
 /// The kernel variant never retains a borrow of the kernel or its context.
 pub(crate) struct NotifyState<'a> {
-    pub(crate) records: &'a mut BTreeMap<ObjectKey, Topology>,
+    pub(crate) records: &'a mut crate::topology::topology::NotifyRecords,
     pub(crate) attributes: &'a mut AttributeStore,
     pub(crate) key_of: &'a dyn Fn(EntityRef) -> ObjectRef,
     context: NotifyContext<'a>,
@@ -2989,7 +3038,7 @@ mod tests {
             .unwrap()
             .evaluate_point(&k, interval.evaluate(0.37))
             .unwrap();
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         crate::topology::brep::p3::seed_records(&mut records, &b, &key_of);
         let mut attributes = AttributeStore::default();
         let marker = attributes
@@ -3084,10 +3133,11 @@ mod tests {
             let result = result_key(EntityRef::Edge(id));
             let mut source_record = Topology::default();
             source_record.set_user_index1(71);
-            let mut records = BTreeMap::from([
-                (original.key, source_record),
-                (result.key, Topology::default()),
-            ]);
+            let mut records =
+                crate::topology::topology::NotifyRecords::from(std::collections::BTreeMap::from([
+                    (original.key, source_record),
+                    (result.key, Topology::default()),
+                ]));
             let mut attributes = AttributeStore::default();
             let mut stores = NotificationStores {
                 records: &mut records,
@@ -3163,7 +3213,7 @@ mod tests {
                 if let Some(previous) = external {
                     context.set_doing_boolean(previous);
                 }
-                let mut records = BTreeMap::new();
+                let mut records = crate::topology::topology::NotifyRecords::new();
                 let mut attributes = AttributeStore::default();
                 let key = |_| ObjectRef {
                     key: ObjectKey(123),

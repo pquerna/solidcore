@@ -574,8 +574,8 @@ impl FilletBrep {
 
             // check state - filletSurface must have been computed by now
             let (Some(surface1), Some(surface2)) = (
-                self.geom(g1)?.fillet_surface()?.cloned(),
-                self.geom(g2)?.fillet_surface()?.cloned(),
+                self.geom(g1)?.fillet_surface(None)?.cloned(),
+                self.geom(g2)?.fillet_surface(None)?.cloned(),
             ) else {
                 return Ok(()); // Fillet surfaces have not yet been computed
             };
@@ -727,14 +727,14 @@ impl FilletBrep {
         let g2 = self.eu_geom(mate)?;
         let mut fs2_tol: Option<f64> = None;
 
-        let surface1: Surface;
+        let mut surface1: Surface;
         let mut surface2: Option<Surface> = None;
         let tol: f64;
         if let Some(g1) = g1 {
             let sid1 = self.geom(g1)?.fillet_solver();
             surface1 = self
                 .geom(g1)?
-                .fillet_surface()?
+                .fillet_surface(None)?
                 .cloned()
                 .ok_or_else(|| SolidError::null_pointer(OP_CROSS))?;
 
@@ -747,7 +747,7 @@ impl FilletBrep {
                 fs2_tol = Some(fs2.approx_tol_3d);
                 surface2 = Some(
                     self.geom(g2)?
-                        .fillet_surface()?
+                        .fillet_surface(None)?
                         .cloned()
                         .ok_or_else(|| SolidError::null_pointer(OP_CROSS))?,
                 );
@@ -805,6 +805,23 @@ impl FilletBrep {
                             tol,
                             solvers,
                         ))?;
+
+                        // Upstream's `pSurface1` / `pSurface2` point at the fillet
+                        // geometries' own surfaces, which the fix edits in place (a
+                        // closed corner's end row becomes its start row); re-read them.
+                        surface1 = self
+                            .geom(g1)?
+                            .fillet_surface(None)?
+                            .cloned()
+                            .ok_or_else(|| SolidError::null_pointer(OP_CROSS))?;
+                        if surface2.is_some() {
+                            surface2 = Some(
+                                self.geom(g2)?
+                                    .fillet_surface(None)?
+                                    .cloned()
+                                    .ok_or_else(|| SolidError::null_pointer(OP_CROSS))?,
+                            );
+                        }
                     }
                 }
             }
@@ -857,7 +874,7 @@ impl FilletBrep {
                 .ok_or_else(|| SolidError::null_pointer(OP_CROSS))?;
             let lifted = surface1.lift_curve(
                 k,
-                &surface1.natural_uv_domain(),
+                &surface1.natural_uv_domain_with_nurb(k)?,
                 &uv1,
                 &uv1.natural_interval(),
                 tol / 10.0,
@@ -1033,7 +1050,7 @@ impl FilletBrep {
         if !has_curve {
             let fillet_surface1 = self
                 .geom(g1)?
-                .fillet_surface()?
+                .fillet_surface(None)?
                 .cloned()
                 .ok_or_else(|| SolidError::null_pointer(OP_SIDE))?;
             // upstream calls `pCorner->IsExtendedSurfacePatch()` on the missing corner
@@ -1213,11 +1230,30 @@ impl FilletBrep {
             .fillet_edge(e)?
             .original_edge()
             .ok_or_else(|| SolidError::null_pointer(OP_EXT_EDGE))?;
-        let faces = edge::faces(target, orig_edge, None)?;
+        let mut faces = edge::faces(target, orig_edge, None)?;
         if faces.len() < 2 {
             return Err(SolidError::sm_err(OP_EXT_EDGE));
         }
         let the_corner = corners.corner(corner)?;
+        // Past a tangent side edge (`make_nx1_corner_topology`), the extended edge
+        // bounds the end face and a face that is not the side face this edge runs in:
+        // its extension is where that side face meets the end face's extension
+        // (tangency-labs/smlib@d5ebcb3, WR-457).
+        if k.fixes.fillet_nx1_tangent_side_edge {
+            if let Some(side) = self.fillet_edge(e)?.original_face() {
+                if !faces.contains(&side) {
+                    let mut end_face = None;
+                    for &f in &faces {
+                        if extended_surface(the_corner, f)?.is_some() {
+                            end_face = Some(f);
+                            break;
+                        }
+                    }
+                    let end_face = end_face.ok_or_else(|| SolidError::null_pointer(OP_EXT_EDGE))?;
+                    faces = vec![side, end_face];
+                }
+            }
+        }
         let mut surfaces: Vec<Option<Surface>> = Vec::with_capacity(2);
         for &f in faces.iter().take(2) {
             let surf = match extended_surface(the_corner, f)? {
@@ -1643,7 +1679,7 @@ impl FilletBrep {
         // Create a line between the two UV points and lift the curve.
         let fillet_surface = self
             .geom(g)?
-            .fillet_surface()?
+            .fillet_surface(None)?
             .cloned()
             .ok_or_else(|| SolidError::null_pointer(OP_END))?;
         let mut eus = Vec::with_capacity(2);
@@ -1778,7 +1814,7 @@ impl FilletBrep {
         // next - Lift pUVCurve to p3DCurve
         let lifted = fillet_surface.lift_curve(
             k,
-            &fillet_surface.natural_uv_domain(),
+            &fillet_surface.natural_uv_domain_with_nurb(k)?,
             &uv_curve,
             &uv_curve.natural_interval(),
             solver.approx_tol_3d / 4.0,
@@ -1872,12 +1908,12 @@ impl FilletBrep {
         // check state
         let fillet_surface = self
             .geom(g)?
-            .fillet_surface()?
+            .fillet_surface(None)?
             .cloned()
             .ok_or_else(|| SolidError::null_pointer(OP_TRIM))?;
 
         // locals: FilletSurface Natural domain and current tolerance
-        let uv_domain = fillet_surface.natural_uv_domain();
+        let uv_domain = fillet_surface.natural_uv_domain_with_nurb(k)?;
         let sid = self
             .geom(g)?
             .fillet_solver()
@@ -2092,7 +2128,8 @@ impl FilletBrep {
 
     /// The trims at the end of `TrimRailCurves`: the rail's curve, then its mate's UV
     /// curve (the original face's, when it has one), then its primary use's UV curve,
-    /// each with the (possibly snapped) interval.
+    /// each with the (possibly snapped) interval. Each trim reads
+    /// `SmTol::GetZoneTol3d(curve)` of the curve's holder ([`held_curve_zone_tol_3d`]).
     fn trim_rail_and_uv_curves(
         &mut self,
         k: &Kernel,
@@ -2101,12 +2138,17 @@ impl FilletBrep {
         mate: EdgeuseId,
         trim_ivl: &mut Extent1d,
     ) -> Result<()> {
+        let rail_tol = held_curve_zone_tol_3d(k, self.brep(), Some(rail))?;
+        let mate_edge = self.brep().edgeuse(mate)?.edge;
+        let mate_tol = held_curve_zone_tol_3d(k, self.brep(), mate_edge)?;
+        let prim_edge = self.brep().edgeuse(prim)?.edge;
+        let prim_tol = held_curve_zone_tol_3d(k, self.brep(), prim_edge)?;
         self.brep_mut()
             .edge_mut(rail)?
             .curve
             .as_mut()
             .ok_or_else(|| SolidError::null_pointer(OP_TRIM))?
-            .trim(k, trim_ivl, TrimMode::Notify)?;
+            .trim_with_zone_tol(k, trim_ivl, TrimMode::Notify, rail_tol)?;
         if let Some(c) = self
             .brep_mut()
             .edgeuse_mut(mate)?
@@ -2114,14 +2156,14 @@ impl FilletBrep {
             .as_mut()
             .filter(|c| is_b_spline(c))
         {
-            c.trim(k, trim_ivl, TrimMode::Notify)?;
+            c.trim_with_zone_tol(k, trim_ivl, TrimMode::Notify, mate_tol)?;
         }
         self.brep_mut()
             .edgeuse_mut(prim)?
             .uv_trim_curve
             .as_mut()
             .ok_or_else(|| SolidError::null_pointer(OP_TRIM))?
-            .trim(k, trim_ivl, TrimMode::Notify)?;
+            .trim_with_zone_tol(k, trim_ivl, TrimMode::Notify, prim_tol)?;
         Ok(())
     }
 
@@ -2168,10 +2210,10 @@ impl FilletBrep {
         let angle_tol = solver.ang_tol_rad;
         let fillet_surface = self
             .geom(g)?
-            .fillet_surface()?
+            .fillet_surface(None)?
             .cloned()
             .ok_or_else(|| SolidError::null_pointer(OP_CLIFF))?;
-        let fil_srf_domain = fillet_surface.natural_uv_domain();
+        let fil_srf_domain = fillet_surface.natural_uv_domain_with_nurb(k)?;
 
         for rail_idx in 0..2 {
             let main_rail = self
@@ -2251,7 +2293,7 @@ impl FilletBrep {
                         self.eu_geom(mate)?
                     };
                     let side_surface = if let Some(sg) = side_fg.filter(|&s| s != g) {
-                        self.geom(sg)?.fillet_surface()?.cloned()
+                        self.geom(sg)?.fillet_surface(None)?.cloned()
                     } else {
                         let face = self
                             .fillet_edge(rail)?
@@ -2438,6 +2480,18 @@ fn user_surface(
         .surface
         .clone()
         .map(|s| crate::intersect::surface_intersector::p1::UserSurface(std::sync::Arc::new(s))))
+}
+
+/// `SmTol::GetZoneTol3d(pCurve)` for a curve held by an edge, or by an edge use (a UV
+/// trim curve, whose `SmCurve::GetEdge` is the edge use's owning edge): that edge's
+/// tolerance (`SmEdge::GetTolerance`, zero on a fillet B-rep's rails); the system zone
+/// tolerance when there is no edge. `SmBSplineCurve::Trim` maps it to parameter space
+/// to find degenerate end spans to remove.
+pub(super) fn held_curve_zone_tol_3d(k: &Kernel, b: &Brep, holder: Option<EdgeId>) -> Result<f64> {
+    Ok(match holder {
+        Some(e) => edge::tolerance(b, e)?,
+        None => crate::geom::tol::zone_tol_3d(k, crate::geom::tol::SmallTopoType::NormalSize),
+    })
 }
 
 #[cfg(test)]

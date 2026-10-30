@@ -17,6 +17,9 @@
 //! their external context, including null. Editing state is part 1's `Brep::editing_enabled`.
 //! Ordinary split failures retain the nearby vertex alongside their status. All six
 //! owned bodies are present; individual dependency calls defer to their owners.
+//! `FindInfiniteRegion` retries a failed `SmShell::RayFire` as upstream, but propagates
+//! errors that have no upstream status (unported, stale id, pending preparation, B-rep
+//! cache owner/handle resolution) instead of treating them as a missed ray.
 //! Part 1's `add_*_record` appends a face, edge or vertex to its owning list at
 //! allocation; native `PostInsert`s later, with no same-kind allocation in between,
 //! so the list order matches, but a record allocated before a dependency error stays
@@ -39,6 +42,10 @@
 //! `UpdateVertexEdgeIntervals` sets it. By default it leaves gaps up to the full
 //! tolerance, as the pinned C++ does, which `AssertValid` refuses above half of it.
 //! See `plan/upstream-issues/WR-469--make-edge-in-face-vertex-tolerance-gap.md`.
+//! Opt-in ([`UpstreamFixes::boolean_skips_faces_apart`](crate::kernel::UpstreamFixes::boolean_skips_faces_apart),
+//! WR-527, #1527): on two planes, `MakeEdgeInFaceWithVU` leaves an inner loop whose
+//! test point lies outside the new face's outer loop box (at the retry tolerance)
+//! in place without classifying it, as the fork's tangency-labs/smlib@60b1c6a.
 
 use crate::curve::curve::Curve;
 use crate::error::{ignore_status, Result, SolidError, SM_ERR};
@@ -426,10 +433,20 @@ fn ray_direction(direction: Vec3) -> Result<Vec3> {
     })
 }
 
+/// Whether a `SmShell::RayFire` call succeeded. Upstream retries on any failed status;
+/// an error with no upstream status (an unported callee, a stale id, a pending
+/// geometry preparation, or the B-rep cache failing to resolve an owner under the
+/// query's identities) is propagated instead, so a naming mismatch cannot pass for a
+/// missed ray and silently select another region.
 fn ray_success(status: &Result<()>) -> Result<bool> {
     match status {
         Ok(()) => Ok(true),
-        Err(e @ SolidError::Unported { .. }) => Err(e.clone()),
+        Err(
+            e @ (SolidError::Unported { .. }
+            | SolidError::NotFound { .. }
+            | SolidError::PreparationRequired { .. }),
+        ) => Err(e.clone()),
+        Err(e) if crate::topology::brep_cache::is_identity_error(e) => Err(e.clone()),
         Err(_) => Ok(false),
     }
 }
@@ -745,7 +762,7 @@ fn register_entities(env: &mut edge::NotifyEnv<'_>, entities: &[EntityRef]) {
 
 fn register_state_entities(state: &mut edge::NotifyState<'_>, entities: &[EntityRef]) {
     for &entity in entities {
-        state.records.entry((state.key_of)(entity).key).or_default();
+        state.records.or_default((state.key_of)(entity).key);
     }
 }
 
@@ -1473,8 +1490,8 @@ pub fn make_edge_in_face_with_vu_with_curve_identity(
     };
     let start_vertex = required(b.vertexuse(start)?.vertex, "start VU without vertex")?;
     let end_vertex = required(b.vertexuse(end)?.vertex, "end VU without vertex")?;
-    let domain =
-        required(b.face(face)?.surface.as_ref(), "face without surface")?.natural_uv_domain();
+    let domain = required(b.face(face)?.surface.as_ref(), "face without surface")?
+        .natural_uv_domain_with_nurb(k)?;
     let (end_orientation, t_start, t_end) = if input.orientation == OrientType::Same {
         (
             OrientType::Opposite,
@@ -1484,6 +1501,28 @@ pub fn make_edge_in_face_with_vu_with_curve_identity(
     } else {
         (OrientType::Same, input.interval.max(), input.interval.min())
     };
+    // Decide before editing: a full periodic cut can split the boundary without
+    // separating the face. A same-vertex/same-loop connection alone is insufficient.
+    // Implementation restriction: only SmCrvOnSurf seams, as supplied by
+    // SplitAtSeam, are recognized using their defining UV curves. Equivalent
+    // SmCircle or SmBSplineCurve seams are not yet recognized and follow the
+    // existing same-loop face-splitting path. This curve-type restriction is
+    // an implementation limitation, not a requirement of the BRep topology.
+    let new_loop_without_new_face = match curve.kind() {
+        crate::curve::curve::CurveKind::CrvOnSurf(on_surf) => {
+            super::p1::is_first_nonseparating_seam(
+                k,
+                b,
+                face,
+                start,
+                end,
+                on_surf,
+                &input.interval,
+            )?
+        }
+        _ => false,
+    };
+
     let edge_id = b.add_edge_record(crate::topology::Edge::new([start_vertex, end_vertex]))?;
     let mut uses = Vec::new();
     let mut vertexuses = Vec::new();
@@ -1679,51 +1718,60 @@ pub fn make_edge_in_face_with_vu_with_curve_identity(
             .unwrap_or(end);
         }
         edge::insert_manifold_edge_end(b, edge_id, Some(end), false)?;
-        // the split face's shell as `GetShell` reads it, through its primary face use
-        // (the port's `Face::shell` is a cache the native shell moves do not maintain)
-        let cached_shell = b.face(face)?.shell;
-        let shell = match b.face(face)?.faceuse {
-            Some(fu) => b.faceuse(fu)?.shell.unwrap_or(cached_shell),
-            None => cached_shell,
+        let (new_face, new_fu1, new_fu2) = if new_loop_without_new_face {
+            let fu1 = required(fp2::upward_faceuse(b, face)?, "face without upward use")?;
+            let fu2 = required(b.faceuse(fu1)?.mate, "faceuse without mate")?;
+            (None, fu1, fu2)
+        } else {
+            // separating cut: create one new face, in the split face's shell as `GetShell`
+            // reads it, through its primary face use (the port's `Face::shell` is a cache
+            // the native shell moves do not maintain)
+            let cached_shell = b.face(face)?.shell;
+            let shell = match b.face(face)?.faceuse {
+                Some(fu) => b.faceuse(fu)?.shell.unwrap_or(cached_shell),
+                None => cached_shell,
+            };
+            let new_face = b.add_face_record(crate::topology::Face::new(shell))?;
+            let mut surface =
+                required(b.face(face)?.surface.as_ref(), "split face without surface")?
+                    .copy_and_add_analytics(k)?;
+            let new_face_owner = (env.key_of)(EntityRef::Face(new_face));
+            surface.set_owner(Some(new_face_owner));
+            b.face_mut(new_face)?.surface = Some(surface);
+            b.set_geometry_owner_key(EntityRef::Face(new_face), Some(new_face_owner));
+            set_face_tolerance(b, new_face, b.tolerance(), true, true)?;
+            b.face_mut(new_face)?.uv_domain = b.face(face)?.uv_domain;
+            let new_fu1 = b.add_faceuse_record(crate::topology::Faceuse::default())?;
+            let new_fu2 = b.add_faceuse_record(crate::topology::Faceuse::default())?;
+            register_entities(
+                env,
+                &[
+                    EntityRef::Face(new_face),
+                    EntityRef::Faceuse(new_fu1),
+                    EntityRef::Faceuse(new_fu2),
+                ],
+            );
+            b.face_mut(new_face)?.faceuse = Some(new_fu1);
+            for (fu, mate, orientation) in [
+                (new_fu1, new_fu2, OrientType::Same),
+                (new_fu2, new_fu1, OrientType::Opposite),
+            ] {
+                let record = b.faceuse_mut(fu)?;
+                record.face = Some(new_face);
+                record.mate = Some(mate);
+                record.orientation = orientation;
+            }
+            let up = required(fp2::upward_faceuse(b, face)?, "face without upward use")?;
+            let down = required(b.faceuse(up)?.mate, "faceuse without mate")?;
+            let up_shell = required(b.faceuse(up)?.shell, "upward use without shell")?;
+            let down_shell = required(b.faceuse(down)?.shell, "downward use without shell")?;
+            shell_post_insert(b, up_shell, new_fu1)?;
+            shell_post_insert(b, down_shell, new_fu2)?;
+            insert_brep_entity(b, EntityRef::Face(new_face))?;
+            (Some(new_face), new_fu1, new_fu2)
         };
-        let new_face = b.add_face_record(crate::topology::Face::new(shell))?;
-        let mut surface = required(b.face(face)?.surface.as_ref(), "split face without surface")?
-            .copy_and_add_analytics(k)?;
-        let new_face_owner = (env.key_of)(EntityRef::Face(new_face));
-        surface.set_owner(Some(new_face_owner));
-        b.face_mut(new_face)?.surface = Some(surface);
-        b.set_geometry_owner_key(EntityRef::Face(new_face), Some(new_face_owner));
-        set_face_tolerance(b, new_face, b.tolerance(), true, true)?;
-        b.face_mut(new_face)?.uv_domain = b.face(face)?.uv_domain;
-        let new_fu1 = b.add_faceuse_record(crate::topology::Faceuse::default())?;
-        let new_fu2 = b.add_faceuse_record(crate::topology::Faceuse::default())?;
-        register_entities(
-            env,
-            &[
-                EntityRef::Face(new_face),
-                EntityRef::Faceuse(new_fu1),
-                EntityRef::Faceuse(new_fu2),
-            ],
-        );
-        b.face_mut(new_face)?.faceuse = Some(new_fu1);
-        for (fu, mate, orientation) in [
-            (new_fu1, new_fu2, OrientType::Same),
-            (new_fu2, new_fu1, OrientType::Opposite),
-        ] {
-            let record = b.faceuse_mut(fu)?;
-            record.face = Some(new_face);
-            record.mate = Some(mate);
-            record.orientation = orientation;
-        }
-        let up = required(fp2::upward_faceuse(b, face)?, "face without upward use")?;
-        let down = required(b.faceuse(up)?.mate, "faceuse without mate")?;
-        let up_shell = required(b.faceuse(up)?.shell, "upward use without shell")?;
-        let down_shell = required(b.faceuse(down)?.shell, "downward use without shell")?;
-        shell_post_insert(b, up_shell, new_fu1)?;
-        shell_post_insert(b, down_shell, new_fu2)?;
-        insert_brep_entity(b, EntityRef::Face(new_face))?;
         let new_loop = b.add_loop_record(Loop {
-            face: new_face,
+            face: new_face.unwrap_or(face),
             edges: Vec::new(),
             loopuse: None,
         })?;
@@ -1765,36 +1813,57 @@ pub fn make_edge_in_face_with_vu_with_curve_identity(
             true,
             true,
         ))?;
-        if !lu::is_outer_loop(b, start_loop)? {
-            if let Some(orientation) = crate::error::ignored(compute_loop_orientation(
-                k, b, new_face, new_loop, None, true,
-            ))? {
-                if orientation != OrientType::Same
-                    && crate::error::ignored(compute_loop_orientation(
-                        k, b, face, start_loop, None, true,
-                    ))?
-                    .is_some()
-                {
-                    // The old-loop orientation is diagnostic only, even if opposite.
-                    fp1::remove_loop(b, new_face, new_loop)?;
-                    fp1::remove_loop(b, face, start_loop)?;
-                    for (loop_, orientation) in [
-                        (start_loop, OrientType::Same),
-                        (new_loop, OrientType::Opposite),
-                    ] {
-                        let (a, z) = lu::loop_loopuses(b, loop_)?;
-                        let z = required(z, "loop without mate")?;
-                        b.loopuse_mut(a)?.orientation = orientation;
-                        b.loopuse_mut(z)?.orientation = orientation;
+        if let Some(new_face) = new_face {
+            // separating cut
+            if !lu::is_outer_loop(b, start_loop)? {
+                if let Some(orientation) = crate::error::ignored(compute_loop_orientation(
+                    k, b, new_face, new_loop, None, true,
+                ))? {
+                    if orientation != OrientType::Same
+                        && crate::error::ignored(compute_loop_orientation(
+                            k, b, face, start_loop, None, true,
+                        ))?
+                        .is_some()
+                    {
+                        // The old-loop orientation is diagnostic only, even if opposite.
+                        fp1::remove_loop(b, new_face, new_loop)?;
+                        fp1::remove_loop(b, face, start_loop)?;
+                        for (loop_, orientation) in [
+                            (start_loop, OrientType::Same),
+                            (new_loop, OrientType::Opposite),
+                        ] {
+                            let (a, z) = lu::loop_loopuses(b, loop_)?;
+                            let z = required(z, "loop without mate")?;
+                            b.loopuse_mut(a)?.orientation = orientation;
+                            b.loopuse_mut(z)?.orientation = orientation;
+                        }
+                        fp1::insert_loop(b, new_face, start_loop)?;
+                        fp1::insert_loop(b, face, new_loop)?;
                     }
-                    fp1::insert_loop(b, new_face, start_loop)?;
-                    fp1::insert_loop(b, face, new_loop)?;
                 }
             }
+            redistribute_inner_loops(k, b, face, new_face, start_loop, new_loop, env)?;
+        } else {
+            // Both boundary cycles belong to this face. Put one seam side first;
+            // the orthogonal seam will join the two cycles into its outer loop.
+            faceuse_remove_loopuse(b, new_fu1, old_top)?;
+            faceuse_remove_loopuse(b, new_fu2, old_bottom)?;
+            faceuse_pre_insert_loopuse(b, new_fu1, old_top)?;
+            faceuse_pre_insert_loopuse(b, new_fu2, old_bottom)?;
+            for (i, loop_) in fp2::loops(b, face, false, None)?.into_iter().enumerate() {
+                let orientation = if i == 0 {
+                    OrientType::Same
+                } else {
+                    OrientType::Opposite
+                };
+                let (a, z) = lu::loop_loopuses(b, loop_)?;
+                let z = required(z, "loop without mate")?;
+                b.loopuse_mut(a)?.orientation = orientation;
+                b.loopuse_mut(z)?.orientation = orientation;
+            }
         }
-        redistribute_inner_loops(k, b, face, new_face, start_loop, new_loop, env)?;
         output.loop_ = Some(new_loop);
-        output.face = Some(new_face);
+        output.face = new_face;
     } else {
         let (mut keep, mut delete) = if lu::is_outer_loop(b, start_loop)? {
             (start_loop, end_loop)
@@ -1995,6 +2064,36 @@ fn compute_loop_orientation(
     )
 }
 
+/// `pFU->Remove(pLU)`: takes the loop use off the face use's list (`SM_ERR` when it is
+/// not there).
+fn faceuse_remove_loopuse(
+    b: &mut Brep,
+    fu: crate::topology::FaceuseId,
+    lu: crate::topology::LoopuseId,
+) -> Result<()> {
+    if b.loopuse(lu)?.faceuse != Some(fu) {
+        return Err(SolidError::sm_err(OP));
+    }
+    let list = &mut b.faceuse_mut(fu)?.loopuses;
+    let Some(at) = list.iter().position(|&x| x == lu) else {
+        return Err(SolidError::sm_err(OP));
+    };
+    list.remove(at);
+    b.loopuse_mut(lu)?.faceuse = None;
+    Ok(())
+}
+
+/// `pFU->PreInsert(pLU)`: puts the loop use first on the face use's list.
+fn faceuse_pre_insert_loopuse(
+    b: &mut Brep,
+    fu: crate::topology::FaceuseId,
+    lu: crate::topology::LoopuseId,
+) -> Result<()> {
+    b.faceuse_mut(fu)?.loopuses.insert(0, lu);
+    b.loopuse_mut(lu)?.faceuse = Some(fu);
+    Ok(())
+}
+
 fn shell_post_insert(
     b: &mut Brep,
     shell: ShellId,
@@ -2131,6 +2230,16 @@ fn redistribute_inner_loops(
     let missing_new = lu::is_missing_seam_at_vertices(k, b, new_outer)?;
     let classify_to_original = !missing_original;
     let mut loops = fp2::loops(b, face, false, None)?;
+
+    // Opt-in (WR-527, #1526/#1527): on a plane the region a loop bounds lies within the
+    // loop's box, so an inner loop sampled outside the box of the new face's outer loop
+    // is not in the new face and stays: only when every edge has a box.
+    let new_outer_box = if k.fixes.boolean_skips_faces_apart {
+        new_face_outer_box(k, b, face, new_face)?
+    } else {
+        None
+    };
+
     let mut i = 1;
     while let Some(&loop_) = loops.get(i) {
         if loop_ == new_loop || loop_ == start_loop {
@@ -2148,6 +2257,12 @@ fn redistribute_inner_loops(
             )?;
             (b.vertex(v)?.point, b.vertex(v)?.tolerance)
         };
+        // Opt-in (WR-527): no move - the test point is outside the new face's outer loop
+        // box, even at the retry tolerance below
+        if new_outer_box.is_some_and(|bbox| !bbox.contains_point(point, tolerance * 100.0)) {
+            i += 1;
+            continue;
+        }
         let target = if classify_to_original { face } else { new_face };
         let other = if classify_to_original { new_face } else { face };
         let mut pc = PointClassification::<EntityRef>::new(tolerance);
@@ -2253,6 +2368,54 @@ fn redistribute_inner_loops(
         }
     }
     Ok(())
+}
+
+/// The box of `new_face`'s outer loop edges, each grown by its tolerance, when both
+/// faces lie on planes and every one of those edges has a curve whose box can be
+/// computed (the fork's `sNewFOuterBox`, WR-527).
+fn new_face_outer_box(
+    k: &Kernel,
+    b: &Brep,
+    face: FaceId,
+    new_face: FaceId,
+) -> Result<Option<crate::geom::extent3d::Extent3d>> {
+    use crate::nurbs::b_spline_curve::BoundingBoxRequest;
+    use crate::surface::surface::SurfaceKind;
+    let on_plane = |f: FaceId| -> Result<bool> {
+        Ok(b.face(f)?
+            .surface
+            .as_ref()
+            .is_some_and(|s| matches!(s.kind(), SurfaceKind::Plane(_))))
+    };
+    if !on_plane(face)? || !on_plane(new_face)? {
+        return Ok(None);
+    }
+    let edges = face_outer_edges(b, new_face)?;
+    if edges.is_empty() {
+        return Ok(None);
+    }
+    let req = BoundingBoxRequest {
+        normal: true,
+        pseudo: false,
+        polar: false,
+    };
+    let mut outer_box = crate::geom::extent3d::Extent3d::new();
+    for edge in edges {
+        let record = b.edge(edge)?;
+        let Some(curve) = record.curve.as_ref() else {
+            return Ok(None);
+        };
+        let Some(mut edge_box) = curve
+            .calculate_bounding_box(k, &record.interval, req, true)
+            .ok()
+            .and_then(|boxes| boxes.normal)
+        else {
+            return Ok(None);
+        };
+        edge_box.expand_absolute(record.tolerance);
+        outer_box = outer_box.union(&edge_box);
+    }
+    Ok(Some(outer_box))
 }
 
 fn edge_sample(k: &Kernel, b: &Brep, edge: EdgeId) -> Result<(Point3, f64)> {
@@ -2638,7 +2801,7 @@ mod tests {
                     type_code: original.type_code(),
                 };
                 let before = (b.edge_list().len(), b.vertex_list().len());
-                let mut records = BTreeMap::new();
+                let mut records = crate::topology::topology::NotifyRecords::new();
                 crate::topology::brep::p3::seed_records(&mut records, &b, &key_of);
                 let mut attributes = AttributeStore::default();
                 let label = attributes
@@ -2767,7 +2930,9 @@ mod tests {
                     let mut record = Topology::default();
                     record.set_user_index1(912);
                     record.mark(Some(&k.context), mark);
-                    let mut records = BTreeMap::from([(edge_ref.key, record)]);
+                    let mut records = crate::topology::topology::NotifyRecords::from(
+                        BTreeMap::from([(edge_ref.key, record)]),
+                    );
                     for (id, _) in b.vertices().iter() {
                         records.insert(split_key(EntityRef::Vertex(id)).key, Topology::default());
                     }
@@ -2945,7 +3110,7 @@ mod tests {
             let region = b
                 .add_region_record(crate::topology::Region::default())
                 .unwrap();
-            let mut records = BTreeMap::new();
+            let mut records = crate::topology::topology::NotifyRecords::new();
             let mut attributes = AttributeStore::default();
             let result = make_shell_vertex_with_kernel_context(
                 &mut k,
@@ -3010,7 +3175,10 @@ mod tests {
                 let events = callbacks::install(&mut k.context);
                 let (mut b, edge) = split_wire();
                 let mut records =
-                    BTreeMap::from([(split_key(EntityRef::Edge(edge)).key, Topology::default())]);
+                    crate::topology::topology::NotifyRecords::from(BTreeMap::from([(
+                        split_key(EntityRef::Edge(edge)).key,
+                        Topology::default(),
+                    )]));
                 let mut attributes = AttributeStore::default();
                 let mut stores = edge::NotificationStores {
                     records: &mut records,
@@ -3047,6 +3215,28 @@ mod tests {
                 callbacks::assert_installed(&k.context, &events);
                 assert_eq!((b.edge_list().len(), b.vertex_list().len()), (1, 2));
             }
+        }
+    }
+
+    #[test]
+    fn ray_errors_without_an_upstream_status_propagate() {
+        assert!(ray_success(&Ok(())).unwrap());
+        assert!(!ray_success(&Err(SolidError::sm_err(OP))).unwrap());
+        assert!(!ray_success(&Err(SolidError::invalid_input(OP, "native"))).unwrap());
+        let internal = [
+            SolidError::Unported {
+                upstream: "SmShell::RayFire",
+                unit: "topology.shell",
+            },
+            SolidError::NotFound {
+                operation: OP,
+                entity: EntityRef::Edge(EdgeId::from_index(7)),
+            },
+            SolidError::PreparationRequired { operation: OP },
+            SolidError::port_invariant("topology::brep_cache", "edge owner is not in source B-rep"),
+        ];
+        for e in internal {
+            assert_eq!(ray_success(&Err(e.clone())), Err(e));
         }
     }
 
@@ -3108,7 +3298,7 @@ mod tests {
             Point3::new(uv_end.x, uv_end.y, 0.0),
             3,
         ));
-        let mut records = std::collections::BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = crate::geom::attribute::AttributeStore::default();
         let key_of = |e: EntityRef| crate::topology::loopuse::notify_ref(e);
         let mut env = edge::NotifyEnv {
@@ -3204,7 +3394,7 @@ mod tests {
             b.vertex_mut(vertex).unwrap().vertexuses.push(vu);
             b.edge_mut(e).unwrap().edgeuses.push(eu);
         }
-        let mut records = std::collections::BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = crate::geom::attribute::AttributeStore::default();
         let mut env = edge::NotifyEnv {
             records: &mut records,

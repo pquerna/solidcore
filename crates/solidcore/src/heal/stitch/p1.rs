@@ -41,6 +41,10 @@
 //!   fails (upstream status ignored): the previous gap, as upstream's reused local.
 //!   Upstream reads an uninitialised local when the very first call fails; the port
 //!   returns [`SolidError::Upstream`] `SM_ERR` there.
+//! - `test_and_split_edge` records the live edge's zone tolerance on its curve for
+//!   the drop's cache, which cannot dereference the owning B-rep. The independent
+//!   stitch/snap tolerance is unchanged; no curve copy or extra arena lookup is
+//!   needed.
 //! - `StitchVertexPairs` indexes its sorted index arrays with the unsorted counts, which
 //!   reads past them upstream when a list holds null entries; the port returns
 //!   [`SolidError::InvalidInput`] there. Its rescan of a vertex after gluing a closer
@@ -72,8 +76,6 @@
 //!   is `topology::brep::p2::notify` on an empty notify state (no B-rep cache, no
 //!   attribute state on the heal path).
 
-use std::collections::BTreeMap;
-
 use crate::boolean::merge::p1::MergeState;
 use crate::boolean::merge::p2::MergeOperand;
 use crate::boolean::topology_intersector::p1::TopologyIntersector;
@@ -97,6 +99,7 @@ use crate::topology::edgeuse::p1 as eu1;
 use crate::topology::edgeuse::p3::{self as eu3, BinormalOptions};
 use crate::topology::face::p1 as fp1;
 use crate::topology::face::p2 as fp2;
+#[cfg(test)]
 use crate::topology::topology::Topology;
 use crate::topology::topology_traverser::{Entity, Marks};
 use crate::topology::{
@@ -597,8 +600,16 @@ fn test_and_split_edge_with(
         new_edge: None,
     };
 
-    let curve = edge::curve(b, e)?.ok_or_else(|| ner("edge without curve"))?;
-    let domain = edge::interval(b, e)?;
+    let record = b.edge_mut(e)?;
+    let zone_tol_3d = record.tolerance;
+    let curve = record
+        .curve
+        .as_mut()
+        .ok_or_else(|| ner("edge without curve"))?;
+    // The drop's cache uses half the owning edge's zone tolerance, not the
+    // independent stitch/snap tolerance. Retain the actual curve and its memo.
+    curve.set_owner_zone_tol_3d(Some(zone_tol_3d));
+    let domain = record.interval;
     // This can't be too big. [B448]
     let dropped = curve.drop_point(
         k,
@@ -612,7 +623,7 @@ fn test_and_split_edge_with(
     out.dist_to_edge = dropped.distance;
 
     // Check far from curve.
-    let this_tol = smos_max(tol, edge::tolerance(b, e)?);
+    let this_tol = smos_max(tol, zone_tol_3d);
     if !dropped.success || dropped.distance > this_tol {
         out.reason = SplitReason::FarFromGeom;
         return Ok(out);
@@ -2323,7 +2334,7 @@ pub(crate) fn sort_by_param(
 /// `SmVertex::SetPoint`: the change notification (on records local to the call), then
 /// the new position.
 pub(crate) fn set_point(k: &mut Kernel, b: &mut Brep, v: VertexId, point: Point3) -> Result<()> {
-    let mut records: BTreeMap<ObjectKey, Topology> = BTreeMap::new();
+    let mut records = crate::topology::topology::NotifyRecords::new();
     let mut attributes = AttributeStore::default();
     let this = arena_identity(CacheObject::Vertex(v));
     let vertexuse_ref = |vu: crate::topology::VertexuseId| ObjectRef {
@@ -2472,7 +2483,7 @@ pub(crate) fn make_vertex_split_edge(
     e: EdgeId,
     t: f64,
 ) -> Result<(Option<EdgeId>, Option<EdgeId>, Option<VertexId>)> {
-    let mut records: BTreeMap<ObjectKey, Topology> = BTreeMap::new();
+    let mut records = crate::topology::topology::NotifyRecords::new();
     let mut attributes = AttributeStore::default();
     let key_of = |entity: EntityRef| match entity {
         EntityRef::Edge(id) => arena_identity(CacheObject::Edge(id)),
@@ -2802,7 +2813,7 @@ mod tests {
                 .geometry_key(original.notify_identity_slot())
                 .unwrap();
             let before = (b.edge_list().len(), b.vertex_list().len());
-            let mut records = BTreeMap::new();
+            let mut records = crate::topology::topology::NotifyRecords::new();
             p3::seed_records(&mut records, &b, &key_of);
             let mut attributes = AttributeStore::default();
             let marker = attributes
@@ -2920,7 +2931,7 @@ mod tests {
             .unwrap();
         attributes.add_attribute(face_key, marker).unwrap();
         attributes.add_attribute(vertex_key, marker).unwrap();
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         records.insert(face_key, Topology::new());
         records.insert(copied_face_key, Topology::new());
         records.insert(vertex_key, Topology::new());

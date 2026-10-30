@@ -717,7 +717,7 @@ const REFUSED: f64 = f64::MIN;
 /// refusal, as the shim refuses those inputs.
 fn st3<T>(r: solidcore::Result<T>) -> Result<Result<T, f64>, Fail> {
     match r {
-        Err(SolidError::InvalidInput { .. }) => Ok(Err(REFUSED)),
+        Err(SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }) => Ok(Err(REFUSED)),
         r => st(r),
     }
 }
@@ -749,7 +749,8 @@ pub(super) fn put_curve(k: &Kernel, o: &mut Vec<f64>, c: &Curve) {
 }
 
 fn put_surface(k: &Kernel, o: &mut Vec<f64>, s: &Surface) {
-    let d = s.natural_uv_domain();
+    // (runner helper that does not return Result)
+    let d = s.natural_uv_domain_if_built();
     o.extend([d.u_min(), d.u_max(), d.v_min(), d.v_max()]);
     for i in 0..=2 {
         for j in 0..=2 {
@@ -1681,7 +1682,7 @@ impl ProtoBrep<H> for Pool {
             let i = ents.iter().position(|t| *t == Some(e)).unwrap_or(usize::MAX);
             H(i, class_kind_of(kinds.get(i).copied().unwrap_or(-1)))
         };
-        let mut records = BTreeMap::new();
+        let mut records = solidcore::topology::topology::NotifyRecords::new();
         let mut attributes = AttributeStore::default();
         let mut env = solidcore::topology::edge::NotifyEnv {
             records: &mut records,
@@ -2804,7 +2805,7 @@ fn run_proto(
                     &mut output,
                 )
                 .map_err(|error| match error {
-                    SolidError::InvalidInput { operation, .. } => SolidError::Upstream {
+                    SolidError::InvalidInput { operation, .. } | SolidError::PortInvariant { operation, .. } => SolidError::Upstream {
                         operation,
                         code: solidcore::error::SM_ERR_INVALID_INPUT,
                         entity: None,
@@ -5089,7 +5090,7 @@ fn transform_status(res: solidcore::Result<()>) -> Result<f64, Fail> {
         Err(e) => match Output::unported(&e) {
             Some(d) => return Err(Fail::Deferred(Box::new(d))),
             None => match e {
-                SolidError::InvalidInput { .. } => 1007.0,
+                SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.0,
                 e => status(&e),
             },
         },

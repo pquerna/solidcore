@@ -42,6 +42,7 @@
 //! | [`FilletGeom::add_referenced_fillet_edgeuse`], [`FilletGeom::add_side_fillet_edgeuse`] | `AddReferencedFilletEdgeuse`, `AddSideFilletEdgeuse` |
 //! | [`FilletGeom::fillet_geom_type`], [`FilletGeom::fillet_solver`], [`FilletGeom::status`], [`FilletGeom::split_flag`], [`FilletGeom::fillet_edges`], [`FilletGeom::center_line_curve`], [`FilletGeom::center_line_geometry`], [`FilletGeom::fillet_surface`], [`FilletGeom::rail`] | `GetFilletGeomType`, `GetFilletSolver`, `GetStatus`, `GetSplitFlag`, `GetFilletEdges`, `GetCenterLineCurve`, `GetFilletSurface`, `GetRail` |
 //! | [`FilletGeom::offset_surface`], [`FilletGeom::set_offset_surface`] | `GetOffsetSurface`, `SetOffsetSurface` |
+//! | [`FilletSurfaceOwner`], [`FilletSurfaceStorage`] | the B-rep owning `m_pFilletSurface` once `MakeFaceBrep` transferred it to a face |
 //! | [`FilletBrep::rail_vertexuse`]                  | `SmFilletGeom::GetRailVertexuse`           |
 //! | [`FilletGeom::set_fillet_surface`], [`FilletGeom::set_fillet_geom_type`], [`FilletGeom::set_rail`] | `SetFilletSurface`, `SetFilletGeomType`, `SetRail` |
 //! | [`FilletBrep::trim_geom`]                       | `SmFilletGeom::Trim`                       |
@@ -101,6 +102,12 @@
 //!   solver's creation context; its status is ignored upstream, so a failed copy leaves
 //!   `NULL`, and only [`SolidError::Unported`] propagates). That constructor leaves `m_dOrientations` and `m_bCapped`
 //!   uninitialised; they start as `0.0` and `false` here.
+//! - **Transferred fillet surface.** After `MakeFaceBrep` the surface belongs to a face of
+//!   the intermediate fillet B-rep and upstream's `GetFilletSurface()` keeps returning the
+//!   pointer. [`FilletGeom::fillet_surface`] / [`FilletGeom::fillet_surface_mut`] take
+//!   that B-rep ([`FilletSurfaceOwner`]) and resolve the face's surface in it; callers
+//!   that run before any face is made pass `None`, and a transferred surface without
+//!   (or with another) owner is refused with `InvalidInput`.
 //! - **Arguments.** Out-params become return values; `SmContext` arguments are the
 //!   [`Kernel`]; `int iDebugLevel` arguments and debug drawing are dropped.
 //!   `sm_TwoPntsIntersection` takes the start and end *points* of its `SmVertex`
@@ -290,6 +297,20 @@ pub enum FilletErrorType {
     BadTrim = 6,
     /// `SM_FILERR_BAD_MERGE`.
     BadMerge = 7,
+    /// Not an upstream code (the pin's enum ends at `SM_FILERR_BAD_MERGE`). The "blend does not
+    /// fit its faces" refusal of the SolidCraft opt-ins (the `fixes.fillet_refuse_*` flags that
+    /// refuse a blend larger than its faces). Only those opt-ins record it; with them off the port
+    /// reports pin codes only.
+    NoRoom = 8,
+    /// `SM_FILERR_CORNER_UNSUPPORTED` (SolidCraft change, tangency-labs/smlib@a73cf5e): a
+    /// filleted vertex no `SmFilletCorner` type handles. This port keeps its existing codes
+    /// 0..=8 (pinned 0..=7 plus `NoRoom` = 8) and gives the new code 9; the fork's enum has
+    /// `SM_FILERR_NOT_EXACT` = 9 and its
+    /// `SM_FILERR_CORNER_UNSUPPORTED` = 10, but this port defines no `NOT_EXACT` code. It is
+    /// not the C API's `SMLIB_ERR_CORNER_UNSUPPORTED` (-1111), which is a capi status and has
+    /// no mapping here. Only `fixes.fillet_vertex_error_diagnostics` records it (#1469); with
+    /// it off the port reports pin codes only.
+    CornerUnsupported = 9,
 }
 
 /// `SmFilletCornerType`: the kind of corner where fillets meet.
@@ -1153,6 +1174,40 @@ pub enum FilletSurfaceStorage {
     },
 }
 
+/// The intermediate fillet B-rep that owns a transferred fillet surface, with the
+/// identity `MakeFaceBrep` recorded for it in [`FilletSurfaceStorage::ManagedFace`]
+/// (upstream reaches the face's surface through the retained pointer).
+#[derive(Debug, Clone, Copy)]
+pub struct FilletSurfaceOwner<B> {
+    /// The issued identity of `body` (`key_of(EntityRef::Brep(..))` at installation).
+    pub identity: crate::geom::object::ObjectRef,
+    /// The body (`&Brep` or `&mut Brep`).
+    pub body: B,
+}
+
+const OP_FILLET_SURFACE: &str = "blend::fillet_geom::fillet_surface";
+
+/// The owning body of a transferred surface recorded as `body`, or an error when the
+/// caller passed none or another body.
+fn managed_owner<B>(
+    owner: Option<FilletSurfaceOwner<B>>,
+    body: crate::geom::object::ObjectRef,
+) -> Result<B> {
+    let owner = owner.ok_or_else(|| {
+        SolidError::invalid_input(
+            OP_FILLET_SURFACE,
+            "transferred fillet surface needs its owning body",
+        )
+    })?;
+    if owner.identity != body {
+        return Err(SolidError::invalid_input(
+            OP_FILLET_SURFACE,
+            "fillet surface names a foreign managed body",
+        ));
+    }
+    Ok(owner.body)
+}
+
 /// The geometry of one fillet surface (`SmFilletGeom`): two rails, the optional centre
 /// line, the fillet surface and the records of the topology built on it.
 #[derive(Debug, Clone)]
@@ -1309,35 +1364,57 @@ impl FilletGeom {
         self.center_line_curve.as_ref()
     }
 
-    /// Borrow the original surface before it is transferred into a face.
+    /// `GetFilletSurface() != NULL`: whether the geometry has a fillet surface, owned
+    /// here or already transferred into a face (the pointer upstream keeps either way).
+    #[must_use]
+    pub const fn has_fillet_surface(&self) -> bool {
+        self.fillet_surface.is_some()
+    }
+
+    /// `GetFilletSurface()`: the fillet surface, owned here or, after `MakeFaceBrep`
+    /// transferred it, the surface of its face in the intermediate fillet B-rep.
+    ///
+    /// `owner` is that B-rep with the identity `MakeFaceBrep` recorded for it. Callers
+    /// that run before any face is made pass `None` (no owning body exists yet).
     ///
     /// # Errors
-    /// A transferred surface requires the actual owning body to resolve it.
-    pub fn fillet_surface(&self) -> Result<Option<&Surface>> {
+    /// [`SolidError::InvalidInput`] for a transferred surface when `owner` is `None` or
+    /// names another body; the face's own lookup errors, and `SM_ERR_NULL_POINTER` for a
+    /// face without a surface.
+    pub fn fillet_surface<'a>(
+        &'a self,
+        owner: Option<FilletSurfaceOwner<&'a Brep>>,
+    ) -> Result<Option<&'a Surface>> {
         match self.fillet_surface.as_ref() {
             None => Ok(None),
             Some(FilletSurfaceStorage::Owned(surface)) => Ok(Some(surface)),
-            // UNPORTED(blend.fillet_geom_p1): actual owning body is required after transfer.
-            Some(FilletSurfaceStorage::ManagedFace { .. }) => Err(SolidError::unported(
-                "SmFilletGeom::GetFilletSurface (managed face context)",
-                "blend.fillet_geom_p1",
-            )),
+            Some(FilletSurfaceStorage::ManagedFace { body, face }) => {
+                let owner = managed_owner(owner, *body)?;
+                Ok(Some(owner.face(*face)?.surface.as_ref().ok_or_else(
+                    || SolidError::null_pointer(OP_FILLET_SURFACE),
+                )?))
+            }
         }
     }
 
-    /// Mutably borrow the original surface before face installation.
+    /// `GetFilletSurface()` for writing: the surface owned here or, once transferred,
+    /// the surface of its face in `owner` (see [`Self::fillet_surface`]).
     ///
     /// # Errors
-    /// A transferred surface requires the actual owning body to resolve it.
-    pub fn fillet_surface_mut(&mut self) -> Result<Option<&mut Surface>> {
+    /// As [`Self::fillet_surface`].
+    pub fn fillet_surface_mut<'a>(
+        &'a mut self,
+        owner: Option<FilletSurfaceOwner<&'a mut Brep>>,
+    ) -> Result<Option<&'a mut Surface>> {
         match self.fillet_surface.as_mut() {
             None => Ok(None),
             Some(FilletSurfaceStorage::Owned(surface)) => Ok(Some(surface)),
-            // UNPORTED(blend.fillet_geom_p1): actual owning body is required after transfer.
-            Some(FilletSurfaceStorage::ManagedFace { .. }) => Err(SolidError::unported(
-                "SmFilletGeom::GetFilletSurface (managed face context)",
-                "blend.fillet_geom_p1",
-            )),
+            Some(FilletSurfaceStorage::ManagedFace { body, face }) => {
+                let owner = managed_owner(owner, *body)?;
+                Ok(Some(owner.face_mut(*face)?.surface.as_mut().ok_or_else(
+                    || SolidError::null_pointer(OP_FILLET_SURFACE),
+                )?))
+            }
         }
     }
 
@@ -1871,7 +1948,7 @@ impl FilletBrep {
                 CliffHandle::Curve(curve_3d),
                 CliffHandle::Surface(fillet_surface),
             ],
-            &fillet_surface.natural_uv_domain(),
+            &fillet_surface.natural_uv_domain_with_nurb(k)?,
             curve_3d,
             &ivl,
             this_approx_tol_3d,
@@ -2393,8 +2470,8 @@ impl FilletBrep {
         }
 
         // Fillet Surface:
-        if let Some(surface) = geom.fillet_surface_mut()? {
-            let mut domain = surface.natural_uv_domain();
+        if let Some(surface) = geom.fillet_surface_mut(None)? {
+            let mut domain = surface.natural_uv_domain_with_nurb(k)?;
             // Trimming is in the u-direction.
             let u_domain = domain.u_interval();
             let temp = u_domain
@@ -2455,7 +2532,8 @@ impl SolutionObject for CliffHandle<'_> {
     fn natural_uv_domain(&self) -> Option<Extent2d> {
         match self {
             Self::Curve(_) => None,
-            Self::Surface(s) => Some(s.natural_uv_domain()),
+            // (kernel-free: a lazy analytic answers its NURB-less base's empty domain)
+            Self::Surface(s) => Some(s.natural_uv_domain_if_built()),
         }
     }
 }
@@ -2483,7 +2561,8 @@ impl SolutionObject for SurfaceHandle<'_> {
     }
 
     fn natural_uv_domain(&self) -> Option<Extent2d> {
-        Some(self.0.natural_uv_domain())
+        // (kernel-free: a lazy analytic answers its NURB-less base's empty domain)
+        Some(self.0.natural_uv_domain_if_built())
     }
 }
 
@@ -2665,8 +2744,8 @@ pub fn two_pnts_intersection(
     tol_3d: f64,
 ) -> Result<PointIntersection> {
     // surface size locals
-    let domain1 = surf1.natural_uv_domain();
-    let domain2 = surf2.natural_uv_domain();
+    let domain1 = surf1.natural_uv_domain_with_nurb(k)?;
+    let domain2 = surf2.natural_uv_domain_with_nurb(k)?;
 
     let ssi_tol = tol_3d; // use caller-specified tol for SSI.
     let angle_tol = deg2rad(30.0);
@@ -3173,7 +3252,7 @@ pub fn adjust_uv_on_seam(
     ref_direction: Vec3,
     uv: &mut Point2,
 ) -> Result<()> {
-    let domain = surf.natural_uv_domain();
+    let domain = surf.natural_uv_domain_with_nurb(k)?;
     let min = domain.min();
     let max = domain.max();
 
@@ -3452,11 +3531,11 @@ pub fn examine_n_fix_fillet_geoms_with_solvers(
     {
         let surface1 = fb
             .geom(geom1)?
-            .fillet_surface()?
+            .fillet_surface(None)?
             .ok_or_else(|| SolidError::null_pointer(OP_EXAMINE))?;
         let surface2 = fb
             .geom(geom2)?
-            .fillet_surface()?
+            .fillet_surface(None)?
             .ok_or_else(|| SolidError::null_pointer(OP_EXAMINE))?;
         if surface1.degree_with_nurb(k, SurfParamType::U)? < 3
             || surface2.degree_with_nurb(k, SurfParamType::U)? < 3
@@ -3481,9 +3560,9 @@ pub fn examine_n_fix_fillet_geoms_with_solvers(
     {
         let surface = fb
             .geom(geom)?
-            .fillet_surface()?
+            .fillet_surface(None)?
             .ok_or_else(|| SolidError::null_pointer(OP_EXAMINE))?;
-        let domain = surface.natural_uv_domain();
+        let domain = surface.natural_uv_domain_with_nurb(k)?;
         let (uv1, uv2) = if at_start {
             (domain.evaluate(0.0, 0.0), domain.evaluate(0.0, 1.0))
         } else {
@@ -3529,7 +3608,7 @@ pub fn examine_n_fix_fillet_geoms_with_solvers(
     {
         let from_surface = fb
             .geom_mut(from_geom)?
-            .fillet_surface_mut()?
+            .fillet_surface_mut(None)?
             .ok_or_else(|| SolidError::null_pointer(OP_EXAMINE))?;
         let Some(bs) = b_spline_net_mut(from_surface) else {
             return Ok(());
@@ -3542,7 +3621,7 @@ pub fn examine_n_fix_fillet_geoms_with_solvers(
     {
         let to_surface = fb
             .geom_mut(to_geom)?
-            .fillet_surface_mut()?
+            .fillet_surface_mut(None)?
             .ok_or_else(|| SolidError::null_pointer(OP_EXAMINE))?;
         let Some(bs) = b_spline_net_mut(to_surface) else {
             return Ok(());
@@ -3586,9 +3665,9 @@ pub fn examine_n_fix_fillet_geoms_with_solvers(
     let (surf_domain, rails) = {
         let g = fb.geom(adjust_fg)?;
         let surface = g
-            .fillet_surface()?
+            .fillet_surface(None)?
             .ok_or_else(|| SolidError::null_pointer(OP_EXAMINE))?;
-        (surface.natural_uv_domain(), g.rails)
+        (surface.natural_uv_domain_with_nurb(k)?, g.rails)
     };
 
     for (kk, rail) in rails.into_iter().enumerate() {
@@ -3603,7 +3682,7 @@ pub fn examine_n_fix_fillet_geoms_with_solvers(
         let iso = {
             let surface = fb
                 .geom(adjust_fg)?
-                .fillet_surface()?
+                .fillet_surface(None)?
                 .ok_or_else(|| SolidError::null_pointer(OP_EXAMINE))?;
             surface.create_iso_parametric_curve(
                 k,
@@ -3833,7 +3912,7 @@ pub fn join_verts_by_capping(
     } else {
         ivl2.max()
     };
-    let domain = surface.natural_uv_domain();
+    let domain = surface.natural_uv_domain_with_nurb(k)?;
 
     // let sUV1 = UVTrimCurve1 UV endPoint
     let pnt = uv_curve1.evaluate_point(k, t_val1)?;
@@ -3903,7 +3982,8 @@ pub fn check_seam_out(surf: &Surface, uv: &mut Point2, tol: f64, closure: SurfPa
         return false;
     }
 
-    let dom = surf.natural_uv_domain();
+    // (kernel-free: a lazy analytic answers its NURB-less base's empty domain)
+    let dom = surf.natural_uv_domain_if_built();
 
     if dom.contains_point(*uv, tol) {
         return false;
@@ -3950,7 +4030,8 @@ pub fn check_seam_on(surf: &Surface, uv: &mut Point2, tol: f64, closure: SurfPar
         return false;
     }
 
-    let dom = surf.natural_uv_domain();
+    // (kernel-free: a lazy analytic answers its NURB-less base's empty domain)
+    let dom = surf.natural_uv_domain_if_built();
 
     let mut ret = false;
 
@@ -4097,7 +4178,7 @@ mod tests {
     fn surface_closure_of_an_open_patch_is_neither() {
         let k = &Kernel::default();
         let s = bilinear_patch();
-        let closure = set_surface_closure(k, &s, &s.natural_uv_domain()).unwrap();
+        let closure = set_surface_closure(k, &s, &s.natural_uv_domain_if_built()).unwrap();
         assert_eq!(closure, SurfParamType::Neither);
     }
 
@@ -4468,7 +4549,7 @@ mod tests {
         );
         // geometry 0's start row is now geometry 1's end row; its other rows are its own
         let near = |a: Point3, b: Point3| a.distance(b) < 1e-12;
-        let s0 = fb.geom(g0).unwrap().fillet_surface().unwrap().unwrap();
+        let s0 = fb.geom(g0).unwrap().fillet_surface(None).unwrap().unwrap();
         let at = |u: f64, v: f64| s0.evaluate_point(&k, Point2::new(u, v)).unwrap();
         assert!(near(at(0.0, 0.0), Point3::new(3.0, 0.0, 0.0)));
         assert!(near(at(0.0, 1.0), Point3::new(3.0, 2.0, 0.0)));
@@ -4531,5 +4612,86 @@ mod tests {
             [None, None],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn transferred_fillet_surface_resolves_in_its_owning_body() {
+        use crate::geom::attribute::ObjectKey;
+        use crate::geom::object::ObjectRef;
+        let k = Kernel::default();
+        let mut body = Brep::new_with_infinite_region().unwrap();
+        let shell = ShellId::from_index(0);
+        let face = body
+            .add_face_record(crate::topology::Face {
+                surface: Some(bilinear_patch()),
+                ..crate::topology::Face::new(shell)
+            })
+            .unwrap();
+        let identity = ObjectRef {
+            type_code: 1,
+            key: ObjectKey(7),
+        };
+        let mut g = FilletGeom::new(&k, None, FilletGeomType::Blends).unwrap();
+        g.set_fillet_surface(Some(bilinear_patch()));
+        // Before MakeFaceBrep the geometry owns the surface; no body is needed.
+        assert!(g.fillet_surface(None).unwrap().is_some());
+        g.fillet_surface = Some(FilletSurfaceStorage::ManagedFace {
+            body: identity,
+            face,
+        });
+        let installed = g
+            .fillet_surface(Some(FilletSurfaceOwner {
+                identity,
+                body: &body,
+            }))
+            .unwrap()
+            .unwrap();
+        assert!(core::ptr::eq(
+            installed,
+            body.face(face).unwrap().surface.as_ref().unwrap()
+        ));
+        for owner in [
+            None,
+            Some(FilletSurfaceOwner {
+                identity: ObjectRef {
+                    type_code: 1,
+                    key: ObjectKey(8),
+                },
+                body: &body,
+            }),
+        ] {
+            assert!(matches!(
+                g.fillet_surface(owner),
+                Err(SolidError::InvalidInput { .. })
+            ));
+        }
+        // Writes go to the face's surface.
+        let flat = Surface::from(crate::surface::plane::Plane::from_normal(
+            Vec3::ZERO,
+            Vec3::Z,
+        ));
+        *g.fillet_surface_mut(Some(FilletSurfaceOwner {
+            identity,
+            body: &mut body,
+        }))
+        .unwrap()
+        .unwrap() = flat;
+        assert!(matches!(
+            g.fillet_surface_mut(None),
+            Err(SolidError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            body.face(face).unwrap().surface.as_ref().unwrap().kind(),
+            SurfaceKind::Plane(_)
+        ));
+        // A face without a surface is upstream's NULL.
+        body.face_mut(face).unwrap().surface = None;
+        assert!(matches!(
+            g.fillet_surface(Some(FilletSurfaceOwner {
+                identity,
+                body: &body
+            })),
+            Err(SolidError::Upstream { .. })
+        ));
     }
 }

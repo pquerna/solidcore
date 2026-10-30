@@ -422,7 +422,7 @@ fn rust(i: &Inputs) -> Result<Rec, HarnessError> {
             // `new (ctx) SmBrep()`: the constructor makes the void infinite region the
             // face makers put the face in
             let mut brep = Brep::new_with_infinite_region().map_err(h)?;
-            let mut records = std::collections::BTreeMap::new();
+            let mut records = solidcore::topology::topology::NotifyRecords::new();
             let mut attributes = solidcore::geom::attribute::AttributeStore::default();
             // distinct identities for the face makers' notifications, keyed as the
             // face reference make_face_brep passes (faces from 1)
@@ -456,8 +456,8 @@ fn rust(i: &Inputs) -> Result<Rec, HarnessError> {
         }
         Query::Blending { g } => {
             let gid = rm.geom(*g)?;
-            let target = rm.target.clone();
-            let r = rm.fb.calc_blending_geom(&k, gid, &solvers, &target);
+            let mut target = rm.target.clone();
+            let r = rm.fb.calc_blending_geom(&k, gid, &solvers, &mut target);
             o.push(status_of!(r));
         }
     }
@@ -531,7 +531,8 @@ pub(crate) fn gen_analytic(rng: &mut Rng, scale: f64) -> AnalyticSrf {
 
 /// The UV point at fractions `(a, b)` of the surface's domain and its 3D point.
 fn on_surface(k: &Kernel, s: &Surface, a: f64, b: f64) -> Option<[f64; 3]> {
-    let d = s.natural_uv_domain();
+    // (runner helper that does not return Result)
+    let d = s.natural_uv_domain_if_built();
     s.evaluate_point(k, d.evaluate(a, b)).ok().map(v3a)
 }
 

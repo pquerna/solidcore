@@ -21,10 +21,8 @@ use crate::surface::surface::Surface;
 use crate::surface::volume::Volume;
 use crate::topology::brep::p3::topology_ref;
 use crate::topology::proto_topology::p1::{ProtoGeometry, ProtoTopology};
-use crate::topology::topology::Topology;
 use crate::topology::{Brep, BrepId, FaceId};
 use crate::{EntityRef, Result, SolidError};
-use std::collections::BTreeMap;
 
 const OP: &str = "blend::fillet_executive::insertion_geometry";
 fn invalid(reason: &'static str) -> SolidError {
@@ -146,7 +144,7 @@ impl BodyKeys<'_> {
 /// Actual retained edit stores and the already lent notification context.
 pub struct InsertionNotifications<'a> {
     /// Actual topology notification records.
-    pub records: &'a mut BTreeMap<ObjectKey, Topology>,
+    pub records: &'a mut crate::topology::topology::NotifyRecords,
     /// Actual attributes, including executive E and active face markers.
     pub attributes: &'a mut AttributeStore,
     /// Actual context lease, supplied by `with_lent_context`.
@@ -239,6 +237,25 @@ impl<'a> InsertionGeometry<'a> {
         Ok(FilletObject::InsertionCurve(
             curves.insert(notifications.context, curve)?,
         ))
+    }
+    /// Free a temporary curve copy an intersector call reported for deletion
+    /// ([`InsertionCurves::destroy`] in the operation's notification domain).
+    /// # Errors
+    /// Not an operation-owned curve handle, missing edit stores, or those of
+    /// [`InsertionCurves::destroy`].
+    pub fn destroy_curve_copy(&mut self, curve: FilletObject) -> Result<()> {
+        let FilletObject::InsertionCurve(binding) = curve else {
+            return Err(invalid("deleted curve is not an operation-owned copy"));
+        };
+        let notifications = self
+            .notifications
+            .as_mut()
+            .ok_or_else(|| invalid("missing insertion notification context"))?;
+        let curves = self
+            .curves
+            .as_mut()
+            .ok_or_else(|| invalid("missing insertion curve ownership"))?;
+        curves.destroy(notifications.context, notifications.attributes, binding)
     }
     /// Run one edit against the actual body and retained notification stores.
     /// # Errors
@@ -634,7 +651,14 @@ impl<'a> InsertionGeometry<'a> {
     /// Missing original Surface, or an owner no insertion body resolves to one
     /// entity.
     pub fn surface_face(&self, binding: SurfaceBinding) -> Result<Option<FilletObject>> {
-        let Some(owner) = self.bound_surface(binding)?.owner() else {
+        self.face_slot_surface_face(self.bound_surface(binding)?)
+    }
+    /// `SmSurface::GetFace()` of a surface held in an insertion body's face slot (a
+    /// bound original or a face's current surface).
+    /// # Errors
+    /// An owner no insertion body resolves to one entity.
+    fn face_slot_surface_face(&self, surface: &Surface) -> Result<Option<FilletObject>> {
+        let Some(owner) = surface.owner() else {
             return Ok(None);
         };
         match self.owner_binding(owner) {
@@ -1053,9 +1077,8 @@ mod tests {
             .as_mut()
             .unwrap()
             .set_owner(Some(foreign), None);
-        assert!(TopologyObjects::curve_edge(&view, curve)
-            .unwrap_err()
-            .is_unported());
+        // Not an edge, curve or edge use: SmCurve::GetEdge's walk stops (NULL).
+        assert_eq!(TopologyObjects::curve_edge(&view, curve).unwrap(), None);
         assert_eq!(
             ClassGeometry::curve(&view, curve).unwrap().owner(),
             Some(foreign)
@@ -1185,7 +1208,7 @@ mod tests {
         let caller = topology_ref(serial, EntityRef::Vertex(vertex));
         let changed = Point3::new(17.0, 18.0, 19.0);
         let mut curves = InsertionCurves::default();
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = AttributeStore::default();
         let events = Arc::new(Mutex::new(Vec::new()));
         k.context
@@ -1263,7 +1286,7 @@ mod tests {
             intermediate.notify_serial(),
         ];
         let mut curves = InsertionCurves::default();
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = AttributeStore::default();
         let result = InsertionGeometry::new(&mut target, &mut pseudo, &mut intermediate)
             .unwrap()
@@ -1408,7 +1431,7 @@ mod tests {
             .surface
             .as_ref()
             .unwrap()
-            .natural_uv_domain()
+            .natural_uv_domain_if_built()
             .min();
         let face_handle = FilletObject::Topology(FilletBody::Target, EntityRef::Face(face));
         let mut geometry =
@@ -1456,7 +1479,7 @@ mod tests {
         let mut pseudo = FilletBrep::new();
         *pseudo.brep_mut() = box_at(&mut k, 200.0);
         let mut curves = InsertionCurves::default();
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = AttributeStore::default();
         crate::topology::brep::p3::with_lent_context(&mut k, |k, context| -> Result<()> {
             let mut view = InsertionGeometry::new(&mut target, &mut pseudo, &mut intermediate)?

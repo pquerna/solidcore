@@ -57,7 +57,9 @@ use crate::EntityRef;
 mod arena_pair;
 mod kernel_adapter;
 mod notification_keys;
-pub(crate) use kernel_adapter::{adopt_namespace_owners, notification_key};
+pub(crate) use kernel_adapter::{
+    adopt_namespace_owners, entity_of_notification_key, notification_key,
+};
 pub use kernel_adapter::{KernelManifoldIntersector, ManifoldKernelAdapter};
 pub use notification_keys::ManifoldNotificationKeys;
 
@@ -275,6 +277,7 @@ pub trait ManifoldIntersector {
         &mut self,
         kernels: &mut BooleanKernels<'_>,
         primary: &mut Brep,
+        attributes: &mut AttributeStore,
         state: &ManifoldState,
         check_all_edges: bool,
     ) -> Result<()>;
@@ -299,11 +302,13 @@ pub trait ManifoldIntersector {
     fn clear_topology_deleted(&mut self);
     /// Current `m_bTopologyDeleted`, including changes during a failed close.
     fn topology_deleted(&self) -> bool;
-    /// `CloseIntersectionLoop(pVertex,bMadeNewTopology)`. The callgraph omits
-    /// this live callee; it is co-ported into `boolean.topology_intersector_p2`
+    /// `CloseIntersectionLoop(pVertex,bMadeNewTopology,sDelVerts,sDelEdges)`. The
+    /// callgraph omits this live callee; it is co-ported into
+    /// `boolean.topology_intersector_p2`
     /// (`TopologyIntersector::close_intersection_loop`). `made_new_topology` is
-    /// written only on success. Topology it inserts notifies through `attributes`.
-    /// The retry/cleanup tail stays at the call site.
+    /// written only on success. `deleted` receives the primary vertices and edges its
+    /// intersections deleted, also when it fails. Topology it inserts notifies through
+    /// `attributes`. The retry/cleanup tail stays at the call site.
     fn close_intersection_loop(
         &mut self,
         kernels: &mut BooleanKernels<'_>,
@@ -312,6 +317,7 @@ pub trait ManifoldIntersector {
         attributes: &mut AttributeStore,
         vertex: VertexId,
         made_new_topology: &mut bool,
+        deleted: &mut (Vec<VertexId>, Vec<EdgeId>),
     ) -> Result<()>;
     /// `FixGaps(sSingleVertices,bModifiedTopology,sDelVerts,sDelEdges)`.
     fn fix_gaps(
@@ -516,14 +522,25 @@ fn mark_common(
             }
             let mut made = false;
             intersector.clear_topology_deleted();
-            if manifold
-                && ignored(
-                    intersector
-                        .close_intersection_loop(kernels, primary, other, attributes, v, &mut made),
-                )?
-                .is_none()
-            {
-                made = false;
+            if manifold {
+                // This could delete entities in our stored pointers:
+                let mut deleted = (Vec::new(), Vec::new());
+                let status = ignored(intersector.close_intersection_loop(
+                    kernels,
+                    primary,
+                    other,
+                    attributes,
+                    v,
+                    &mut made,
+                    &mut deleted,
+                ));
+                state
+                    .intersection_vertices
+                    .retain(|x| !deleted.0.contains(x));
+                state.intersection_edges.retain(|x| !deleted.1.contains(x));
+                if status?.is_none() {
+                    made = false;
+                }
             }
             if made || intersector.topology_deleted() {
                 done = false;
@@ -1427,7 +1444,7 @@ fn editing_stages(
                 | BooleanOperation::Slice
         )
     {
-        intersector.post_process(kernels, primary, state, false)?;
+        intersector.post_process(kernels, primary, attributes, state, false)?;
     }
     Ok(false)
 }
@@ -1678,7 +1695,7 @@ fn manifold_boolean_translated(
         if let Some(a) = primary.as_mut() {
             let editing = a.editing_enabled();
             a.set_editing_enabled(true);
-            let mut records = std::collections::BTreeMap::new();
+            let mut records = crate::topology::topology::NotifyRecords::new();
             let mut env = edge::NotifyEnv {
                 records: &mut records,
                 attributes: &mut *attributes,

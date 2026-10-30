@@ -678,7 +678,13 @@ impl shell::RegionLookup for BrepRegions<'_> {
                 });
             }
         }
-        // UNPORTED(topology.shell): SmRegion::GetBrep of a region outside the notifying B-rep
+        // UNPORTED(topology.shell): SmRegion::GetBrep of a region outside the notifying B-rep.
+        // Needs a cross-B-rep lookup (design change). Upstream `SmRegion::GetBrep` follows the region's own pointer into any B-rep, but this
+        // lookup borrows only the notifying one. The handlers reach regions through
+        // this lookup only for the regions of the merge/split being notified, which
+        // all belong to the notifying B-rep; the boolean propagation path resolves
+        // regions of both operands through the caller-supplied lookup instead
+        // (`boolean::merge::p1`). Covered by `brep_regions_lookup_defers_foreign_key`.
         Err(SolidError::unported("SmRegion::GetBrep", "topology.shell"))
     }
 }
@@ -709,7 +715,7 @@ pub fn region_only_key(e: EntityRef) -> ObjectRef {
 #[derive(Debug, Default)]
 pub struct RegionNotifyState {
     /// The regions' `SmTopology` records.
-    pub records: BTreeMap<ObjectKey, Topology>,
+    pub records: crate::topology::topology::NotifyRecords,
     /// The (empty) attribute store.
     pub attributes: AttributeStore,
 }
@@ -757,7 +763,7 @@ impl RegionNotifyState {
 #[derive(Debug, Default)]
 pub struct ArenaNotifyState {
     /// Each object's default `SmTopology` record.
-    pub records: BTreeMap<ObjectKey, Topology>,
+    pub records: crate::topology::topology::NotifyRecords,
     /// The (empty) attribute store.
     pub attributes: AttributeStore,
 }
@@ -795,7 +801,7 @@ impl ArenaNotifyState {
             return;
         }
         for e in all {
-            self.records.entry(notify_ref(e).key).or_default();
+            self.records.or_default(notify_ref(e).key);
         }
     }
 
@@ -1595,8 +1601,16 @@ pub fn replace_surface(
     };
     // calls SmFace::Notify(SM_NO_CHANGE_GEOMETRY, ..) which tells all Face SmEdgeuses
     // and SmVertexuses to delete all their cached data
-    let old_surface =
-        face1::set_surface_notified(b, env, top_face, face_ref, new_surface, false, surface_refs)?;
+    let old_surface = face1::set_surface_notified(
+        k,
+        b,
+        env,
+        top_face,
+        face_ref,
+        new_surface,
+        false,
+        surface_refs,
+    )?;
 
     // default faceDomain to NewSurface Domain
     face2::set_uv_domain(b, top_face, &new_domain)?;
@@ -1912,7 +1926,7 @@ fn region_post_insert_shell(b: &mut Brep, r: RegionId, s: ShellId) -> Result<()>
 fn region_remove_shell(b: &mut Brep, s: ShellId) -> Result<()> {
     let r = shell_region(b, s)?.ok_or(null_deref("shell without region"))?;
     match shell::region_remove_shell(b, r, s) {
-        Err(SolidError::InvalidInput { .. }) | Ok(()) => Ok(()),
+        Err(SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }) | Ok(()) => Ok(()),
         Err(e) => Err(e),
     }
 }
@@ -2010,7 +2024,8 @@ pub struct MergedCurves {
 }
 
 /// `MergeCurvesOnSurface`: merges the 3D `curves` (with optional UV curves
-/// `uv_curves`, used on the first face only) lying on the surface of `face` into the
+/// `uv_curves`, one entry per curve, `None` for upstream's null entry; used on the first
+/// face only) lying on the surface of `face` into the
 /// face, splitting it (and the faces split off it) into new faces. Curves shorter than
 /// `tolerance` are skipped. Each curve is classified against each face
 /// in place ([`curve_on_classify_mut`]), coincident-maybe intervals are squeezed, the
@@ -2034,7 +2049,7 @@ pub fn merge_curves_on_surface<O: ClassObject + Copy>(
     face: FaceId,
     tolerance: f64,
     curves: &[O],
-    uv_curves: Option<&[O]>,
+    uv_curves: Option<&[Option<O>]>,
     options: MergeCurvesOptions<O>,
 ) -> Result<MergedCurves> {
     // check state - m_bEditingEnabled must be on
@@ -2056,7 +2071,7 @@ fn merge_curves_body<O: ClassObject + Copy>(
     face: FaceId,
     tolerance: f64,
     curves: &[O],
-    uv_curves: Option<&[O]>,
+    uv_curves: Option<&[Option<O>]>,
     options: MergeCurvesOptions<O>,
 ) -> Result<MergedCurves> {
     let mut out = MergedCurves::default();
@@ -2084,7 +2099,7 @@ fn merge_curves_body<O: ClassObject + Copy>(
 
             // on first face iter - get UVCurve if given
             let uv_curve = match (uv_curves, jj) {
-                (Some(uv), 0) => Some(*uv.get(ii).ok_or(null_deref("missing UV curve"))?),
+                (Some(uv), 0) => *uv.get(ii).ok_or(null_deref("missing UV curve"))?,
                 _ => None,
             };
 
@@ -2795,6 +2810,32 @@ mod tests {
         (b, v, e, f)
     }
 
+    /// A region key that is no region of the notifying B-rep stays unresolved
+    /// (the documented gap of [`BrepRegions`]); a region of the B-rep resolves.
+    #[test]
+    fn brep_regions_lookup_defers_foreign_key() {
+        use crate::topology::loopuse::notify_ref;
+        use shell::RegionLookup;
+        let (b, _, _, _) = brep();
+        let key_of = |e: EntityRef| notify_ref(e);
+        let lookup = BrepRegions {
+            b: &b,
+            key_of: &key_of,
+        };
+        for (id, _) in b.regions().iter() {
+            let k = notify_ref(EntityRef::Region(id)).key;
+            assert!(lookup.resolve_region(k).is_ok());
+        }
+        let foreign = notify_ref(EntityRef::Region(RegionId::from_index(99))).key;
+        assert!(matches!(
+            lookup.resolve_region(foreign),
+            Err(SolidError::Unported {
+                unit: "topology.shell",
+                ..
+            })
+        ));
+    }
+
     /// The region keys of a [`RegionNotifyState`] are arena identities: the heal path's
     /// tracker (`entity_of_notify_key`, the inverse of `notify_ref`) decodes a split's
     /// regions back to themselves for every index (a bare index decoded region `r >= 1`
@@ -2916,7 +2957,7 @@ mod tests {
     #[test]
     fn notify_without_cache_only_propagates() {
         let (b, _, e, _) = brep();
-        let mut records = BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attrs = AttributeStore::default();
         let key_of = |x: EntityRef| ObjectRef {
             type_code: 0,

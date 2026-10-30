@@ -293,7 +293,12 @@ fn curve_of<O: Copy>(geometry: &impl ClassGeometry<O>, o: Option<O>) -> Result<&
 /// A status upstream ignores, except the errors that cannot be ignored here: unported
 /// callees and undefined behaviour upstream.
 fn ignore_soft<T>(r: Result<T>) -> Result<()> {
-    if let Err(e @ (SolidError::Unported { .. } | SolidError::InvalidInput { .. })) = r {
+    if let Err(
+        e @ (SolidError::Unported { .. }
+        | SolidError::InvalidInput { .. }
+        | SolidError::PortInvariant { .. }),
+    ) = r
+    {
         return Err(e);
     }
     Ok(())
@@ -767,7 +772,14 @@ pub fn find_ed_on_degen_face<O: Copy + PartialEq>(
     // Degenerate face has 2 edges within tol of edge on other brep
     if let Some(face) = common.first() {
         let _ = face;
-        // UNPORTED(topology.face_p4): SmFace::GetEdges
+        // UNPORTED(topology.face_p4): SmFace::GetEdges, then SmBrep::DeleteFace(pFace,
+        // FALSE, TRUE, &sTopos)
+        // Proof (unreachable): the only caller, `CanCombineEdgeDefinitions`, gets here
+        // with two different edges of one B-rep, which `sm_AreConnected` (no edge-edge
+        // case, upstream and `are_connected`) reports unconnected, so it has already
+        // returned 0. Upstream's `DeleteFace` without `bDeleteEdgesVertices` also leaves
+        // `sTopos` empty, so even a reached call would answer 0 (its only effect being
+        // the face deletion).
         return Err(SolidError::unported("SmFace::GetEdges", "topology.face_p4"));
     }
 
@@ -782,7 +794,11 @@ pub fn find_ed_on_degen_face<O: Copy + PartialEq>(
 fn degen_face_choice(r: Result<u64>) -> Result<u64> {
     match r {
         Ok(n) => Ok(n),
-        Err(e @ (SolidError::Unported { .. } | SolidError::InvalidInput { .. })) => Err(e),
+        Err(
+            e @ (SolidError::Unported { .. }
+            | SolidError::InvalidInput { .. }
+            | SolidError::PortInvariant { .. }),
+        ) => Err(e),
         Err(_) => Ok(0),
     }
 }
@@ -1540,8 +1556,8 @@ impl<O: ClassObject> EdgeDefinition<O> {
 
     /// Whether `position` is an interior point of the definition near its start (or
     /// end) (`IsInteriorPoint`): farther than `tol` from that end, dropping onto the
-    /// 3d curve (minimising, guessed at that end) in that half of the interval, with
-    /// the drop point farther than `tol` from the end. The parameter is the drop
+    /// 3d curve (minimising, guessed at that end) within `tol` of it, in that half of
+    /// the interval, with the drop point farther than `tol` from the end. The parameter is the drop
     /// parameter when the result is `true` (or the end parameter when the position
     /// is at the end).
     ///
@@ -1585,6 +1601,14 @@ impl<O: ClassObject> EdgeDefinition<O> {
         };
         param = d.parameter;
         if !d.success {
+            return Ok((false, param));
+        }
+
+        // SM_SO_MINIMIZE succeeds for any converged closest point, however far away.
+        // A true result lets UpdateEdges() trim this EdgeDef to the parameter, so the
+        // position must actually lie on the curve. (`!(dDropDist <= sTol3d)`: a NaN
+        // distance is rejected.)
+        if d.distance.is_nan() || d.distance > tol {
             return Ok((false, param));
         }
 
@@ -1832,6 +1856,11 @@ impl ProtoEdge {
     #[must_use]
     pub fn coinc_proto_faces(&self) -> &[ProtoFaceId] {
         &self.coinc_pfs
+    }
+
+    /// The coincident proto faces, for the edits upstream makes to `m_sCoincPFs`.
+    pub fn coinc_proto_faces_mut(&mut self) -> &mut Vec<ProtoFaceId> {
+        &mut self.coinc_pfs
     }
 
     /// Sets the interval (`SetXSectInterval`).
@@ -2086,8 +2115,10 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         self.split_self_loops_on_vertices = split;
     }
 
-    /// The destructor `~SmProtoTopologyManager`: deletes the listed proto faces,
-    /// then the listed proto edges (with their edge definitions, which delete the
+    /// The destructor `~SmProtoTopologyManager`: first cuts the links between the
+    /// listed proto edges and proto vertices (each listed edge's ends are cleared and
+    /// each listed vertex's edge list emptied, so no destructor below unlists across
+    /// them), then deletes the listed proto faces, then the listed proto edges (with their edge definitions, which delete the
     /// curves they own), then the listed proto vertices (with their vertex
     /// definitions). Returns the curve handles deleted. References to objects
     /// already deleted (a use after free upstream) are skipped. Objects that are not
@@ -2095,6 +2126,21 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
     /// the manager); the manager must not be used for anything else afterwards.
     #[must_use]
     pub fn destroy(&mut self) -> Vec<O> {
+        // Cut the ProtoVertex <-> ProtoEdge links first: a ProtoVertex can still list a
+        // ProtoEdge that has moved to another ProtoVertex, and its destructor would then
+        // write into a deleted ProtoEdge.
+        for &pe in &self.pes {
+            if let Some(Some(e)) = self.pe_store.get_mut(pe.0 as usize) {
+                e.set_start_proto_vertex(None);
+                e.set_end_proto_vertex(None);
+            }
+        }
+        for &pv in &self.pvs {
+            if let Some(Some(v)) = self.pv_store.get_mut(pv.0 as usize) {
+                v.proto_edges_mut().clear();
+            }
+        }
+
         let mut deleted = Vec::new();
         for pf in std::mem::take(&mut self.pfs) {
             if let Some(slot) = self.pf_store.get_mut(pf.0 as usize) {
@@ -3527,9 +3573,11 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         let split_pt =
             match self.proto_edge_evaluate(k, geometry, orig_pe, split_param, true, false) {
                 Ok((Some(p), _)) => p,
-                Err(e @ (SolidError::Unported { .. } | SolidError::InvalidInput { .. })) => {
-                    return Err(e)
-                }
+                Err(
+                    e @ (SolidError::Unported { .. }
+                    | SolidError::InvalidInput { .. }
+                    | SolidError::PortInvariant { .. }),
+                ) => return Err(e),
                 _ => Vec3::UNDEF,
             };
 

@@ -4,7 +4,9 @@
 //! The C++ side builds a real `SmBrep` per call with the shared topology fixture (an
 //! upstream `.smb` file, a wire edge, a one-face B-rep or the `my_test_topology` wire
 //! network), replaces analytic geometry by plain B-spline copies, and runs one
-//! `SmBrep` member. The Rust side imports the graph the shim exports (the
+//! `SmBrep` member. The Rust side builds a wire edge, face or network source itself
+//! ([`crate::own_builder`] under this shim's conventions: lists registered first, its
+//! own owner identities). For an `.smb` file it imports the graph the shim exports (the
 //! `topology.vertexuse` importer), restores what the import cannot carry (the B-rep
 //! tolerance, infinite region, region list head, editing flag and each vertex's vertex
 //! use order, from the shim's `Extras`), runs the port and writes the same output
@@ -703,7 +705,7 @@ fn run_rust_op(k: &mut Kernel, b: &mut Brep, op: Op, a: &[f64]) -> Result<Vec<f6
                 0 => status(bp2::make_shell_vertex_topology(b, region))?.0,
                 1 => status(bp2::make_edge_vertex_topology(b, region, v1))?.0,
                 _ => {
-                    let mut records = BTreeMap::new();
+                    let mut records = solidcore::topology::topology::NotifyRecords::new();
                     let mut attrs = AttributeStore::default();
                     let mut env = NotifyEnv {
                         records: &mut records,
@@ -770,7 +772,7 @@ fn run_rust_op(k: &mut Kernel, b: &mut Brep, op: Op, a: &[f64]) -> Result<Vec<f6
             let surf = surface_arg(a, 1)?;
             let ext = arg(a.len() - 2)?;
             let uv = arg(a.len() - 1)?;
-            let mut records = BTreeMap::new();
+            let mut records = solidcore::topology::topology::NotifyRecords::new();
             let mut attrs = AttributeStore::default();
             let mut env = NotifyEnv {
                 records: &mut records,
@@ -799,7 +801,7 @@ fn run_rust_op(k: &mut Kernel, b: &mut Brep, op: Op, a: &[f64]) -> Result<Vec<f6
             }
             // every notified object, the B-rep included (it is a topology object
             // upstream: `this` and possibly a data object), has its default record
-            let mut records = BTreeMap::new();
+            let mut records = solidcore::topology::topology::NotifyRecords::new();
             records.insert(
                 bp2::brep_ref(b).key,
                 solidcore::topology::topology::Topology::default(),
@@ -859,7 +861,7 @@ fn run_rust_op(k: &mut Kernel, b: &mut Brep, op: Op, a: &[f64]) -> Result<Vec<f6
                 _ => bp2::OldSurface::Keep,
             };
             let create = arg(a.len() - 1)? != 0.0;
-            let mut records = BTreeMap::new();
+            let mut records = solidcore::topology::topology::NotifyRecords::new();
             let mut attrs = AttributeStore::default();
             let mut env = NotifyEnv {
                 records: &mut records,
@@ -967,16 +969,77 @@ fn surface_arg(a: &[f64], at: usize) -> Result<Surface, Fail> {
     Ok(rust_surface(&SrfIn::Bspline(b))?)
 }
 
+/// The surface and curve owners of the `topology.brep_p2` Rust B-rep: this runner's
+/// identities ([`key_of`]).
+fn face_owner(f: FaceId) -> ObjectRef {
+    key_of(EntityRef::Face(f))
+}
+
+fn edgeuse_owner(eu: EdgeuseId) -> ObjectRef {
+    key_of(EntityRef::Edgeuse(eu))
+}
+
+fn edge_owner(e: EdgeId) -> (ObjectRef, ObjectRef) {
+    (
+        key_of(EntityRef::Edge(e)),
+        key_of(EntityRef::Brep(BrepId::from_index(0))),
+    )
+}
+
+/// The shim's build conventions (`sc_topology_fixture.h`, its `run`): the face, edge
+/// and vertex lists registered before the traversal, `GetVertexEdgeGap` in the
+/// `init_gaps` walk.
+const CONVENTIONS: crate::own_builder::Conventions<'static> = crate::own_builder::Conventions {
+    prefix_lists: true,
+    vertex_edge_gaps: true,
+    vertex_lists_last: false,
+    skip_edge_list: false,
+    face_owner: &face_owner,
+    edge_owner: &edge_owner,
+    edgeuse_owner: &edgeuse_owner,
+};
+
+/// The Rust B-rep of the case and its entity counts, or the build failure's output:
+/// shim-built sources are built by the Rust kernel ([`crate::own_builder`], the
+/// shim's `editing` flag applied after); `.smb` files are imported from the shim's
+/// export ([`rust_brep`]).
+fn own_brep(k: &mut Kernel, i: &Inputs) -> Result<Result<(Brep, [usize; 10]), Output>, HarnessError> {
+    use crate::own_builder::{build_with, build_status, counts, Built};
+    let src: super::topology_edgeuse_p1::BrepIn = serde_json::to_value(&i.brep)
+        .and_then(serde_json::from_value)
+        .map_err(|e| harness(format!("B-rep source: {e}")))?;
+    match build_with(k, &src, i.validate_only, i.init_gaps, &CONVENTIONS)? {
+        Some(Built::Brep(b)) => {
+            let mut b = *b;
+            if i.editing >= 0 {
+                b.set_editing_enabled(i.editing != 0);
+            }
+            let c = counts(&b);
+            Ok(Ok((b, c)))
+        }
+        Some(Built::Failed(e)) => match Output::unported(&e) {
+            Some(o) => Ok(Err(o)),
+            None => Ok(Err(Output::new().values("out", vec![-1.0, build_status(&e)]))),
+        },
+        None => {
+            let (path, h, c) = match prepare(i)? {
+                Ok(x) => x,
+                Err(o) => return Ok(Err(o)),
+            };
+            Ok(Ok((rust_brep(&path, &h, &c)?, c)))
+        }
+    }
+}
+
 fn run_rust(i: &Inputs) -> Result<Output, HarnessError> {
-    let (path, h, c) = match prepare(i)? {
+    let mut k = Kernel::default();
+    let (mut b, c) = match own_brep(&mut k, i)? {
         Ok(x) => x,
         Err(o) => return Ok(o),
     };
     let Some((op, args)) = op_args(&i.op, &c)? else {
         return Ok(Output::err("no target"));
     };
-    let mut b = rust_brep(&path, &h, &c)?;
-    let mut k = Kernel::default();
     if let OpIn::Merge { curves, tol, .. } = &i.op {
         let face = FaceId::from_index(args.first().copied().unwrap_or(0.0) as u32);
         return merge_rust(&mut k, &mut b, face, curves, *tol);
@@ -1074,10 +1137,10 @@ fn merge_ssi_rust(
         .iter()
         .map(|c| rust_curve(c).map(SmCurve::from))
         .collect::<Result<_, _>>()?;
-    let uv: Option<Vec<SmCurve>> = uv_curves
+    let uv: Option<Vec<Option<SmCurve>>> = uv_curves
         .map(|uv| {
             uv.iter()
-                .map(|c| rust_curve(c).map(SmCurve::from))
+                .map(|c| rust_curve(c).map(|c| Some(SmCurve::from(c))))
                 .collect::<Result<_, _>>()
         })
         .transpose()?;

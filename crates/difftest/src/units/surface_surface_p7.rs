@@ -668,7 +668,7 @@ pub(crate) fn req_of(v: u8) -> Result<SolutionRequested, HarnessError> {
 /// cannot return.
 pub(crate) fn status(e: &SolidError) -> f64 {
     match e {
-        SolidError::InvalidInput { .. } => 1007.0,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.0,
         SolidError::Upstream { code, .. } => f64::from(*code),
         _ => -1.0,
     }
@@ -745,7 +745,8 @@ fn surface_handle(id: u8, s: &Surface) -> Handle {
     Handle {
         id,
         interval: None,
-        domain: Some(s.natural_uv_domain()),
+        // (runner helper without a kernel in scope)
+        domain: Some(s.natural_uv_domain_if_built()),
     }
 }
 
@@ -1095,7 +1096,7 @@ fn rust_run(k: &Kernel, i: &Inputs) -> Result<Vec<f64>, Fail> {
                 .collect();
             let cur = Curve::new(pw, curve.p, curve.u.clone())
                 .map_err(|e| harness(format!("curve input: {e}")))?;
-            let bc = BSplineCurve::from_nurb(cur, curve.dim, false);
+            let bc = SmCurve::from(BSplineCurve::from_nurb(cur, curve.dim, false));
             let k = Kernel::default();
             match st(s.create_parallel_projection_curves(&k, &dom_of(*dom), &bc, v3(*vec), *dist, None, None))? {
                 Ok((c3d, _)) => o.extend([0.0, c3d.len() as f64]),
@@ -1366,7 +1367,8 @@ pub(crate) fn natural(s: &SrfIn) -> [f64; 4] {
         SrfIn::Plane { .. } | SrfIn::Revolution { .. } => {
             let d = surface_of(s).map_or_else(
                 |_| Extent2d::from_points(Point2::new(0.0, 0.0), Point2::new(1.0, 1.0)),
-                |x| x.natural_uv_domain(),
+                // (runner helper without a kernel in scope)
+                |x| x.natural_uv_domain_if_built(),
             );
             [d.min().x, d.min().y, d.max().x, d.max().y]
         }

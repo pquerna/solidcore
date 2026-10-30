@@ -829,9 +829,11 @@ pub fn make_faceuse_attempt_with(
                 None,
             ) {
                 Ok(sector) => sector.radial_edgeuse,
-                Err(e @ (SolidError::Unported { .. } | SolidError::InvalidInput { .. })) => {
-                    return Err(e)
-                }
+                Err(
+                    e @ (SolidError::Unported { .. }
+                    | SolidError::InvalidInput { .. }
+                    | SolidError::PortInvariant { .. }),
+                ) => return Err(e),
                 Err(_) => None,
             };
             // add the classified radial sector's Edgeuse to the sFaceEdgeuses list
@@ -1373,7 +1375,11 @@ fn null_first<O: PartialEq + Copy>(list: &mut [Option<O>], item: O) {
 fn ignore_soft<T>(r: Result<T>) -> Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
-        Err(e @ (SolidError::Unported { .. } | SolidError::InvalidInput { .. })) => Err(e),
+        Err(
+            e @ (SolidError::Unported { .. }
+            | SolidError::InvalidInput { .. }
+            | SolidError::PortInvariant { .. }),
+        ) => Err(e),
         Err(_) => Ok(None),
     }
 }
@@ -2176,7 +2182,7 @@ mod tests {
             key: ObjectKey(4_000_000),
             type_code: crate::topology::face::p2::TYPE,
         };
-        let mut records = std::collections::BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let source = ObjectRef {
             key: ObjectKey(3_000_000),
             type_code: edge::TYPE,
@@ -2293,7 +2299,7 @@ mod tests {
     fn null_edgeuse_merges_nothing() {
         let mut brep = Brep::new();
         let mut other = Brep::new();
-        let mut records = std::collections::BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = crate::geom::attribute::AttributeStore::new();
         let key = |_: VertexId| ObjectRef {
             key: crate::geom::attribute::ObjectKey(1),

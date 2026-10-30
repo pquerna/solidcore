@@ -48,7 +48,6 @@ use solidcore::surface::surface::Surface;
 use solidcore::topology::brep::p4::{self, DeleteEnv};
 use solidcore::topology::brep_cache::{arena_identity, CacheObject};
 use solidcore::topology::shell::ShellMembers;
-use solidcore::topology::topology::Topology as SmTopologyRecord;
 use solidcore::topology::{
     ArenaId, Brep, EdgeId, EdgeuseOwner, FaceId, LoopuseStart, ShellId, VertexId, VertexuseId,
     VertexuseOwner,
@@ -345,7 +344,8 @@ fn rust_records(b: &Brep, pre: [usize; 10]) -> Model {
         let owned = f.surface.as_ref().and_then(Surface::owner) == Some(face_owner(id.index()));
         rec.i(i64::from(owned));
         let natural = f.surface.as_ref().map_or([0.0; 4], |s| {
-            let d = s.natural_uv_domain();
+            // (runner helper without a kernel in scope)
+            let d = s.natural_uv_domain_if_built();
             [d.min().x, d.min().y, d.max().x, d.max().y]
         });
         for x in natural {
@@ -353,7 +353,8 @@ fn rust_records(b: &Brep, pre: [usize; 10]) -> Model {
         }
         // the surface point at the centre of the natural domain (the shim's `EvaluatePoint`)
         let point = f.surface.as_ref().and_then(|s| {
-            let d = s.natural_uv_domain();
+            // (runner helper without a kernel in scope)
+            let d = s.natural_uv_domain_if_built();
             let c = Point2::new((d.min().x + d.max().x) * 0.5, (d.min().y + d.max().y) * 0.5);
             s.evaluate_point(&Kernel::default(), c).ok()
         });
@@ -755,7 +756,7 @@ impl UnitDiff for Runner {
         b.set_editing_enabled(i.editing);
         let pre = record_counts(&b);
         let mut k = Kernel::default();
-        let mut records: BTreeMap<ObjectKey, SmTopologyRecord> = BTreeMap::new();
+        let mut records: solidcore::topology::topology::NotifyRecords = solidcore::topology::topology::NotifyRecords::new();
         let mut attributes = AttributeStore::default();
         let mut env = DeleteEnv {
             records: &mut records,

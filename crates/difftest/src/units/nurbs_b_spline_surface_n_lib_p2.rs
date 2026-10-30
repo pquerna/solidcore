@@ -680,7 +680,7 @@ fn dump_state(o: &mut Vec<f64>, s: &BSplineSurface) {
 /// The `SmStatus` of a Rust error; `-1` for one upstream cannot return.
 fn status(e: &SolidError) -> f64 {
     match e {
-        SolidError::InvalidInput { .. } => 1007.0,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.0,
         SolidError::Upstream { code, .. } => f64::from(*code),
         _ => -1.0,
     }
@@ -1506,7 +1506,8 @@ fn gen_analytic_corner(rng: &mut Rng) -> Inputs {
     let turn = rng.uniform(0.0, std::f64::consts::TAU);
     let reverse = rng.chance(0.3);
     let built = analytic_of(&k, &a).and_then(|s| {
-        let d = s.natural_uv_domain();
+        // (runner helper that does not return Result)
+        let d = s.natural_uv_domain_if_built();
         let (lo, hi) = (d.min(), d.max());
         let corner = |i: usize| {
             let t = turn + std::f64::consts::TAU * i as f64 / sides as f64;

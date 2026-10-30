@@ -494,13 +494,14 @@ fn options_of(o: Option<[bool; 5]>) -> Option<SweepOptions> {
         move_profile_center_to_path: c,
         orient_profile_perpendicular_to_path: d,
         move_to_profile: e,
+        profile_at_path_start: false,
     })
 }
 
 /// The `SmStatus` of a Rust error; `-1` for one upstream cannot return.
 fn status(e: &SolidError) -> f64 {
     match e {
-        SolidError::InvalidInput { .. } => 1007.0,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.0,
         SolidError::Upstream { code, .. } => f64::from(*code),
         _ => -1.0,
     }
@@ -977,8 +978,10 @@ fn gen_consumed(rng: &mut Rng, s: f64, off: P3, empty_ok: bool) -> Vec<CrvIn> {
     }
 }
 
-/// Whether a profile holds a full circle (the FFI rejects sweeping one over a
-/// negative distance: upstream never returns).
+/// Whether a profile holds a full circle. The generator sweeps one over a positive
+/// distance only (at c9c5979 a negative distance never returned, HANG-13), which keeps
+/// the generated inputs unchanged; the fixture `hang13-negative-full-circle.json`
+/// covers negative distances.
 fn has_full_circle(cs: &[CrvIn]) -> bool {
     cs.iter().any(|c| match c {
         CrvIn::Circle { .. } | CrvIn::AnalyticCircle { .. } => true,

@@ -17,8 +17,10 @@
 //! **B-rep ops** use the B-reps of unit `topology.vertexuse` (upstream `.smb` files and
 //! faces of B-spline surfaces or real `SmPlane`s): the C++ side builds a real `SmBrep`
 //! and preserves exactly exported analytic surfaces. Other surfaces and edge curves
-//! get the plain B-spline copies the Rust import rebuilds; the Rust side imports the
-//! graph that unit's shim exports. Loop,
+//! get the plain B-spline copies the Rust import rebuilds. The Rust side reads an `.smb`
+//! file itself (`crate::own_builder::read_with`: the Rust reader, renumbered into the
+//! shim's walk order; no C++ export reaches the Rust side) and imports the graph that
+//! unit's shim exports for the other sources. Loop,
 //! face and edge use selectors are taken modulo their counts. The mutating ops compare
 //! every edge use's UV trim curve afterwards.
 //!
@@ -1186,7 +1188,7 @@ fn find_outer(
             o.push(0.0);
             put_outer(o, &ordered, &counts, &orients, normal, &outer);
         }
-        Err(SolidError::InvalidInput { .. }) => o.extend([0.0, NULL_DEREF]),
+        Err(SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }) => o.extend([0.0, NULL_DEREF]),
         Err(e) => {
             o.push(status::<()>(&Err(e))?);
         }
@@ -1328,7 +1330,7 @@ fn run_rust_geom(k: &mut Kernel, op: &OpIn) -> Result<Vec<f64>, Fail> {
             let s = rust_surface(surface)?;
             let cs = rust_curves(curves)?;
             let n = cs.len();
-            let dom = s.natural_uv_domain();
+            let dom = s.natural_uv_domain_with_nurb(k).map_err(|e| HarnessError::new(e.to_string()))?;
             let input = tt::TrimInput {
                 loop_counts: vec![n],
                 curves: cs,
@@ -1339,7 +1341,7 @@ fn run_rust_geom(k: &mut Kernel, op: &OpIn) -> Result<Vec<f64>, Fail> {
                 surface_orientation: OrientType::Same,
             };
             let mut b = Brep::new();
-            let mut records = std::collections::BTreeMap::new();
+            let mut records = solidcore::topology::topology::NotifyRecords::new();
             let mut attributes = solidcore::geom::attribute::AttributeStore::default();
             let key_of = |_| solidcore::geom::object::ObjectRef {
                 type_code: 0,
@@ -1710,7 +1712,7 @@ fn mirror_pre(
         o.push(-1.0);
         return Ok(());
     }
-    let d = srf.natural_uv_domain();
+    let d = srf.natural_uv_domain_with_nurb(k).map_err(|e| HarnessError::new(e.to_string()))?;
     let side = side_of(side);
     let (low, high) = if side == SurfParamType::U {
         (d.min().x, d.max().x)
@@ -2046,7 +2048,7 @@ fn run_rust_brep(k: &mut Kernel, b: &mut Brep, op: &OpIn) -> Result<Vec<f64>, Fa
                 o.push(NULL_DEREF);
                 return Ok(o);
             };
-            let bounds = srf.natural_uv_domain();
+            let bounds = srf.natural_uv_domain_with_nurb(k).map_err(|e| HarnessError::new(e.to_string()))?;
             let closed = srf
                 .is_closed(k, &bounds, SurfParamType::U, None, false)
                 .map_err(f)?
@@ -2123,6 +2125,25 @@ fn run_rust(i: &OpIn) -> Result<Output, HarnessError> {
         };
     }
     let r = match brep_of(i) {
+        Some(brep @ BrepIn::File { rebuild, .. }) => {
+            // an `.smb` file: read by the Rust reader and renumbered into the shim's
+            // walk order (no C++ export reaches the Rust side)
+            use crate::own_builder::{build_status, counts, read_with, Built, Conventions};
+            let path = shared::path_of(brep)?;
+            let conv = &Conventions::EDGEUSE_GRAPH;
+            let mut b = match read_with(&mut k, &path, *rebuild, false, false, conv)? {
+                Built::Brep(b) => *b,
+                Built::Failed(e) => {
+                    return Ok(Output::unported(&e).unwrap_or_else(|| {
+                        Output::new().values("out", vec![-1.0, build_status(&e)])
+                    }))
+                }
+            };
+            let Some(op) = resolve_op(i, counts(&b)) else {
+                return Ok(Output::err("no_entity_of_that_kind"));
+            };
+            run_rust_brep(&mut k, &mut b, &op)
+        }
         Some(brep) => {
             let ex = export_of(brep)?;
             let Some(c) = fixture::counts(&ex) else {

@@ -81,12 +81,14 @@ impl NurbsSurface {
         if poles.len() != nu * nv {
             return Err(MeshError::BadSurface("pole count is not nu * nv"));
         }
-        for k in [&u_knots, &v_knots] {
-            for (i, value) in k.iter().enumerate() {
+        for knots in [&u_knots, &v_knots] {
+            let mut previous = None;
+            for value in knots {
                 control.charge(1)?;
-                if !value.is_finite() || (i > 0 && *value < k[i - 1]) {
+                if !value.is_finite() || previous.is_some_and(|previous| *value < previous) {
                     return Err(MeshError::BadSurface("knots not finite and nondecreasing"));
                 }
+                previous = Some(*value);
             }
         }
         for pole in &poles {
@@ -108,9 +110,12 @@ impl NurbsSurface {
         }
         let mut hpoles = Vec::new();
         reserve(&mut hpoles, poles.len(), control)?;
-        for (i, &[x, y, z]) in poles.iter().enumerate() {
+        for (index, &[x, y, z]) in poles.iter().enumerate() {
             control.charge(1)?;
-            let w = weights.map_or(1.0, |weights| weights[i]);
+            let w = match weights {
+                Some(weights) => *weights.get(index).ok_or(MeshError::Internal)?,
+                None => 1.0,
+            };
             hpoles.push([x * w, y * w, z * w, w]);
         }
         let end = |k: &[f64], i: usize| k.get(i).copied().ok_or(MeshError::Internal);

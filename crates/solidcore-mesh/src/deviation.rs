@@ -160,7 +160,7 @@ pub fn deviation(k: &Kernel, b: &Brep, mesh: &Mesh, tolerance: f64) -> Result<De
         let Some(p) = mesh.triangle_points(*t) else {
             continue;
         };
-        let domain = s.natural_uv_domain();
+        let domain = s.natural_uv_domain_with_nurb(k)?;
         let d = triangle_deviation(k, s, &domain, *uv, p);
         sum += d;
         let facet = (p[1] - p[0]).cross(p[2] - p[0]);

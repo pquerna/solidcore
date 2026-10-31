@@ -13,6 +13,11 @@
 //! ([`crate::util::trim_curve`]) and sampled curve points (see the FFI module docs for
 //! each op's output).
 //!
+//! `own_reader_fillet.json` runs `CreateUVTrimCurves` on every face of the `Fillet/`
+//! files of the fillet executive sweeps (e.g. `sphere_diff_3cylinders.smb`, whose face
+//! 7 trim of edge 30 diverged before #1215), as read and with rebuilt UV trim curves,
+//! each side reading the file with its own reader.
+//!
 //! Face, loop and other-face selectors are taken modulo the B-rep's counts, so
 //! generated cases need no counts; a B-rep without faces gives `no face` on both sides.
 //!
@@ -1059,6 +1064,17 @@ fn analytic_face(
 
 #[allow(clippy::too_many_lines)] // one arm per op
 fn run_rust_case(i: &Inputs) -> Result<Output, HarnessError> {
+    // an input the FFI refuses is a harness error on both sides (PR #502's convention):
+    // the shim never builds it, so the Rust side must not either. Fuzz case fuzz00127
+    // (`--fuzz 300 --seeds 24`) mutated a control point to `1e300`: the export refuses a
+    // block value above `1e150` (HANG-29) for the C++ side, while this side built the
+    // face for over 40 s. `validate_block` is the export's own block checks (pure Rust,
+    // no shim call), on the path and block `build` sends.
+    let path = match &i.brep {
+        CaseBrep::Shared(b) => shared::path_of(b)?,
+        CaseBrep::Faces(_) | CaseBrep::EdgeLoop(_) => String::new(),
+    };
+    fixture::validate_block(&path, &block(i)?).map_err(|e| harness(format!("export: {e}")))?;
     let (mut b, counts) = match own_brep(i)? {
         Ok(x) => x,
         Err(out) => return Ok(out),
@@ -1228,6 +1244,10 @@ fn run_rust_case(i: &Inputs) -> Result<Output, HarnessError> {
             put_use_states(&b, &mut out);
             for (_, eu) in b.edgeuses().iter() {
                 value!(put_trim_curve(&k, &mut out, eu.uv_trim_curve.as_ref()));
+            }
+            // each UV trim curve's owner (the shim's `g.find(6, uv->GetOwner())`)
+            for (eu, _) in b.edgeuses().iter() {
+                out.push(crate::own_builder::uv_owner_index(&b, eu, None));
             }
         }
         OpIn::Intersect { .. } => {

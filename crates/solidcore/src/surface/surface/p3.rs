@@ -14,6 +14,7 @@
 //! | [`Surface::evaluate_normal_section`], [`evaluate_normal_section_of`], [`SurfaceNormalSection`] | `SmSurface::EvaluateNormalSection` |
 //! | [`Surface::get_singularities`], [`Surface::get_singularities_of_face`], [`Singularities`] | `SmSurface::GetSingularities`                    |
 //! | [`Surface::cover_coincident_surface_deferring_trims`], [`CoverCoincident`] | `SmSurface::CoverCoincidentSurface`     |
+//! | [`Surface::calculate_tight_bounding_box`]        | `SmSurface::CalculateTightBoundingBox`           |
 //! | [`check_shape_match`]                             | `smsurf_CheckShapeMatch`                         |
 //! | [`FindPsNormalEnfo`] (`EvalNFunctions`)           | `SmFindPSNormalENFO::Evaluate` (struct: `surface.surface_p1`) |
 //! | [`SssIntersectEnfo`] (`EvalNFunctions`)           | `SmSSSIntersectENFO::Evaluate` (struct: `surface.surface_p1`) |
@@ -56,6 +57,11 @@
 //!   samples of a 21 x 21 grid over the domain the merge uses; otherwise the cover fails
 //!   (the faces keep the edge between them) instead of merging onto a continuation that
 //!   is not one sheet. tangency-labs/solidcore#434.
+//! - **A face across a wrapped seam is covered** (opt-in
+//!   `Kernel::fixes.cover_wraps_across_closed_seam`, WR-599; the fork's
+//!   tangency-labs/smlib@16bf1cb). A boundary step across this surface's seam in a
+//!   direction it is closed in over its natural domain is no failure, and the domain
+//!   keeps its period there; an open direction or a pole still refuses.
 
 use crate::error::{ignored, Result, SolidError};
 use crate::geom::assert_array::labels;
@@ -83,7 +89,7 @@ use crate::surface::plane::Plane;
 use super::p1::{
     crossed_seam_or_pole, evaluate_1st_derivatives, evaluate_2nd_derivatives,
     evaluate_normal_section as smsurf_evaluate_normal_section, FindPsNormalEnfo, SsNormalizeEnfo,
-    SspIntersectEnfo, SssIntersectEnfo, SurfaceSolveContext,
+    SspIntersectEnfo, SssIntersectEnfo, SurfaceSolveContext, MAX_STEP_RATIO,
 };
 use super::p2::evaluate_geometric as smsurf_evaluate_geometric;
 use super::p2::{GeometricProperties, SurfaceEvaluate};
@@ -752,6 +758,107 @@ impl Surface {
         })
     }
 
+    /// The tight axis-aligned box of the surface over `uv_domain`
+    /// (`CalculateTightBoundingBox`): for a B-spline-based surface with fewer than three
+    /// control points in each direction, the box of its four corner points; otherwise
+    /// the points maximising the signed distance along `±x`, `±y`, `±z` over the domain
+    /// (`SM_SR_ALL` global solves, statuses ignored), and the tight boxes of the four
+    /// boundary iso curves of the domain.
+    ///
+    /// # Errors
+    ///
+    /// Those of the boundary iso curves and their boxes; [`SolidError::Unported`] from
+    /// the solves and evaluations.
+    pub fn calculate_tight_bounding_box(
+        &self,
+        k: &Kernel,
+        uv_domain: &Extent2d,
+    ) -> Result<Extent3d> {
+        use crate::geom::global_solver::SolutionRequested;
+        use crate::nurbs::b_spline_surface::SurfParamType;
+
+        let mut tight_box = Extent3d::new();
+
+        // Special case for 2x2 B-Spline surfaces (SM_CAST_NONNULL_PTR(SmBSplineSurface)):
+        let bspline_based = !matches!(
+            self.kind(),
+            SurfaceKind::OffsetSurface(_)
+                | SurfaceKind::CurveBounded(_)
+                | SurfaceKind::Step(_)
+                | SurfaceKind::SrfInVolume(_)
+        );
+        if bspline_based
+            && self.number_control_points(k, SurfParamType::U) < 3
+            && self.number_control_points(k, SurfParamType::V) < 3
+        {
+            // This works even if the domain is different from the natural domain
+            // (statuses ignored: a failed evaluation keeps the last point):
+            let mut pt = Vec3::UNDEF;
+            for (u, v) in [
+                (uv_domain.min().x, uv_domain.min().y),
+                (uv_domain.max().x, uv_domain.min().y),
+                (uv_domain.min().x, uv_domain.max().y),
+                (uv_domain.max().x, uv_domain.max().y),
+            ] {
+                if let Some(p) = ignored(self.evaluate_point(k, Point2::new(u, v)))? {
+                    pt = p;
+                }
+                tight_box.add_point(pt);
+            }
+            return Ok(tight_box);
+        } // end 2x2 B-Spline check.
+
+        // Loop on three directions, positive then negative (statuses ignored)
+        let mut dir_vec = Vec3::new(1.0, 0.0, 0.0); // +/- x
+        for idx in 0..3 {
+            if idx == 1 {
+                dir_vec = Vec3::new(0.0, 1.0, 0.0); // +/- y
+            }
+            if idx == 2 {
+                dir_vec = Vec3::new(0.0, 0.0, 1.0); // +/- z
+            }
+            for pass in 0..2 {
+                if pass == 1 {
+                    dir_vec = -dir_vec;
+                }
+                let solutions = ignored(super::p4::global_point_solve_starts(
+                    k,
+                    self,
+                    uv_domain,
+                    SolverOperation::Signed3dDirectedMaximize,
+                    dir_vec,
+                    EFF_ZERO_SQRT,
+                    SolutionRequested::All,
+                ))?
+                .unwrap_or_default();
+                for sol in &solutions {
+                    let mut eval = super::p2::SurfaceEval::with_uv(
+                        k,
+                        Some(self),
+                        sol.parameters.first().copied().unwrap_or(0.0),
+                        sol.parameters.get(1).copied().unwrap_or(0.0),
+                    );
+                    tight_box.add_point(eval_pos(&mut eval)?);
+                }
+            }
+        }
+
+        // Now do the boundaries.  [B203]
+        for (param, ivl) in [
+            (SurfParamType::U, uv_domain.u_interval()),
+            (SurfParamType::V, uv_domain.v_interval()),
+        ] {
+            for iso in [ivl.min(), ivl.max()] {
+                let curve = self
+                    .create_iso_parametric_curve(k, param, iso, 0.0, Some(uv_domain), false)?
+                    .curve;
+                let crv_box = curve.calculate_tight_bounding_box(k, &curve.natural_interval())?;
+                tight_box = tight_box.union(&crv_box);
+            }
+        }
+        Ok(tight_box)
+    }
+
     /// Whether `other` (or the subset `other_domain` of it) fits inside this surface: a
     /// grid of points of `other` is dropped to this surface and, when all coincide within
     /// `tol`, this surface's STEP domain is expanded to cover them
@@ -835,7 +942,7 @@ impl Surface {
         };
 
         // We're going to have to expand ourselves right away.
-        let big_domain = self.max_analytic_domain(k)?;
+        let mut big_domain = self.max_analytic_domain(k)?;
         if big_domain.is_degenerate(0.0) {
             return Ok(failure);
         }
@@ -851,6 +958,24 @@ impl Surface {
             Some(d) => *d,
             None => other.natural_uv_domain_with_nurb(k)?,
         };
+
+        // Not upstream (WR-536), opt-in `boolean2d_plane_covers_far_faces` (the fork's
+        // tangency-labs/smlib@67b8a1e): a plane is unbounded and its STEP parameterization
+        // affine, so it can grow to cover the other surface however far that lies from
+        // this face (two holes 1.5 m apart on a 3 m sheet, each face a few millimetres
+        // wide). GetMaxAnalyticDomain's fixed reach of 100 widths is for B-splines, whose
+        // extension degrades with distance; for a plane, grow the search domain to the
+        // orthogonal projection of the other surface's bounding box, which holds every
+        // point the checks below drop.
+        if k.fixes.boolean2d_plane_covers_far_faces {
+            if let SurfaceKind::Plane(plane) = self.kind() {
+                let mut other_box = other.calculate_tight_bounding_box(k, &other_dom)?;
+                other_box.expand_absolute(tol);
+                for corner in other_box.corners() {
+                    big_domain.add_point(plane.project_point_to_uv_domain(corner));
+                }
+            }
+        }
 
         // upstream ignores the status of the point evaluations
         let mut pt = Vec3::UNDEF;
@@ -1049,6 +1174,43 @@ impl Surface {
         let dom_u = other_dom.u_interval();
         let dom_v = other_dom.v_interval();
 
+        // SolidCraft fork, tangency-labs/smlib@16bf1cb (WR-599): a surface whose domain
+        // already closes on itself in a direction (a cylinder's full turn, the face on it
+        // wrapping all the way round) covers a face that straddles its seam: that face's
+        // points lie on it on both sides of the seam, and the face merged into it is the
+        // periodic face whose seam runs on through the covered part (the merge adds that
+        // piece of the seam, `SmFace::SplitAtSeam`). A step of the boundary walk across the
+        // seam in such a direction is no failure; the domain in it stays the period it
+        // already spans. In any other direction, or across a pole, a crossing still means
+        // the other face does not fit inside this one. Opt-in
+        // (`Kernel::fixes.cover_wraps_across_closed_seam`); upstream refuses every crossing.
+        let wraps_across_seam = k.fixes.cover_wraps_across_closed_seam;
+        let (wraps_u, wraps_v) = if wraps_across_seam {
+            let this_domain = self.natural_uv_domain_with_nurb(k)?;
+            (
+                self.is_closed(
+                    k,
+                    &this_domain,
+                    crate::nurbs::b_spline_surface::SurfParamType::U,
+                    None,
+                    false,
+                )?
+                .0,
+                self.is_closed(
+                    k,
+                    &this_domain,
+                    crate::nurbs::b_spline_surface::SurfParamType::V,
+                    None,
+                    false,
+                )?
+                .0,
+            )
+        } else {
+            (false, false)
+        };
+        let mut crossed_u = false;
+        let mut crossed_v = false;
+
         for ii in 0..4_usize {
             // Get the corner guess.  (Sorry, a bit slick:)
             let (row, col) = (if ii < 2 { ii } else { 3 - ii }, ii / 2);
@@ -1108,7 +1270,22 @@ impl Surface {
 
                 // Here we check seams/poles.
                 if crossed_seam_or_pole(k, self, guess_uv, drop_uv, &big_domain)? {
-                    return Ok(failure);
+                    if !wraps_across_seam {
+                        return Ok(failure);
+                    }
+                    // WR-599: across which seam: a step longer than the helper allows
+                    // (`sdMaxStepRatio`).
+                    let step = drop_uv - guess_uv;
+                    let jump_u = step.x.abs() > MAX_STEP_RATIO * big_domain.u_interval().length();
+                    let jump_v = step.y.abs() > MAX_STEP_RATIO * big_domain.v_interval().length();
+                    if (jump_u && !wraps_u)
+                        || (jump_v && !wraps_v)
+                        || location == LocationType::Pole
+                    {
+                        return Ok(failure);
+                    }
+                    crossed_u = crossed_u || jump_u;
+                    crossed_v = crossed_v || jump_v;
                 }
 
                 // Check max distance.
@@ -1143,7 +1320,28 @@ impl Surface {
         // Now union the projection of Other surface on our domain with our original
         // domain, and update our domain to it.
         let orig_domain = self.step_uv_domain();
-        let update_domain = orig_domain.union(&new_domain);
+        let mut update_domain = orig_domain.union(&new_domain);
+        // WR-599: across a seam it already wraps, this surface keeps its period (see above).
+        if crossed_u {
+            update_domain = Extent2d::from_points(
+                Point2::new(orig_domain.min().x, update_domain.min().y),
+                Point2::new(orig_domain.max().x, update_domain.max().y),
+            );
+            new_domain = Extent2d::from_points(
+                Point2::new(orig_domain.min().x, new_domain.min().y),
+                Point2::new(orig_domain.max().x, new_domain.max().y),
+            );
+        }
+        if crossed_v {
+            update_domain = Extent2d::from_points(
+                Point2::new(update_domain.min().x, orig_domain.min().y),
+                Point2::new(update_domain.max().x, orig_domain.max().y),
+            );
+            new_domain = Extent2d::from_points(
+                Point2::new(new_domain.min().x, orig_domain.min().y),
+                Point2::new(new_domain.max().x, orig_domain.max().y),
+            );
+        }
 
         // SolidCraft change, tangency-labs/smlib 1b6f5fa (tangency-labs/solidcore#434): a
         // B-spline surface covers past its natural domain by continuing its end spans, and
@@ -1284,6 +1482,7 @@ impl Surface {
             sq_node_tol,
         );
         let mut solver = LocalSolveNd::new(&mut equations, Some(&intervals), Some(&periodicities));
+        solver.set_skips_failed_evaluations(k.fixes.oscillating_skips_failed_guesses);
 
         solver.set_desired_accuracy(EFF_ZERO_SQ);
         solver.set_boundary_handler(BoundaryHandler::TotalBoundaryHits, 3);
@@ -1354,6 +1553,7 @@ impl Surface {
         let mut equations =
             SsNormalizeEnfo::new(k, self, other, operation, Some(opt_vectors), EFF_ZERO_SQ);
         let mut solver = LocalSolveNd::new(&mut equations, Some(&intervals), Some(periodicities));
+        solver.set_skips_failed_evaluations(k.fixes.oscillating_skips_failed_guesses);
         solver.set_boundary_handler(BoundaryHandler::TotalBoundaryHits, 8);
 
         // Solve it
@@ -1442,6 +1642,7 @@ impl Surface {
         // Construct the Newton-Raphson Solver class with the surf/surf/surf equation set
         let mut equations = SssIntersectEnfo::new(k, s1, s2, s3, EFF_ZERO_SQ);
         let mut solver = LocalSolveNd::new(&mut equations, Some(&intervals), Some(&periodicities));
+        solver.set_skips_failed_evaluations(k.fixes.oscillating_skips_failed_guesses);
 
         // set the solver's exit behavior for solutions that run outside the boundary
         solver.set_boundary_handler(BoundaryHandler::TotalBoundaryHits, 8);
@@ -1724,6 +1925,21 @@ fn clip_to_big_domain(domain: &Extent2d, big_domain: &Extent2d) -> Extent2d {
     domain
         .intersect(big_domain)
         .unwrap_or_else(|_| Extent2d::new())
+}
+
+/// `SmSurfaceEval::Pos()`: the position, also when the evaluation failed (then what
+/// the failed evaluation wrote).
+fn eval_pos(eval: &mut super::p2::SurfaceEval<'_>) -> Result<Point3> {
+    match eval.pos() {
+        Ok(p) => Ok(p),
+        Err(e) if e.is_unported() => Err(e),
+        Err(_) => Ok(eval
+            .values()
+            .first()
+            .and_then(|r| r.first())
+            .copied()
+            .unwrap_or(Vec3::UNDEF)),
+    }
 }
 
 #[cfg(test)]

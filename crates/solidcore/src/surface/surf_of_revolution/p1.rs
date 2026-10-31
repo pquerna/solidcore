@@ -1325,6 +1325,32 @@ impl SurfOfRevolution {
         hu: usize,
         hv: usize,
     ) -> Result<Vec<Vec3>> {
+        // (an order above the limit is refused before the array is read)
+        let n = if hu <= 5 && hv <= 5 {
+            (hu + 1) * (hv + 1)
+        } else {
+            0
+        };
+        let mut d = vec![Vec3::ZERO; n];
+        self.evaluate_step_at_into(k, uv, hu, hv, &mut d)?;
+        Ok(d)
+    }
+
+    /// [`Self::evaluate_step_at`] into the caller's array `d` (`(hu + 1) * (hv + 1)` entries):
+    /// the entries upstream does not write keep the caller's values, as upstream's
+    /// `aDerivatives` does (a fresh `SmVector3d` array holds `SM_UNDEF_DOUBLE`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::evaluate_step_at`]; `InvalidInput` when `d` is too short.
+    pub(crate) fn evaluate_step_at_into(
+        &self,
+        k: &Kernel,
+        uv: Point2,
+        hu: usize,
+        hv: usize,
+        d: &mut [Vec3],
+    ) -> Result<()> {
         // check input
         if hu > 3 || hv > 3 {
             return Err(SolidError::sm_err(OP_EVAL_STEP));
@@ -1361,7 +1387,9 @@ impl SurfOfRevolution {
         let pz = p.dot(s_z);
 
         let n = (hu + 1) * (hv + 1);
-        let mut d = vec![Vec3::ZERO; n];
+        let d = d
+            .get_mut(..n)
+            .ok_or_else(|| SolidError::invalid_input(OP_EVAL_STEP, "derivative array too short"))?;
         let mut set = |i: usize, v: Vec3| {
             if let Some(slot) = d.get_mut(i) {
                 *slot = v;
@@ -1451,8 +1479,8 @@ impl SurfOfRevolution {
         }
 
         // The formulas above are per radian; STEP U is in degrees.
-        scale_step_angular_derivatives(&mut d, hu, hv, true, false)?;
-        Ok(d)
+        scale_step_angular_derivatives(d, hu, hv, true, false)?;
+        Ok(())
     }
 
     /// The point at the STEP parameters `uv` (`EvaluateSTEPPoint`: [`Self::evaluate_step`]
@@ -2071,6 +2099,45 @@ mod tests {
             retained.polar_curve.as_ref().unwrap().notify_key(),
             Some(key)
         );
+    }
+
+    #[test]
+    fn rejected_shifted_generator_interval_preserves_the_revolution() {
+        let mut k = k();
+        k.fixes.ellipse_step_interval_checks = true;
+        for swap in [false, true] {
+            let g = Ellipse::new_circle(
+                &k,
+                Vec3::new(3.0, 0.0, 0.0),
+                Vec3::X,
+                Vec3::Z,
+                Extent1d::from_min_max(0.0, 360.0),
+                1.0,
+                &EllipseOptions::default(),
+            )
+            .unwrap();
+            let mut s =
+                SurfOfRevolution::create_canonical(&k, Curve::from(g), Vec3::ZERO, Vec3::Z, swap)
+                    .unwrap();
+            let old_domain = s.step_uv_domain();
+            let old_nurb = s.base().gw_nurb().unwrap().clone();
+            let target = Extent2d::from_bounds(0.0, 360.0, 180.0, 540.0);
+            assert!(matches!(
+                s.adjust_step_uv_domain(&k, &target),
+                Err(SolidError::InvalidInput { .. })
+            ));
+            assert_eq!(s.step_uv_domain(), old_domain);
+            assert_eq!(s.base().gw_nurb().unwrap(), &old_nurb);
+            let CurveKind::Ellipse(gen) = s.gen_curve().unwrap().kind() else {
+                panic!("circle generator changed type");
+            };
+            assert_eq!(gen.step_interval(), old_domain.v_interval());
+            // A supported trim still succeeds after the rejected edit.
+            s.adjust_step_uv_domain(&k, &Extent2d::from_bounds(0.0, 0.0, 180.0, 90.0))
+                .unwrap();
+            let n = s.base().gw_nurb().unwrap();
+            assert!(n.u_knots().iter().chain(n.v_knots()).all(|v| v.is_finite()));
+        }
     }
 
     #[test]

@@ -40,12 +40,6 @@ use crate::topology::{edge, Brep, EdgeId, FaceId, VertexId};
 
 const OP: &str = "topology::brep_cache";
 
-/// Whether `e` is this module's own identity or handle error: an owner, handle or tree
-/// the B-rep cache could not resolve under the caller's identities. Upstream addresses
-/// these objects by pointer, so no upstream status corresponds to it.
-pub(crate) fn is_identity_error(e: &SolidError) -> bool {
-    matches!(e, SolidError::PortInvariant { operation, .. } if *operation == OP)
-}
 /// `SmBrepCache_TYPE`.
 pub const TYPE: i64 = 16400;
 /// `SmBrepCache::GetTypeString`.
@@ -670,7 +664,11 @@ impl crate::intersect::topology_solver::p1::TopologyObjects<CacheObject> for Bre
                 None => Ok(system),
             },
             // SmBrep: GetZoneTol3d(const SmBrep*)
-            CacheObject::Brep => Ok(self.brep.tolerance()),
+            CacheObject::Brep => Ok(crate::geom::tol::brep_zone_tol_3d(
+                k,
+                self.brep,
+                SmallTopoType::NormalSize,
+            )),
             // UNPORTED(query.poly): SmPolyVertex/SmPolyEdge/SmPolyFace::GetTolerance (the
             // poly B-rep is not in this view)
             CacheObject::PolyVertex(_) | CacheObject::PolyEdge(_) | CacheObject::PolyFace(_) => {

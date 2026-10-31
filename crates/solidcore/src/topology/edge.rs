@@ -162,8 +162,8 @@ pub const CLASS_STRING: &str = "SmEdge";
 
 /// `SmBrep_TYPE` (the `SM_CAST_PTR(SmBrep, ..)` of `Notify`).
 const BREP_TYPE: i64 = 16011;
-/// `SM_ERR_INVALID_INPUT`.
-const SM_ERR_INVALID_INPUT: i32 = 1007;
+// `SM_ERR_INVALID_INPUT`.
+use crate::error::SM_ERR_INVALID_INPUT;
 
 /// `SmEdge::IsKindOf`: `SmEdge_TYPE` or a base class type.
 #[must_use]
@@ -2175,7 +2175,9 @@ pub fn set_orientation(b: &mut Brep, e: EdgeId, orientation: OrientType) -> Resu
 /// By default a failed curve reversal's status is ignored, as upstream: the edge
 /// gets the default interval and its uses are still flipped. With the opt-in
 /// [`crate::kernel::UpstreamFixes::edge_reversal_keeps_failed_edge`] (WR-260) a
-/// failed reversal returns before changing the interval or edge uses.
+/// failed reversal returns before changing the interval or edge uses, and an edge
+/// without curve keeps its interval (upstream installs the default one; fork
+/// tangency-labs/smlib 47507b6).
 ///
 /// # Errors
 ///
@@ -2194,6 +2196,9 @@ pub fn reverse_orientation(k: &Kernel, b: &mut Brep, e: EdgeId) -> Result<()> {
             Err(err) if k.fixes.edge_reversal_keeps_failed_edge => return Err(err),
             Err(err) => failed(err)?,
         }
+    } else if k.fixes.edge_reversal_keeps_failed_edge {
+        // nothing reversed the interval: the edge keeps it (WR-260 addendum)
+        new_ivl = old_ivl;
     }
     b.edge_mut(e)?.interval = new_ivl;
 
@@ -2668,6 +2673,38 @@ pub fn set_curve(
     set_curve_with_identity(b, e, new_curve, options, env, curve_refs, None)
 }
 
+/// `Replace3DCurve(p3DCurve)` (CO-PORTED by unit `blend.fillet_removal`; shared with
+/// `SmBrep::ReplaceCurve` in `offset::offset_geometry_creation`): `SetCurve(p3DCurve,
+/// TRUE)` (the old curve and, through the change notification, the edge uses' UV trim
+/// curves deleted), then for a new curve its owner set to the edge (`SetOwner`, under
+/// `env`'s identity of the edge) and the edge's interval to the curve's natural interval.
+///
+/// # Errors
+///
+/// Those of [`set_curve`] and [`set_interval`].
+pub(crate) fn replace_3d_curve(
+    b: &mut Brep,
+    e: EdgeId,
+    curve: Option<Curve>,
+    env: &mut NotifyEnv<'_>,
+) -> Result<()> {
+    let interval = curve.as_ref().map(Curve::natural_interval);
+    let curve = curve.map(|mut c| {
+        let owner = (env.key_of)(EntityRef::Edge(e));
+        let _ = c.set_owner(Some(owner), Some(crate::topology::brep::p2::brep_ref(b)));
+        c
+    });
+    let options = SetCurveOptions {
+        delete_old_curve: true,
+        ..SetCurveOptions::default()
+    };
+    let _ = set_curve(b, e, curve, options, env, [None, None])?;
+    if let Some(interval) = interval {
+        set_interval(b, e, &interval)?;
+    }
+    Ok(())
+}
+
 /// Replace the actual edge curve while notifying its body's issued identity.
 /// The cache, UV invalidation and curve lifecycle share [`set_curve`]'s body.
 /// Other edge APIs retain their existing identity contract.
@@ -2773,7 +2810,8 @@ fn set_curve_with_identity(
 /// `GetBlendEdgeuse`: the edge use bounding the sector to fillet (an
 /// [`OrientType::Same`] edge use of an interior region for a solid, of the concave
 /// side for a shell); `None` for a lamina edge, an edge between tangent faces (within
-/// 2 degrees) or an inconsistent edge use.
+/// 2 degrees; half a degree with `fixes.fillet_half_degree_crease`, WR-621) or an
+/// inconsistent edge use.
 ///
 /// # Errors
 ///
@@ -2852,16 +2890,27 @@ pub fn blend_edgeuse(k: &Kernel, b: &mut Brep, e: EdgeId) -> Result<Option<Edgeu
     let (fu_normal, fu_normal2) = (ev0.face_normal, ev1.face_normal);
     let (bin_vec, bin_vec2) = (ev0.binormal, ev1.binormal);
 
-    // set max nonTangent angle to 88 degrees
-    let max_dot = (88.0 * PI / 180.0).cos();
+    // set max nonTangent angle to 88 degrees. With `fillet_half_degree_crease` (WR-621,
+    // fork 2e8758b) 89.5 degrees: faces within half a degree of each other are tangent, a
+    // crease of 0.5 to 2 degrees is an edge the model means and is filleted
+    let max_angle = if k.fixes.fillet_half_degree_crease {
+        89.5
+    } else {
+        88.0
+    };
+    let max_dot = (max_angle * PI / 180.0).cos();
 
-    // the faces are tangent and can't be filleted
+    // the faces are tangent and can't be filleted. With `fillet_knife_edge_rounds`
+    // (WR-570, fork b7ec55b) only when their binormals point away from each other (the
+    // faces continue each other): binormals pointing the same way are a cusp (a knife
+    // edge), whose ball lies back from the edge, filleted like any other edge
+    let cusp = k.fixes.fillet_knife_edge_rounds && bin_vec.dot(bin_vec2) > 0.0;
     let dot1 = bin_vec2.dot(fu_normal);
-    if dot1.abs() < max_dot {
+    if !cusp && dot1.abs() < max_dot {
         return Ok(None); // Tangent: unable to fillet
     }
     let dot2 = bin_vec.dot(fu_normal2);
-    if dot2.abs() < max_dot {
+    if !cusp && dot2.abs() < max_dot {
         return Ok(None); // Tangent: unable to fillet
     }
 
@@ -3478,6 +3527,26 @@ mod tests {
         for eu in eus {
             assert!(b.edgeuse(eu).unwrap().uv_trim_curve.is_none());
         }
+    }
+
+    /// WR-260 addendum (fork tangency-labs/smlib 47507b6): reversing an edge without
+    /// curve installs the default interval upstream; with
+    /// `edge_reversal_keeps_failed_edge` the edge keeps its own.
+    #[test]
+    fn reversing_an_edge_without_curve_keeps_its_interval_with_the_opt_in() {
+        let mut k = Kernel::default();
+        let (mut b, e, _, _) = wire();
+        b.edge_mut(e).unwrap().curve = None;
+        let ivl = b.edge(e).unwrap().interval;
+        assert_ne!(ivl, Extent1d::new());
+        reverse_orientation(&k, &mut b, e).unwrap();
+        assert_eq!(b.edge(e).unwrap().interval, Extent1d::new());
+
+        k.fixes.edge_reversal_keeps_failed_edge = true;
+        let (mut b, e, _, _) = wire();
+        b.edge_mut(e).unwrap().curve = None;
+        reverse_orientation(&k, &mut b, e).unwrap();
+        assert_eq!(b.edge(e).unwrap().interval, ivl);
     }
 
     #[test]

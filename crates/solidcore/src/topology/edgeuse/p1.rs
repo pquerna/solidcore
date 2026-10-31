@@ -94,7 +94,6 @@
 
 use crate::curve::curve::Curve;
 use crate::error::{EntityRef, Result, SolidError};
-use crate::geom::attribute::ObjectKey;
 use crate::geom::extent1d::Extent1d;
 use crate::geom::global_solver::SolverOperation;
 use crate::geom::local_solve_nd::EvalNFunctions;
@@ -114,7 +113,7 @@ use crate::surface::surface::p5::DropPointOptions;
 use crate::surface::surface::Surface;
 use crate::topology::{
     topology as topo, Brep, EdgeId, EdgeuseId, EdgeuseOwner, FaceId, FaceuseId, LoopId, LoopuseId,
-    NamingScheme, ObjectHandle, RegionId, ShellId, VertexId, VertexuseId, VertexuseOwner,
+    ObjectHandle, RegionId, ShellId, VertexId, VertexuseId, VertexuseOwner,
 };
 
 const OP: &str = "topology::edgeuse::p1";
@@ -801,9 +800,7 @@ pub fn set_uv_trim_curve(
         };
         // pUVTrimCurve->SetOwner(holder), under the B-rep's naming (a UV trim curve
         // notifies nothing)
-        if let Some(owner) = owner_ref_in(b, holder) {
-            let _ = c.set_owner(Some(owner), None);
-        }
+        let _ = c.set_owner(Some(owner_ref_in(b, holder)), None);
         let r = b.edgeuse_mut(holder)?;
         r.uv_trim_curve = Some(c);
         r.drop_curve_fail = copy;
@@ -830,29 +827,16 @@ pub fn set_uv_trim_curve(
     Ok(detached)
 }
 
-/// The identity edge use `eu` of `b` owns geometry under: for a
-/// [`NamingScheme::Caller`] B-rep the caller's key recorded for it where the B-rep was
-/// built (`Brep::geometry_owner_key`; `None` when none is recorded), else
-/// [`owner_ref`] of `b`'s naming.
-pub(crate) fn owner_ref_in(b: &Brep, eu: EdgeuseId) -> Option<ObjectRef> {
-    match b.naming() {
-        NamingScheme::Caller => b.geometry_owner_key(EntityRef::Edgeuse(eu)),
-        naming => owner_ref(naming, eu),
-    }
-}
-
-/// The identity edge use `eu` owns geometry under in a B-rep with naming `naming`
-/// ([`NamingScheme`]); `None` when the B-rep records no scheme, or names its owners by
-/// a caller's keys (see [`owner_ref_in`]).
-pub(crate) fn owner_ref(naming: NamingScheme, eu: EdgeuseId) -> Option<ObjectRef> {
-    match naming {
-        NamingScheme::Unknown | NamingScheme::Caller => None,
-        NamingScheme::Notify => Some(crate::topology::loopuse::notify_ref(EntityRef::Edgeuse(eu))),
-        NamingScheme::Arena => Some(ObjectRef {
-            type_code: TYPE,
-            key: ObjectKey(u64::from(eu.index())),
-        }),
-    }
+/// The identity edge use `eu` of `b` owns geometry under ([`Brep::owner_identity`]:
+/// for a [`NamingScheme::Caller`](crate::topology::NamingScheme::Caller) B-rep the key recorded for it, else its notification
+/// identity, the identity `check_brep` checks the owner against), a B-rep that
+/// records no scheme included: upstream `SetUVTrimCurve` always owns the
+/// new curve by its holder (`pUVTrimCurve->SetOwner(eu)`), so leaving it without owner
+/// would differ from upstream for every B-rep made by `Brep::new`
+/// (`plan/findings/topology.edgeuse_p1--uv-trim-owner-under-unknown-naming.md`); the
+/// arena scheme names edge uses alike (`Brep::use_arena_naming` rebinds their trims).
+pub(crate) fn owner_ref_in(b: &Brep, eu: EdgeuseId) -> ObjectRef {
+    b.owner_identity(EntityRef::Edgeuse(eu))
 }
 
 /// `DeleteUVTrimCurve`: `SetUVTrimCurve(NULL, 0.0, TRUE, NULL)`.
@@ -869,7 +853,8 @@ pub type ReplacedUvTrimCurve = (Option<Curve>, Option<Box<DropCurveFail<ObjectHa
 
 /// `SetMemberUVTrimCurve`: places `curve` (and `drop_curve_fail` when given) on the
 /// [`OrientType::Same`] member of the mated pair (this edge use when it is the `SAME`
-/// one, else its mate) without any other bookkeeping; returns what the slots held.
+/// one, else its mate) and makes that member the curve's owner, without any other
+/// bookkeeping; returns what the slots held.
 ///
 /// # Errors
 ///
@@ -878,7 +863,7 @@ pub type ReplacedUvTrimCurve = (Option<Curve>, Option<Box<DropCurveFail<ObjectHa
 pub fn set_member_uv_trim_curve(
     b: &mut Brep,
     eu: EdgeuseId,
-    curve: Curve,
+    mut curve: Curve,
     drop_curve_fail: Option<DropCurveFail<ObjectHandle>>,
 ) -> Result<ReplacedUvTrimCurve> {
     let owner = if b.edgeuse(eu)?.orientation == OrientType::Same {
@@ -886,6 +871,9 @@ pub fn set_member_uv_trim_curve(
     } else {
         mate(b, eu)?.ok_or_else(|| null("SetMemberUVTrimCurve: edge use without mate"))?
     };
+    // pUVTrimCurve->SetOwner(pOwner), under the B-rep's naming (a UV trim curve notifies
+    // nothing), as `set_uv_trim_curve`
+    let _ = curve.set_owner(Some(owner_ref_in(b, owner)), None);
     let r = b.edgeuse_mut(owner)?;
     let old_curve = r.uv_trim_curve.replace(curve);
     let old_fail = match drop_curve_fail {
@@ -2002,6 +1990,18 @@ mod tests {
             set_member_uv_trim_curve(&mut b, b0, uv_line([0.0, 0.0], [1.0, 0.0]), None).unwrap();
         assert!(old.is_none());
         assert!(uv_trim_curve_pointer(&b, a0).unwrap().is_some());
+
+        // the SAME member owns the curve it is given, whichever use of the pair placed
+        // it (SmEdgeuse::SetMemberUVTrimCurve's pUVTrimCurve->SetOwner(pOwner))
+        b.set_naming(crate::topology::NamingScheme::Notify);
+        let mut stale = uv_line([0.0, 1.0], [1.0, 1.0]);
+        let _ = stale.set_owner(Some(owner_ref_in(&b, b0)), None);
+        set_member_uv_trim_curve(&mut b, b0, stale, None).unwrap();
+        let owner = uv_trim_curve_pointer(&b, a0)
+            .unwrap()
+            .and_then(Curve::owner);
+        assert_eq!(owner, Some(owner_ref_in(&b, a0)));
+        assert!(owner.is_some());
     }
 
     #[test]

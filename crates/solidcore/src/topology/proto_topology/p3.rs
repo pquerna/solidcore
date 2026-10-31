@@ -76,6 +76,22 @@
 //!   failing paths are not reachable from the callers ported so far).
 //! - The `SM_DEBUG_CODE` blocks are not ported.
 //! - **Recursion.** None.
+//! - **Upper split child's interval** (WR-101, opt-in
+//!   `Kernel::fixes.proto_edge_split_upper_keeps_the_old_max`): `SmProtoEdge::Split` sets
+//!   the upper child's interval from this edge's interval after clamping it, so the upper
+//!   child gets `[dT, dT]` instead of `[dT, old_max]`. With the flag the upper child keeps
+//!   `[dT, old_max]`; the lower child is `[old_min, dT]` either way. Off by default for
+//!   pinned C++ parity.
+//! - **HANG-51.** `ResolveOverlappingProtoEdges` does not advance its index after it
+//!   replaces an overlapping proto edge group, and a replacement can form a new group
+//!   at the same index forever (`Solids/extrusion_old.smb`, rounded solid outset 2.5:
+//!   a two-edge group re-formed thousands of times; the C++ hangs too). The port fails
+//!   with `InvalidInput` once it has replaced more than [`MAX_OVERLAP_GROUPS_BASE`] +
+//!   [`OVERLAP_GROUPS_PER_PROTO_EDGE`] x (proto edges at entry) groups in one call.
+//!   The topology intersector's caller propagates it (it ignores only soft statuses).
+//!   Across the difftest cases of the boolean, merge, topology intersector, proto
+//!   topology, offset and fillet intersector units, four calls replace a group, one
+//!   each.
 
 use crate::curve::curve::p2::Curve;
 use crate::curve::curve::p8::CurveIntersectOptions;
@@ -99,6 +115,20 @@ use super::p1::{
 use super::p2::ProtoBrep;
 
 const OP: &str = "topology::proto_topology::p3";
+const OP_RESOLVE_OVERLAPPING: &str =
+    "topology::proto_topology::p3::resolve_overlapping_proto_edges";
+/// Overlapping proto edge groups one
+/// [`ProtoTopologyManager::resolve_overlapping_proto_edges`] may replace beyond
+/// [`OVERLAP_GROUPS_PER_PROTO_EDGE`] per proto edge it starts with (not upstream; see
+/// the module deviations, HANG-51).
+pub const MAX_OVERLAP_GROUPS_BASE: usize = 64;
+
+/// Overlapping proto edge groups one
+/// [`ProtoTopologyManager::resolve_overlapping_proto_edges`] may replace per proto edge
+/// it starts with, on top of [`MAX_OVERLAP_GROUPS_BASE`] (each group holds at least two
+/// proto edges, so a call that does not cycle replaces groups in proportion to its
+/// proto edges).
+pub const OVERLAP_GROUPS_PER_PROTO_EDGE: usize = 4;
 const OP_ED_SPLIT: &str = "topology::proto_topology::p3::edge_definition_split";
 const OP_SPLIT_INT: &str = "topology::proto_topology::p3::split_intersecting_proto_edges";
 
@@ -671,6 +701,11 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
     /// split point, splitting every edge definition as well. Returns the new vertex
     /// and edge; `(None, None)` when `dt` is not interior.
     ///
+    /// With `Kernel::fixes.proto_edge_split_upper_keeps_the_old_max` the upper child keeps
+    /// this edge's old interval maximum (`[dt, old_max]`); without it (default, pinned
+    /// C++) the upper child is `[dt, dt]`, because upstream reads this edge's maximum
+    /// after clamping it to `dt` (WR-101). The lower child is `[old_min, dt]` either way.
+    ///
     /// # Errors
     ///
     /// [`SolidError::InvalidInput`] for a deleted object; `SM_ERR_NULL_POINTER` when no
@@ -723,12 +758,15 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         };
 
         // set Split child ProtoEdge intervals (the upper one is set from this
-        // edge's interval after it was changed, as upstream; the upper child gets [dT, dT],
-        // plan/upstream-issues.md WR-101)
+        // edge's interval after it was changed, as upstream; the upper child gets [dT, dT]
+        // without the opt-in, plan/upstream-issues/WR-101)
         let mut lower = self
             .proto_edge(pe)
             .ok_or(dangling("proto edge is deleted"))?
             .xsect_interval();
+        // WR-101: upstream reads this maximum after clamping it, giving the upper child
+        // `[dT, dT]`; the opt-in keeps the old maximum (`[dT, old_max]`).
+        let old_max = lower.max();
         ignore_soft(lower.set_min_max(lower.min(), dt))?;
         self.proto_edge_mut(pe)
             .ok_or(dangling("proto edge is deleted"))?
@@ -737,7 +775,12 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
             .proto_edge(new_pe)
             .ok_or(dangling("proto edge is deleted"))?
             .xsect_interval();
-        ignore_soft(upper.set_min_max(dt, lower.max()))?;
+        let upper_max = if k.fixes.proto_edge_split_upper_keeps_the_old_max {
+            old_max
+        } else {
+            lower.max()
+        };
+        ignore_soft(upper.set_min_max(dt, upper_max))?;
         self.proto_edge_mut(new_pe)
             .ok_or(dangling("proto edge is deleted"))?
             .set_xsect_interval(upper);
@@ -1389,6 +1432,12 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
 
         // For each PE (at least one of the SrcTopos should be an edge.)
         let mut ii = 0usize;
+        // groups replaced so far and the most allowed (not upstream: HANG-51, see the
+        // module deviations)
+        let mut groups_resolved = 0usize;
+        let max_groups = OVERLAP_GROUPS_PER_PROTO_EDGE
+            .saturating_mul(self.proto_edges().len())
+            .saturating_add(MAX_OVERLAP_GROUPS_BASE);
         // repeat the index when the list was changed by removing a group
         while let Some(&pe) = self.proto_edges().get(ii) {
             let group = self.overlapping_pe_group(pe)?;
@@ -1398,6 +1447,13 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
             if !found_group {
                 ii += 1;
                 continue;
+            }
+            groups_resolved += 1;
+            if groups_resolved > max_groups {
+                return Err(SolidError::invalid_input(
+                    OP_RESOLVE_OVERLAPPING,
+                    "overlapping proto edge groups keep re-forming (HANG-51)",
+                ));
             }
 
             // lowest topology search locals
@@ -1599,8 +1655,8 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                         )?;
 
                         // Make sure that a parameter is set in each PointClass object.
-                        ignore_soft(cc1.set_point_class_parameters(k, &*geometry, false))?;
-                        ignore_soft(cc2.set_point_class_parameters(k, &*geometry, false))?;
+                        ignore_soft(geometry.set_point_class_parameters_mut(k, &mut cc1, false))?;
+                        ignore_soft(geometry.set_point_class_parameters_mut(k, &mut cc2, false))?;
 
                         cc1s.push(cc1);
                         cc2s.push(cc2);
@@ -1643,8 +1699,8 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                 ))?;
 
                 let _ = cc1.extract_geometry(k, &*geometry, &mut cc2, ExtractOptions::default())?;
-                ignore_soft(cc1.set_point_class_parameters(k, &*geometry, false))?;
-                ignore_soft(cc2.set_point_class_parameters(k, &*geometry, false))?;
+                ignore_soft(geometry.set_point_class_parameters_mut(k, &mut cc1, false))?;
+                ignore_soft(geometry.set_point_class_parameters_mut(k, &mut cc2, false))?;
                 cc1s.push(cc1);
                 cc2s.push(cc2);
             }

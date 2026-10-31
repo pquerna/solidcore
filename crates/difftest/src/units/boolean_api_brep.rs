@@ -8,7 +8,7 @@
 //! A case is one API call (`api` plus its arguments). Operands are boxes
 //! (`SmApiCreateBox`) or spheres (`SmApiCreateSphere`); fixture cases also use sheets
 //! (`SmApiCreatePlane`), disks (`SmApiCreatePlanarCircle`), tori (`SmApiCreateTorus`),
-//! operands moved by `SmApiRotate` /
+//! cylinders (`SmApiCreateCylinder`), cones (`SmApiCreateCone`), operands moved by `SmApiRotate` /
 //! `SmApiTranslate` steps, skin solids (`SmApiCreateSkinPrimitive` of exact NURB curves)
 //! and the result of an `SmApiBoolean` of two operands. Both sides
 //! build them with the same constructors (`primitive::api_primitives`,
@@ -45,7 +45,17 @@
 //! its own long attribute before `SmApiBoolean`, each side on its own operands (the C++
 //! shim with `SmLongAttribute`s, the Rust side with `Brep::add_attribute`), and also
 //! compares `attributes`: per result face (edge) its area (length) and the attributes it
-//! carries, sorted by attributes, so attribute propagation through the merge shows.
+//! carries, sorted by attributes, so attribute propagation through the merge shows. A
+//! `boolean_2d` call with `attributed` tags both operands the same way before
+//! `SmApiBoolean2d` and compares an assigned result's `attributes` likewise.
+//!
+//! A `checked` call (fixtures only) runs `SmApiBoolean`, then the capi check sequence
+//! (`SmBrep::ValidatePointers`, then `SmBrep::AssertValid`; Rust
+//! `topology::brep::validation::check_brep`) on the result at `level` (default 2), and
+//! also compares `check`: the pointer check's status, whether `AssertValid` ran and
+//! passed, and for each list the failed tests (reporting type, list and test index) with
+//! how many reports each failed. The entities a report names are not compared: the two
+//! sides number a boolean result's entities differently.
 //!
 //! Compared: the input validation (`SM_BO_EXTRACT_SEPARATE` for the two-B-rep entry
 //! points, short lists and operations other than union / intersection / difference /
@@ -70,6 +80,7 @@ use solidcore::boolean::api_brep as api;
 use solidcore::boolean::merge::MergeOptions;
 use solidcore::curve::curve::Curve as SmCurve;
 use solidcore::geom::a_object::BooleanOperation;
+use solidcore::geom::assert_array::AssertArray;
 use solidcore::geom::attribute::{Attribute, AttributeStore, Behavior, ObjectKey};
 use solidcore::geom::vector3d::{Point3, Vec3};
 use solidcore::kernel::Kernel;
@@ -86,6 +97,7 @@ use solidcore::sweep::api_brep::{
 use solidcore::sweep::api_surfaces::create_skin_primitive;
 use solidcore::error::SM_ERR;
 use solidcore::topology::brep::p1::BoundaryTessellation;
+use solidcore::topology::brep::validation::{check_brep, CheckLevel};
 use solidcore::topology::brep::{p1 as brep_p1, p2 as brep_p2};
 use solidcore::topology::edgeuse::p1 as edgeuse_p1;
 use solidcore::topology::proto_topology::p1::api_transform::{
@@ -160,6 +172,13 @@ enum BrepIn {
     },
     /// `SmApiCreatePlanarCircle` (a disk in the XY plane).
     Disk { origin: P3, radius: f64 },
+    /// `SmApiCreateCone` (`SmBrep*&` overload; axis +Z, `origin` the base center).
+    Cone {
+        origin: P3,
+        radius_base: f64,
+        radius_top: f64,
+        height: f64,
+    },
 }
 
 /// The `pRegionBrep` of a non-manifold sweep.
@@ -322,6 +341,11 @@ enum Inputs {
         a: BrepIn,
         b: BrepIn,
         operation: i32,
+        /// Both operands' faces and edges tagged first (operands 0 and 1, this
+        /// `SmAttributeBehaviorType`), as [`Inputs::Attributed`] tags them; an assigned
+        /// result's record adds the attributes its faces and edges carry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attributed: Option<u8>,
     },
     /// `SmApiNonManifoldBoolean`.
     NonManifold {
@@ -349,6 +373,10 @@ enum Inputs {
         region: RegionIn,
         #[serde(default)]
         selection: SelectionIn,
+        /// Tag every face and edge first (operand 0 of [`Inputs::Attributed`], this
+        /// behaviour) and compare the swept B-rep's attribute rows too.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attributed: Option<u8>,
     },
     /// `SmApiNonManifoldRotationalSweep(brep, region, ...)`.
     RotationalSweep {
@@ -364,6 +392,10 @@ enum Inputs {
         region: RegionIn,
         #[serde(default)]
         selection: SelectionIn,
+        /// Tag every face and edge first (operand 0 of [`Inputs::Attributed`], this
+        /// behaviour) and compare the swept B-rep's attribute rows too.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attributed: Option<u8>,
     },
     /// Both operands' faces and edges tagged with their own long attribute (behaviour
     /// `behavior`, an `SmAttributeBehaviorType` value), then `SmApiBoolean`; the record
@@ -374,6 +406,12 @@ enum Inputs {
         operation: i32,
         #[serde(default)]
         behavior: u8,
+        /// `SmApiBooleanWithOptions` with these flags instead of `SmApiBoolean`.
+        #[serde(default)]
+        flags: Option<FlagsIn>,
+        /// With `flags`: the first operand is first replaced by its `SmApiBrepCopy`.
+        #[serde(default)]
+        copy_first: bool,
     },
     /// `SmApiTessellateBoundaries` of `brep`, the edges at `drop_curves` (`GetEdges`
     /// indices) first left without curve.
@@ -383,6 +421,27 @@ enum Inputs {
         #[serde(default)]
         drop_curves: Vec<u64>,
     },
+    /// A `merge_breps`, `lists` or `trees` call whose input B-reps (in input order,
+    /// `breps1` then `breps2`) are each tagged as operand `i`, as `attributed` tags its
+    /// two; the record adds the attributes every output B-rep's faces and edges carry.
+    AttributedList {
+        call: Box<Inputs>,
+        #[serde(default)]
+        behavior: u8,
+    },
+    /// `SmApiBoolean`, then the capi check of its result at `level` (an
+    /// `SmAssertTestLevel`, 0 to 2); the record adds the failed tests.
+    Checked {
+        a: BrepIn,
+        b: BrepIn,
+        operation: i32,
+        #[serde(default = "level_2")]
+        level: u8,
+    },
+}
+
+fn level_2() -> u8 {
+    2
 }
 
 fn spec(b: &BrepIn) -> BrepSpec {
@@ -450,6 +509,17 @@ fn spec(b: &BrepIn) -> BrepSpec {
             b: Box::new(spec(b)),
         },
         &BrepIn::Disk { origin, radius } => BrepSpec::Disk { origin, radius },
+        &BrepIn::Cone {
+            origin,
+            radius_base,
+            radius_top,
+            height,
+        } => BrepSpec::Cone {
+            origin,
+            radius_base,
+            radius_top,
+            height,
+        },
     }
 }
 
@@ -538,10 +608,16 @@ fn to_call(i: &Inputs) -> Call {
             b: spec(b),
             operation: *operation,
         },
-        Inputs::Boolean2d { a, b, operation } => Call::Boolean2d {
+        Inputs::Boolean2d {
+            a,
+            b,
+            operation,
+            attributed,
+        } => Call::Boolean2d {
             a: spec(a),
             b: spec(b),
             operation: *operation,
+            attributed: *attributed,
         },
         Inputs::NonManifold { a, b, operation } => Call::NonManifold {
             a: spec(a),
@@ -561,6 +637,7 @@ fn to_call(i: &Inputs) -> Call {
             merge,
             region,
             selection: sel,
+            attributed,
         } => Call::Sweep {
             brep: spec(brep),
             dir: *dir,
@@ -569,6 +646,7 @@ fn to_call(i: &Inputs) -> Call {
             merge: *merge,
             region: region.ffi(),
             selection: selection(sel),
+            attributed: *attributed,
         },
         Inputs::RotationalSweep {
             brep,
@@ -579,6 +657,7 @@ fn to_call(i: &Inputs) -> Call {
             merge,
             region,
             selection: sel,
+            attributed,
         } => Call::RotationalSweep {
             brep: spec(brep),
             base: *base,
@@ -588,17 +667,32 @@ fn to_call(i: &Inputs) -> Call {
             merge: *merge,
             region: region.ffi(),
             selection: selection(sel),
+            attributed: *attributed,
         },
         Inputs::Attributed {
             a,
             b,
             operation,
             behavior,
+            flags,
+            copy_first,
         } => Call::Attributed {
             a: spec(a),
             b: spec(b),
             operation: *operation,
             behavior: *behavior,
+            options: flags.map(|f| {
+                (
+                    *copy_first,
+                    Flags {
+                        cookie_cutter: f.cookie_cutter,
+                        imprinting: f.imprinting,
+                        boolean_post_process: f.boolean_post_process,
+                        imprint_and_classify_faces: f.imprint_and_classify_faces,
+                        keep_other_brep: f.keep_other_brep,
+                    },
+                )
+            }),
         },
         Inputs::TessellateBoundaries {
             brep,
@@ -608,6 +702,21 @@ fn to_call(i: &Inputs) -> Call {
             brep: spec(brep),
             angle_tol_deg: *angle_tol_deg,
             drop_curves: drop_curves.clone(),
+        },
+        Inputs::AttributedList { call, behavior } => Call::AttributedList {
+            call: Box::new(to_call(call)),
+            behavior: *behavior,
+        },
+        Inputs::Checked {
+            a,
+            b,
+            operation,
+            level,
+        } => Call::Checked {
+            a: spec(a),
+            b: spec(b),
+            operation: *operation,
+            level: *level,
         },
     }
 }
@@ -642,8 +751,34 @@ fn cpp(i: &Inputs) -> Result<Output, HarnessError> {
         Ok(o) => match i {
             Inputs::Measured { .. } => measured_output(&o, "measures"),
             Inputs::Attributed { .. } => measured_output(&o, "attributes"),
+            Inputs::AttributedList { .. } if o.first() == Some(&0.0) => {
+                let (head, rows) = ffi::split_measures(&o)
+                    .ok_or_else(|| harness("cpp: attributed record too short"))?;
+                Ok(to_output(head)?.values("attributes", rows.to_vec()))
+            }
+            Inputs::Checked { .. } => checked_output(&o),
+            Inputs::Boolean2d {
+                attributed: Some(_),
+                ..
+            } if o.first() == Some(&0.0) && o.get(1) == Some(&1.0) => {
+                let (head, rows) = ffi::split_measures(&o)
+                    .ok_or_else(|| harness("cpp: attributed 2D record too short"))?;
+                Ok(areas_output(head, true)?.values("attributes", rows.to_vec()))
+            }
             Inputs::Boolean2d { .. } => {
                 areas_output(&o, o.first() == Some(&0.0) && o.get(1) == Some(&1.0))
+            }
+            Inputs::Sweep {
+                attributed: Some(_),
+                ..
+            }
+            | Inputs::RotationalSweep {
+                attributed: Some(_),
+                ..
+            } if o.first() == Some(&0.0) => {
+                let (head, rows) = ffi::split_measures(&o)
+                    .ok_or_else(|| harness("cpp: attributed sweep record too short"))?;
+                Ok(areas_output(head, true)?.values("attributes", rows.to_vec()))
             }
             Inputs::Sweep { .. } | Inputs::RotationalSweep { .. } => {
                 areas_output(&o, o.first() == Some(&0.0))
@@ -666,6 +801,28 @@ fn measured_output(o: &[f64], key: &str) -> Result<Output, HarnessError> {
     let (head, measures) =
         ffi::split_measures(o).ok_or_else(|| harness("cpp: measured record too short"))?;
     Ok(to_output(head)?.values(key, measures.to_vec()))
+}
+
+/// A `checked` record: the integer record, then on success (`status` 0 and a result) the
+/// check the shim appends, split off as the integers `check` ([`ffi::split_measures`]).
+fn checked_output(o: &[f64]) -> Result<Output, HarnessError> {
+    let succeeded = o.first() == Some(&0.0) && o.get(1) == Some(&1.0);
+    if !succeeded {
+        return to_output(o);
+    }
+    let (head, check) =
+        ffi::split_measures(o).ok_or_else(|| harness("cpp: checked record too short"))?;
+    let check = check
+        .iter()
+        .map(|&x| {
+            if x.fract() == 0.0 && x.abs() < 1e15 {
+                Ok(x as i64)
+            } else {
+                Err(harness(format!("non-integer check entry {x}")))
+            }
+        })
+        .collect::<Result<Vec<i64>, _>>()?;
+    Ok(to_output(head)?.ints("check", check))
 }
 
 /// A record that ends, when `has_areas`, with the shim's `put_areas` tail (split off as
@@ -870,6 +1027,12 @@ fn build_at(k: &mut Kernel, b: &BrepIn, depth: usize) -> Result<Brep, Stop> {
             create_skin_primitive(k, &counts, &refs, *degree as usize, *cap_ends).map(|s| s.brep)
         }
         &BrepIn::Disk { origin, radius } => primitives::create_planar_circle(k, p3(origin), radius),
+        &BrepIn::Cone {
+            origin,
+            radius_base,
+            radius_top,
+            height,
+        } => primitives::create_cone(k, p3(origin), radius_base, radius_top, height),
     };
     r.map_err(|e| stop("operand constructor", &e))
 }
@@ -976,6 +1139,40 @@ fn measures(k: &Kernel, b: &mut Brep) -> Result<Vec<f64>, Stop> {
     Ok(o)
 }
 
+/// The shim's `put_failed_tests`: `groups` then per failed report's (reporting type,
+/// list index, test index), in ascending order, `type list test count`.
+fn failed_tests(o: &mut Vec<i64>, reports: &AssertArray) -> Result<(), Stop> {
+    let mut groups: std::collections::BTreeMap<(i64, i64, i64), i64> =
+        std::collections::BTreeMap::new();
+    for r in reports.reports().iter().filter(|r| !r.ok) {
+        let list = i64::try_from(r.list_index).map_err(|_| harness("list index overflow"))?;
+        let test = i64::try_from(r.test_index).map_err(|_| harness("test index overflow"))?;
+        *groups.entry((r.reporting_type, list, test)).or_insert(0) += 1;
+    }
+    o.push(count(groups.len())?);
+    for ((t, l, i), n) in groups {
+        o.extend([t, l, i, n]);
+    }
+    Ok(())
+}
+
+/// The shim's `run_checked` tail: the capi check of `b` at `level` (`check_brep`), as
+/// `pointers_status failed... assert_valid failed...` (`assert_valid` `-1` when skipped).
+fn check(k: &mut Kernel, b: &mut Brep, level: u8) -> Result<Vec<i64>, Stop> {
+    let level = match level {
+        0 => CheckLevel::Level0,
+        1 => CheckLevel::Level1,
+        2 => CheckLevel::Level2,
+        _ => return Err(Stop::Harness(harness(format!("check level {level}")))),
+    };
+    let c = check_brep(k, b, level).map_err(|e| stop("check_brep", &e))?;
+    let mut o = vec![i64::from(c.pointers_status)];
+    failed_tests(&mut o, &c.pointer_reports)?;
+    o.push(c.assert_valid.map_or(-1, i64::from));
+    failed_tests(&mut o, &c.reports)?;
+    Ok(o)
+}
+
 /// The shim's `tag_operand`: every face (`GetFaces` order) and edge (`GetEdges` order) of
 /// operand `operand` gets its own long attribute, id = value =
 /// `ATTRIBUTE_BASE + 1000 operand + 500 kind + index`, behaviour `behavior`.
@@ -1061,6 +1258,102 @@ fn put_attributes(k: &Kernel, o: &mut Vec<f64>, b: &mut Brep) -> Result<(), Stop
     o.push(rows.len() as f64);
     o.extend(rows.into_iter().flatten());
     Ok(())
+}
+
+/// The shim's `tag_all`: B-rep `i` of `breps` tagged as operand `i`.
+fn tag_all(breps: &mut [Brep], behavior: Behavior) -> Result<(), Stop> {
+    for (i, b) in breps.iter_mut().enumerate() {
+        tag_operand(b, i as u64, behavior)?;
+    }
+    Ok(())
+}
+
+/// An `attributed_list` call (the shim's `run_attributed_list`): the inner list call on
+/// tagged inputs, a successful record followed by each output B-rep's attribute rows.
+fn attributed_list(
+    k: &mut Kernel,
+    call: &Inputs,
+    behavior: Behavior,
+    seen: &dyn Fn(&SolidError),
+) -> Result<Output, Stop> {
+    let err_output = |e: &SolidError| {
+        seen(e);
+        err_output(e)
+    };
+    match call {
+        Inputs::MergeBreps {
+            breps: list,
+            operation,
+        } => {
+            let mut v = build_all(k, list)?;
+            tag_all(&mut v, behavior)?;
+            match api::merge_breps(k, &mut v, op(*operation)?) {
+                Ok(mut res) => {
+                    let mut o = vec![count(v.len())?, 1];
+                    put_brep(&mut o, &res)?;
+                    let mut rows = Vec::new();
+                    put_attributes(k, &mut rows, &mut res)?;
+                    Ok(record(0, o).values("attributes", rows))
+                }
+                Err(e) if matches!(e, SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }) => {
+                    seen(&e);
+                    Ok(record(status(&e), vec![1, count(v.len())?]))
+                }
+                Err(e) => Ok(err_output(&e)),
+            }
+        }
+        Inputs::Lists {
+            breps1,
+            breps2,
+            operation,
+        } => {
+            let mut all = build_all(k, breps1)?;
+            all.extend(build_all(k, breps2)?);
+            tag_all(&mut all, behavior)?;
+            let b2 = all.split_off(breps1.len());
+            match api::boolean_lists(k, &all, &[], &b2, &[], *operation) {
+                Ok(mut res) => {
+                    let mut o = vec![count(res.breps.len())?];
+                    for b in &res.breps {
+                        o.push(1);
+                        put_brep(&mut o, b)?;
+                    }
+                    o.push(count(res.surfaces.len())?);
+                    let mut rows = Vec::new();
+                    for b in &mut res.breps {
+                        put_attributes(k, &mut rows, b)?;
+                    }
+                    Ok(record(0, o).values("attributes", rows))
+                }
+                Err(e) => Ok(err_output(&e)),
+            }
+        }
+        Inputs::Trees { breps: list, tree } => {
+            let mut built = build_all(k, list)?;
+            tag_all(&mut built, behavior)?;
+            let mut v: Vec<Option<Brep>> = built.into_iter().map(Some).collect();
+            match api::boolean_trees(k, &mut v, tree) {
+                Ok(()) => {
+                    let mut o = vec![count(v.len())?];
+                    for b in &v {
+                        o.push(i64::from(b.is_some()));
+                        if let Some(b) = b {
+                            put_brep(&mut o, b)?;
+                        }
+                    }
+                    let mut rows = Vec::new();
+                    for b in v.iter_mut().flatten() {
+                        put_attributes(k, &mut rows, b)?;
+                    }
+                    Ok(record(0, o).values("attributes", rows))
+                }
+                Err(e) => Ok(err_output(&e)),
+            }
+        }
+        _ => Err(Stop::Harness(harness(
+            "attributed_list call is not merge_breps, lists or trees",
+        ))),
+    }
 }
 
 /// The shim's `put_areas`: `faces` and the face areas in ascending order (a failed face
@@ -1162,6 +1455,7 @@ fn sweep_record(
     k: &Kernel,
     r: solidcore::Result<()>,
     b: &mut Brep,
+    attributed: bool,
     seen: &dyn Fn(&SolidError),
 ) -> Result<Output, Stop> {
     match r {
@@ -1169,7 +1463,13 @@ fn sweep_record(
             let mut o = Vec::new();
             put_brep(&mut o, b)?;
             let a = areas(k, b)?;
-            Ok(record(0, o).values("areas", a))
+            let out = record(0, o).values("areas", a);
+            if !attributed {
+                return Ok(out);
+            }
+            let mut rows = Vec::new();
+            put_attributes(k, &mut rows, b)?;
+            Ok(out.values("attributes", rows))
         }
         Err(e) if matches!(e, SolidError::InvalidInput { .. }) => {
             seen(&e);
@@ -1363,14 +1663,40 @@ fn rust_call_with(k: &mut Kernel, i: &Inputs, seen: &dyn Fn(&SolidError)) -> Res
             b,
             operation,
             behavior,
+            flags,
+            copy_first,
         } => {
             let behavior = Behavior::from_code(i32::from(*behavior))
                 .map_err(|e| Stop::Harness(harness(format!("behavior: {e}"))))?;
             let (mut a, mut b) = (build(k, a)?, build(k, b)?);
             tag_operand(&mut a, 0, behavior)?;
             tag_operand(&mut b, 1, behavior)?;
-            let kept = keeps_other(*operation, false);
-            match api::boolean(k, a, b, op(*operation)?) {
+            let kept = keeps_other(*operation, flags.is_some_and(|f| f.keep_other_brep));
+            let run = match flags {
+                None => api::boolean(k, a, b, op(*operation)?),
+                Some(f) => {
+                    let a = if *copy_first {
+                        // SmApiBrepCopy of the tagged operand (an arena-only store,
+                        // as the topology.brep_p3 copy runner's)
+                        let mut state = solidcore::topology::brep::p2::ArenaNotifyState::default();
+                        let mut env = state.env(None);
+                        env.key_of = &super::topology_brep_p3::key_of;
+                        match solidcore::topology::brep::p3::api_brep_copy(
+                            k,
+                            &mut env,
+                            Some(&a),
+                            &super::topology_brep_p3::source_key_of,
+                        ) {
+                            Ok(c) => c,
+                            Err(e) => return Ok(err_output(&e)),
+                        }
+                    } else {
+                        a
+                    };
+                    api::boolean_with_options(k, a, b, op(*operation)?, options(*f))
+                }
+            };
+            match run {
                 Ok(mut out) => {
                     let rec = two_record(&out, kept)?;
                     let mut rows = Vec::new();
@@ -1385,6 +1711,22 @@ fn rust_call_with(k: &mut Kernel, i: &Inputs, seen: &dyn Fn(&SolidError)) -> Res
                 Err(e) => Ok(err_output(&e)),
             }
         }
+        Inputs::Checked {
+            a,
+            b,
+            operation,
+            level,
+        } => {
+            let (a, b) = (build(k, a)?, build(k, b)?);
+            match api::boolean(k, a, b, op(*operation)?) {
+                Ok(mut out) => {
+                    let rec = two_record(&out, keeps_other(*operation, false))?;
+                    let c = check(k, &mut out.result, *level)?;
+                    Ok(rec.ints("check", c))
+                }
+                Err(e) => Ok(err_output(&e)),
+            }
+        }
         Inputs::NonManifold { a, b, operation } => {
             let (a, b) = (build(k, a)?, build(k, b)?);
             two(
@@ -1392,15 +1734,32 @@ fn rust_call_with(k: &mut Kernel, i: &Inputs, seen: &dyn Fn(&SolidError)) -> Res
                 keeps_other(*operation, false),
             )
         }
-        Inputs::Boolean2d { a, b, operation } => {
+        Inputs::Boolean2d {
+            a,
+            b,
+            operation,
+            attributed,
+        } => {
             let operation = op_2d(*operation)?;
-            let (a, b) = (build(k, a)?, build(k, b)?);
+            let (mut a, mut b) = (build(k, a)?, build(k, b)?);
+            if let Some(behavior) = attributed {
+                let behavior = Behavior::from_code(i32::from(*behavior))
+                    .map_err(|e| Stop::Harness(harness(format!("behavior: {e}"))))?;
+                tag_operand(&mut a, 0, behavior)?;
+                tag_operand(&mut b, 1, behavior)?;
+            }
             match api::boolean_2d(k, a, b, operation) {
                 Ok(api::Boolean2dOutcome::Result(mut res)) => {
                     let mut o = vec![1];
                     put_brep(&mut o, &res)?;
                     let a = areas(k, &mut res)?;
-                    Ok(record(0, o).values("areas", a))
+                    let out = record(0, o).values("areas", a);
+                    if attributed.is_none() {
+                        return Ok(out);
+                    }
+                    let mut rows = Vec::new();
+                    put_attributes(k, &mut rows, &mut res)?;
+                    Ok(out.values("attributes", rows))
                 }
                 Ok(api::Boolean2dOutcome::Unassigned { brep1, brep2 }) => {
                     let mut o = vec![0];
@@ -1431,9 +1790,15 @@ fn rust_call_with(k: &mut Kernel, i: &Inputs, seen: &dyn Fn(&SolidError)) -> Res
             merge,
             region,
             selection: sel,
+            attributed,
         } => {
             let mut b = build(k, brep)?;
             let (f, e, v) = picked(&b, sel)?;
+            if let Some(behavior) = attributed {
+                let behavior = Behavior::from_code(i32::from(*behavior))
+                    .map_err(|e| Stop::Harness(harness(format!("behavior: {e}"))))?;
+                tag_operand(&mut b, 0, behavior)?;
+            }
             let other = region_other(k, *region)?;
             let selection = SweepSelection {
                 faces: f.as_deref(),
@@ -1443,7 +1808,7 @@ fn rust_call_with(k: &mut Kernel, i: &Inputs, seen: &dyn Fn(&SolidError)) -> Res
             let dir = Vec3::new(dir[0], dir[1], dir[2]);
             let region = region_arg(*region, other.as_ref());
             let r = non_manifold_sweep(k, &mut b, region, dir, *dist, *stitch, *merge, selection);
-            sweep_record(k, r, &mut b, seen)
+            sweep_record(k, r, &mut b, attributed.is_some(), seen)
         }
         Inputs::RotationalSweep {
             brep,
@@ -1454,9 +1819,15 @@ fn rust_call_with(k: &mut Kernel, i: &Inputs, seen: &dyn Fn(&SolidError)) -> Res
             merge,
             region,
             selection: sel,
+            attributed,
         } => {
             let mut b = build(k, brep)?;
             let (f, e, v) = picked(&b, sel)?;
+            if let Some(behavior) = attributed {
+                let behavior = Behavior::from_code(i32::from(*behavior))
+                    .map_err(|e| Stop::Harness(harness(format!("behavior: {e}"))))?;
+                tag_operand(&mut b, 0, behavior)?;
+            }
             let other = region_other(k, *region)?;
             let selection = SweepSelection {
                 faces: f.as_deref(),
@@ -1476,7 +1847,7 @@ fn rust_call_with(k: &mut Kernel, i: &Inputs, seen: &dyn Fn(&SolidError)) -> Res
                 *merge,
                 selection,
             );
-            sweep_record(k, r, &mut b, seen)
+            sweep_record(k, r, &mut b, attributed.is_some(), seen)
         }
         Inputs::TessellateBoundaries {
             brep,
@@ -1512,6 +1883,11 @@ fn rust_call_with(k: &mut Kernel, i: &Inputs, seen: &dyn Fn(&SolidError)) -> Res
             }
             let points: Vec<f64> = t.points.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
             Ok(record(status, o).values("points", points))
+        }
+        Inputs::AttributedList { call, behavior } => {
+            let behavior = Behavior::from_code(i32::from(*behavior))
+                .map_err(|e| Stop::Harness(harness(format!("behavior: {e}"))))?;
+            attributed_list(k, call, behavior, seen)
         }
         Inputs::Trees { breps: list, tree } => {
             let mut v: Vec<Option<Brep>> = build_all(k, list)?.into_iter().map(Some).collect();
@@ -1826,6 +2202,7 @@ fn gen_more(rng: &mut Rng) -> Inputs {
                 a,
                 b,
                 operation: rng.below(5) as i32,
+                attributed: None,
             }
         }
         9 | 10 => {
@@ -1846,6 +2223,7 @@ fn gen_more(rng: &mut Rng) -> Inputs {
                 merge: rng.chance(0.3),
                 region: gen_region(rng),
                 selection,
+                attributed: None,
             }
         }
         _ => {
@@ -1871,6 +2249,7 @@ fn gen_more(rng: &mut Rng) -> Inputs {
                 merge: rng.chance(0.3),
                 region: gen_region(rng),
                 selection,
+                attributed: None,
             }
         }
     }

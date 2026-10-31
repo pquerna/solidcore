@@ -19,8 +19,9 @@
 //! curves, each `p n+1 (n+1) x [x y z w] (n+p+2) knots`, built as
 //! `SmBSplineCurve(gw_CURVE*, 3, FALSE)`; at most [`MAX_SKIN_CURVES`]) or `8 O[3] radius`
 //! (`SmApiCreatePlanarCircle`) or `9 O[3] radius
-//! height` (`SmApiCreateCylinder`, the `SmBrep*&` overload). Nested blocks are at most
-//! [`MAX_DEPTH`] deep.
+//! height` (`SmApiCreateCylinder`, the `SmBrep*&` overload) or `10 O[3] radius_base
+//! radius_top height` (`SmApiCreateCone`, the `SmBrep*&` overload). Nested blocks are at
+//! most [`MAX_DEPTH`] deep.
 //!
 //! | [`Call`]        | op | args                                   | output after the status (on success)            |
 //! |-----------------|----|----------------------------------------|-------------------------------------------------|
@@ -40,8 +41,13 @@
 //! | `Piecewise`     | 14 | brep brep `create_new`                 | `has [is_first brep brep]`                      |
 //! | `Sweep`         | 15 | brep `D[3] dist stitch merge region` sel | brep (also on `SM_ERR_INVALID_INPUT`)         |
 //! | `RotationalSweep` | 16 | brep `P[3] A[3] angle stitch merge region` sel | brep (also on `SM_ERR_INVALID_INPUT`)  |
-//! | `Attributed`    | 17 | brep brep `operation` `behavior`       | two-B-rep record, then the attribute rows       |
+//! | `Attributed`    | 17 | brep brep `operation` `behavior` [`copy_first` flags] | two-B-rep record, then the attribute rows |
 //! | `TessellateBoundaries` | 18 | brep `angle_tol_deg` `nd`, `nd` edge indices | (also after `SM_ERR`) `ne` edge indices, `nc` counts, `np` points `x y z` |
+//! | `AttributedList` | 19 | `behavior`, a `MergeBreps` / `Lists` / `Trees` call | its record, then the attribute rows |
+//! | `Checked`       | 20 | brep brep `operation` `level`          | two-B-rep record, then the result's check       |
+//! | `Sweep` (attributed) | 21 | `behavior`, then op 15's args     | op 15's record, then the attribute rows         |
+//! | `RotationalSweep` (attributed) | 22 | `behavior`, then op 16's args | op 16's record, then the attribute rows |
+//! | `Boolean2d` (attributed) | 23 | `behavior`, then op 12's args | op 12's record, then (an assigned result) the attribute rows |
 //!
 //! The two-B-rep record is `has [is_first kept brep [brep]]` (the second B-rep when
 //! upstream keeps it); a B-rep is `faces edges vertices regions manifold_solid`, then per
@@ -79,14 +85,35 @@
 //! `Attributed` gives every face (`GetFaces` order) and edge (`GetEdges` order) of the first
 //! (operand 0) and second (operand 1) B-rep its own `SmLongAttribute`: id
 //! [`ATTRIBUTE_BASE`] `+ 1000 operand + 500 kind + index` (kind 0 face, 1 edge), value the
-//! id, behaviour `behavior` (`SmAttributeBehaviorType`, 0 to 4); then `SmApiBoolean`. On
+//! id, behaviour `behavior` (`SmAttributeBehaviorType`, 0 to 4); then `SmApiBoolean`, or
+//! with `options` (the optional tail `copy_first` and the five flags)
+//! `SmApiBooleanWithOptions`, the first operand first replaced by its `SmApiBrepCopy`
+//! when `copy_first` (a kept second operand follows `bKeepOtherBrep` too). On
 //! success the two-B-rep record is followed by `faces rows... edges rows...` of the result
 //! and, when upstream keeps it, of the second B-rep, then the number of those values
 //! ([`split_measures`]). A row is `measure n` then per attribute (in ascending order)
-//! `id behavior value users` (value: the long value, else 0; users: `GetUsers`' size); the
+//! `id behavior value users` (value: the long value, else 0; users: the `GetUsers` that are `SmTopology` objects, as the port keeps no attributes on geometry); the
 //! measure is the face's `SmApiFaceComputeArea` at [`AREA_ACCURACY`] or the edge's
 //! `SmApiEdgeComputeLength` at [`LENGTH_ACCURACY`] (minus the status on failure); rows are
 //! sorted by their attribute part, then by measure ([`sort_rows`]).
+//! `AttributedList` tags every B-rep `i` of a `MergeBreps`, `Lists` or `Trees` call's
+//! lists (in input order, `breps1` then `breps2`) as operand `i`, runs the call, and ends a
+//! successful record with the `faces rows... edges rows...` of each output B-rep (the
+//! result; each list output; each non-null tree slot), then the number of those values.
+//! An attributed sweep (op `21` / `22`: [`Call::Sweep`] / [`Call::RotationalSweep`] with
+//! `attributed`) tags the swept B-rep's faces and edges the same way (operand 0) before
+//! the sweep; a successful record ends, after the areas tail, with that B-rep's
+//! `faces rows... edges rows...` and the number of those values.
+//!
+//! `Checked` runs `SmApiBoolean`, then on success the capi check sequence on the result at
+//! `level` (`SmAssertTestLevel`, 0 to 2): `SmBrep::ValidatePointers` (its default
+//! `SM_NO_WALK`), then `SmBrep::AssertValid` with `SM_WALK` unless the pointer check
+//! reported a failure. After the two-B-rep record come `pointers_status failed...
+//! assert_valid failed...` and the number of those values ([`split_measures`]):
+//! `assert_valid` is `-1` when skipped, else `0`/`1`; each `failed` is `groups` then per
+//! failed test, in ascending order, `reporting_type list_index test_index count` (which
+//! tests fail and how often; the sides number a result's entities differently, so the
+//! entities a report names are not compared).
 //!
 //! [`run`] accepts only what upstream handles without undefined behaviour: finite
 //! operand data with positive box and plane dimensions and a nonzero sphere radius (torus
@@ -97,7 +124,8 @@
 //! at most [`MAX_LIST`] B-reps per list and [`MAX_TREE`] tree nodes in -64..=64; tree
 //! executed B-rep nodes in range and binary operands non-null (`SmMerge::BooleanTrees`
 //! indexes unchecked and clears each leaf slot). Safe repeated leaves remain accepted.
-//! A disk radius is finite (`SmPrimitiveCreation::CreateCircle` fails cleanly otherwise);
+//! A disk radius is finite (`SmPrimitiveCreation::CreateCircle` fails cleanly otherwise),
+//! as are a cone's dimensions (`SmApiConeDimsValid` rejects the rest);
 //! sweep vectors, distances and angles are finite. Selection indices past the operand's
 //! lists are `SC_ERR_ARG` from the shim.
 
@@ -231,6 +259,18 @@ pub enum BrepSpec {
         origin: [f64; 3],
         /// Radius.
         radius: f64,
+    },
+    /// `SmApiCreateCone(origin, radius_base, radius_top, height)` (axis +Z, the `SmBrep*&`
+    /// overload).
+    Cone {
+        /// Center of the base.
+        origin: [f64; 3],
+        /// Radius at the base (at least zero).
+        radius_base: f64,
+        /// Radius at the top (at least zero; not both zero).
+        radius_top: f64,
+        /// Height (positive).
+        height: f64,
     },
 }
 
@@ -450,6 +490,10 @@ pub enum Call {
         b: BrepSpec,
         /// `Sm2DBooleanOperationType` value (0 to 4).
         operation: i32,
+        /// Both operands' faces and edges tagged first with this `SmAttributeBehaviorType`
+        /// (op `23`, as an attributed sweep's); an assigned result's record then ends with
+        /// its attribute rows.
+        attributed: Option<u8>,
     },
     /// `SmApiNonManifoldBoolean`.
     NonManifold {
@@ -485,6 +529,10 @@ pub enum Call {
         region: RegionArg,
         /// The optional selections.
         selection: Selection,
+        /// `Some(behavior)`: every face and edge of the B-rep is tagged first, as
+        /// [`Call::Attributed`] tags operand 0 (op `21`/`22`), and the record ends with
+        /// the swept B-rep's attribute rows.
+        attributed: Option<u8>,
     },
     /// `SmApiNonManifoldRotationalSweep(brep, region, ...)`.
     RotationalSweep {
@@ -504,6 +552,10 @@ pub enum Call {
         region: RegionArg,
         /// The optional selections.
         selection: Selection,
+        /// `Some(behavior)`: every face and edge of the B-rep is tagged first, as
+        /// [`Call::Attributed`] tags operand 0 (op `21`/`22`), and the record ends with
+        /// the swept B-rep's attribute rows.
+        attributed: Option<u8>,
     },
     /// Both operands' faces and edges tagged, then `SmApiBoolean`, followed by the
     /// attribute rows of the B-reps it returns.
@@ -516,6 +568,9 @@ pub enum Call {
         operation: i32,
         /// `SmAttributeBehaviorType` value of the tags (0 to 4).
         behavior: u8,
+        /// `SmApiBooleanWithOptions` instead of `SmApiBoolean`: whether the first operand
+        /// is first replaced by its `SmApiBrepCopy`, and the merge flags.
+        options: Option<(bool, Flags)>,
     },
     /// `SmApiTessellateBoundaries` of `brep`, the edges at `drop_curves` (`GetEdges`
     /// indices) first left without curve.
@@ -526,6 +581,26 @@ pub enum Call {
         angle_tol_deg: f64,
         /// `GetEdges` indices of the edges whose curve is taken away.
         drop_curves: Vec<u64>,
+    },
+    /// A [`Call::MergeBreps`], [`Call::Lists`] or [`Call::Trees`] whose input B-reps are
+    /// tagged, followed by the attribute rows of the B-reps it returns.
+    AttributedList {
+        /// The list call.
+        call: Box<Call>,
+        /// `SmAttributeBehaviorType` value of the tags (0 to 4).
+        behavior: u8,
+    },
+    /// `SmApiBoolean`, followed by the capi check (`ValidatePointers`, then
+    /// `AssertValid`) of its result.
+    Checked {
+        /// First operand.
+        a: BrepSpec,
+        /// Second operand.
+        b: BrepSpec,
+        /// `SmBooleanOperationType` value.
+        operation: i32,
+        /// `SmAssertTestLevel` value (0 to 2).
+        level: u8,
     },
 }
 
@@ -632,6 +707,22 @@ fn check_spec(s: &BrepSpec, depth: usize) -> Result<(), FfiError> {
         BrepSpec::Disk { origin, radius } => {
             if !origin.iter().all(|x| x.is_finite()) || !radius.is_finite() {
                 return Err(bad("disk: non-finite value"));
+            }
+        }
+        BrepSpec::Cone {
+            origin,
+            radius_base,
+            radius_top,
+            height,
+        } => {
+            // `SmApiConeDimsValid` rejects the rest cleanly (`SM_ERR_INVALID_INPUT`, a
+            // failing constructor: `SC_ERR_ARG`)
+            if !origin.iter().all(|x| x.is_finite())
+                || !radius_base.is_finite()
+                || !radius_top.is_finite()
+                || !height.is_finite()
+            {
+                return Err(bad("cone: non-finite value"));
             }
         }
     }
@@ -742,6 +833,16 @@ fn push_checked(o: &mut Vec<f64>, s: &BrepSpec) {
             o.extend_from_slice(origin);
             o.push(*radius);
         }
+        BrepSpec::Cone {
+            origin,
+            radius_base,
+            radius_top,
+            height,
+        } => {
+            o.push(10.0);
+            o.extend_from_slice(origin);
+            o.extend([*radius_base, *radius_top, *height]);
+        }
     }
 }
 
@@ -768,6 +869,17 @@ fn push_list(o: &mut Vec<f64>, l: &[BrepSpec], max: usize) -> Result<(), FfiErro
     o.push(l.len() as f64);
     for s in l {
         push_spec(o, s)?;
+    }
+    Ok(())
+}
+
+/// A sweep's op code: `op`, or with `attributed` the attributed op (`op + 3`) and the
+/// behaviour.
+fn push_attributed(o: &mut Vec<f64>, op: f64, attributed: Option<u8>) -> Result<(), FfiError> {
+    match attributed {
+        None => o.push(op),
+        Some(behavior) if behavior <= 4 => o.extend([op + 6.0, f64::from(behavior)]),
+        Some(_) => return Err(bad("behavior is not an SmAttributeBehaviorType value")),
     }
     Ok(())
 }
@@ -873,11 +985,20 @@ fn encode(call: &Call) -> Result<Vec<f64>, FfiError> {
             push_spec(&mut o, b)?;
             o.push(f64::from(*operation));
         }
-        Call::Boolean2d { a, b, operation } => {
+        Call::Boolean2d {
+            a,
+            b,
+            operation,
+            attributed,
+        } => {
             if !(0..=4).contains(operation) {
                 return Err(bad("operation is not an Sm2DBooleanOperationType value"));
             }
-            o.push(12.0);
+            match attributed {
+                None => o.push(12.0),
+                Some(behavior) if *behavior <= 4 => o.extend([23.0, f64::from(*behavior)]),
+                Some(_) => return Err(bad("behavior is not an SmAttributeBehaviorType value")),
+            }
             push_spec(&mut o, a)?;
             push_spec(&mut o, b)?;
             o.push(f64::from(*operation));
@@ -896,11 +1017,12 @@ fn encode(call: &Call) -> Result<Vec<f64>, FfiError> {
             merge,
             region,
             selection,
+            attributed,
         } => {
             if !dir.iter().all(|x| x.is_finite()) || !dist.is_finite() {
                 return Err(bad("sweep: non-finite value"));
             }
-            o.push(15.0);
+            push_attributed(&mut o, 15.0, *attributed)?;
             push_spec(&mut o, brep)?;
             o.extend_from_slice(dir);
             o.push(*dist);
@@ -916,11 +1038,12 @@ fn encode(call: &Call) -> Result<Vec<f64>, FfiError> {
             merge,
             region,
             selection,
+            attributed,
         } => {
             if !base.iter().chain(axis).all(|x| x.is_finite()) || !angle_deg.is_finite() {
                 return Err(bad("rotational sweep: non-finite value"));
             }
-            o.push(16.0);
+            push_attributed(&mut o, 16.0, *attributed)?;
             push_spec(&mut o, brep)?;
             o.extend_from_slice(base);
             o.extend_from_slice(axis);
@@ -933,6 +1056,7 @@ fn encode(call: &Call) -> Result<Vec<f64>, FfiError> {
             b,
             operation,
             behavior,
+            options,
         } => {
             check_op(*operation)?;
             if *behavior > 4 {
@@ -943,6 +1067,16 @@ fn encode(call: &Call) -> Result<Vec<f64>, FfiError> {
             push_spec(&mut o, b)?;
             o.push(f64::from(*operation));
             o.push(f64::from(*behavior));
+            if let Some((copy_first, flags)) = options {
+                o.extend([
+                    flag(*copy_first),
+                    flag(flags.cookie_cutter),
+                    flag(flags.imprinting),
+                    flag(flags.boolean_post_process),
+                    flag(flags.imprint_and_classify_faces),
+                    flag(flags.keep_other_brep),
+                ]);
+            }
         }
         Call::TessellateBoundaries {
             brep,
@@ -957,6 +1091,36 @@ fn encode(call: &Call) -> Result<Vec<f64>, FfiError> {
             o.push(*angle_tol_deg);
             o.push(drop_curves.len() as f64);
             o.extend(drop_curves.iter().map(|&d| d as f64));
+        }
+        Call::AttributedList { call, behavior } => {
+            if *behavior > 4 {
+                return Err(bad("behavior is not an SmAttributeBehaviorType value"));
+            }
+            if !matches!(
+                **call,
+                Call::MergeBreps { .. } | Call::Lists { .. } | Call::Trees { .. }
+            ) {
+                return Err(bad("attributed list call is not MergeBreps, Lists or Trees"));
+            }
+            o.push(19.0);
+            o.push(f64::from(*behavior));
+            o.extend(encode(call)?);
+        }
+        Call::Checked {
+            a,
+            b,
+            operation,
+            level,
+        } => {
+            check_op(*operation)?;
+            if *level > 2 {
+                return Err(bad("level is not an SmAssertTestLevel value (0 to 2)"));
+            }
+            o.push(20.0);
+            push_spec(&mut o, a)?;
+            push_spec(&mut o, b)?;
+            o.push(f64::from(*operation));
+            o.push(f64::from(*level));
         }
     }
     Ok(o)
@@ -1052,5 +1216,42 @@ mod tests {
         };
         assert!(encode(&call(&slice(10))).is_ok());
         assert!(encode(&call(&slice(6))).is_err());
+    }
+
+    #[test]
+    fn checked_takes_a_cone_and_only_assert_test_levels() {
+        let cone = BrepSpec::Cone {
+            origin: [0.0; 3],
+            radius_base: 0.0,
+            radius_top: 3.0,
+            height: 2.0,
+        };
+        let shape = BrepSpec::Box {
+            origin: [0.0; 3],
+            size: [1.0; 3],
+        };
+        let call = |level| Call::Checked {
+            a: shape.clone(),
+            b: cone.clone(),
+            operation: 1,
+            level,
+        };
+        let encoded = encode(&call(2)).unwrap();
+        assert_eq!(encoded.first(), Some(&20.0));
+        assert_eq!(&encoded[8..13], &[10.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(&encoded[encoded.len() - 2..], &[1.0, 2.0]);
+        assert!(encode(&call(3)).is_err());
+        let bad = Call::Checked {
+            a: shape,
+            b: BrepSpec::Cone {
+                origin: [0.0; 3],
+                radius_base: f64::NAN,
+                radius_top: 3.0,
+                height: 2.0,
+            },
+            operation: 1,
+            level: 2,
+        };
+        assert!(encode(&bad).is_err());
     }
 }

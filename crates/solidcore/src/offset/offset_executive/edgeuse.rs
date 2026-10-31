@@ -407,6 +407,7 @@ impl EdgeBrep<'_> {
             surface,
             trim_curves,
             trim_orientations: made.trim_orientations,
+            closing_wall: made.closing_wall,
         })
     }
 }
@@ -419,6 +420,9 @@ pub(super) struct EdgeCap {
     pub(super) trim_curves: Vec<Curve>,
     /// `sTrimOrientations`.
     pub(super) trim_orientations: Vec<OrientType>,
+    /// Not upstream (`bClosingWall`, opt-in `Kernel::fixes.local_operation_step_walls`):
+    /// the cap is a step wall, kept out of the face extensions.
+    pub(super) closing_wall: bool,
 }
 
 impl ClassGeometry<Handle> for EdgeBrep<'_> {
@@ -1052,6 +1056,11 @@ impl OffsetBrep<Handle> for EdgeBrep<'_> {
         Ok(eu::face(self.brep(arena), u)?.map(|f| Handle::topology(arena, EntityRef::Face(f))))
     }
 
+    fn edgeuse_orientation(&self, u: Handle) -> Result<OrientType> {
+        let (arena, u) = u.edgeuse()?;
+        eu::orientation(self.brep(arena), u)
+    }
+
     fn edgeuse_faceuse(&self, u: Handle) -> Result<Option<Handle>> {
         let (arena, u) = u.edgeuse()?;
         Ok(eu::faceuse(self.brep(arena), u)?
@@ -1206,6 +1215,12 @@ impl CreatorExecutive<Handle> for Executive<'_> {
                 .offset_edgeuse(u)
                 .map(|o| Handle::topology(Arena::Offset, EntityRef::Edgeuse(o))),
             _ => None,
+        }
+    }
+
+    fn note_unmated_edgeuse(&mut self, original: Handle) {
+        if let Object::Topology(Arena::Original, EntityRef::Edgeuse(u)) = original.object {
+            self.inner.unmated_edgeuses.insert(u);
         }
     }
 

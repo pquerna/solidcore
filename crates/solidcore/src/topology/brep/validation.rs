@@ -19,12 +19,16 @@
 //! requests and run tests whose level is at most the requested level, as upstream.
 
 mod assert_valid;
+pub(crate) use assert_valid::standalone_curve_assert_valid;
 mod coincidence;
 mod pointers;
 pub(crate) mod spatial;
 
-pub use assert_valid::{assert_valid, check_brep, check_brep_with_keys, BrepCheck, CheckLevel};
+pub use assert_valid::{
+    assert_valid, check_brep, check_brep_with_keys, curve_assert_valid, BrepCheck, CheckLevel,
+};
 pub use coincidence::{contains_coincident_topology, CoincidenceResult};
+pub(crate) use pointers::validate_geometry;
 pub use pointers::validate_pointers;
 
 use crate::error::{EntityRef, Result, SolidError};
@@ -34,8 +38,8 @@ use crate::topology::{Brep, BrepId, EdgeuseId, FaceId};
 
 const OP: &str = "topology::brep::validation";
 const BREP_TYPE: i64 = 16011;
-const SUCCESS: i32 = 1000;
-const ERROR: i32 = 1001;
+use crate::error::SM_ERR as ERROR;
+use crate::error::SM_SUCCESS as SUCCESS;
 
 fn invalid(reason: &'static str) -> SolidError {
     SolidError::invalid_input(OP, reason)

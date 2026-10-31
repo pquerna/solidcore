@@ -10,7 +10,7 @@ use super::topology_edgeuse_p1::{brep_block_of, path_of, BrepIn};
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use solidcore::geom::assert_array::{obj_type_string, AssertArray, ObjectKey as ReportKey};
+use solidcore::geom::assert_array::{labels, obj_type_string, AssertArray, ObjectKey as ReportKey};
 use solidcore::geom::attribute::ObjectKey;
 use solidcore::geom::object::ObjectRef;
 use solidcore::topology::brep::validation;
@@ -61,6 +61,12 @@ struct Inputs {
     /// ([`copy_summary`]): the copy's report identities are its caller keys.
     #[serde(default)]
     copy: bool,
+    /// With `copy`: check the result of an operation on the copy instead (shim op 4,
+    /// `copy_operation`; #1631): 1 union with a 10 mm box at `value` on each axis, 2
+    /// the same with that box's copy, 3 `fillet_edges` of edge `index` with radius
+    /// `value`, 4 a shell of distance `value` with face `index` open.
+    #[serde(default)]
+    copy_op: u8,
     #[serde(default)]
     mutation: u8,
     #[serde(default)]
@@ -132,6 +138,8 @@ const CONVENTIONS: crate::own_builder::Conventions<'static> = crate::own_builder
     face_owner: &own_face_owner,
     edge_owner: &own_edge_owner,
     edgeuse_owner: &own_edgeuse_owner,
+    // the runner records `Notify` itself, after the build
+    naming: NamingScheme::Unknown,
 };
 fn block(src: &Src) -> Result<(String, Vec<f64>), HarnessError> {
     Ok(match src {
@@ -174,7 +182,11 @@ fn args(i: &Inputs) -> [f64; 5] {
     [
         f64::from(i.level),
         f64::from(i.walk),
-        f64::from(i.mutation),
+        f64::from(if i.copy && i.copy_op != 0 {
+            i.copy_op
+        } else {
+            i.mutation
+        }),
         i.index as f64,
         i.value,
     ]
@@ -392,18 +404,26 @@ fn read_reports(rd: &mut Reader<'_>) -> Result<(Vec<Rec>, i64), HarnessError> {
     let last_add = rd.num()? as i64;
     Ok((out, last_add))
 }
-/// The capi line of a decoded report.
+/// The capi line of a decoded report, as `BrepCheck::lines`: the owner tag only when the
+/// report names an owner type (the shim writes a `NULL` one as empty).
 fn line(r: &Rec) -> String {
     let test = r.ints.get(2).copied().unwrap_or(-1);
     let text = |i: usize| r.texts.get(i).map_or("", String::as_str);
-    format!(
-        "{}::Test #{} {}: {} [owner {}]",
-        text(6),
-        test,
-        text(0),
-        text(5),
-        text(3)
-    )
+    let head = format!("{}::Test #{} {}: {}", text(6), test, text(0), text(5));
+    match text(3) {
+        "" => head,
+        owner => format!("{head} [owner {owner}]"),
+    }
+}
+/// A decoded report the capi lines count, as `BrepCheck::lines`: failed (`!m_bOK`) and
+/// not a warning (`labels::is_warning` of its reporting type, list and test).
+fn failed(r: &Rec) -> bool {
+    let index = |i: usize| r.ints.get(i).and_then(|&x| u64::try_from(x).ok());
+    let warning = match (r.ints.first(), index(1), index(2)) {
+        (Some(&t), Some(list), Some(test)) => labels::is_warning(t, list, test),
+        _ => false,
+    };
+    r.ints.get(4) == Some(&0) && !warning
 }
 fn put(o: Output, prefix: &str, reports: &[Rec], last_add: i64) -> Output {
     let mut ints = vec![reports.len() as i64];
@@ -444,14 +464,14 @@ fn output(protocol: &[f64], capi: bool) -> Result<Output, HarnessError> {
         if status != 1000 && pointers.is_empty() {
             lines.push(format!("SmBrep::ValidatePointers failed with status {status}"));
         }
-        lines.extend(pointers.iter().filter(|r| r.ints.get(4) == Some(&0)).map(line));
+        lines.extend(pointers.iter().filter(|r| failed(r)).map(line));
         if pointer_failures {
             lines.push("AssertValid skipped: ValidatePointers failed".to_string());
         } else {
-            if assert == 0 && asserts.is_empty() {
+            if assert == 0 && !asserts.iter().any(failed) {
                 lines.push("SmBrep::AssertValid failed without a report".to_string());
             }
-            lines.extend(asserts.iter().filter(|r| r.ints.get(4) == Some(&0)).map(line));
+            lines.extend(asserts.iter().filter(|r| failed(r)).map(line));
         }
         let o = Output::new()
             .int("pointers_status", status)
@@ -531,8 +551,8 @@ fn level2_tests(k: &mut Kernel, b: &mut Brep) -> solidcore::Result<Vec<f64>> {
     Ok(out)
 }
 
-/// Why op 2 refuses mutations 8-10 (null face surface, edge curve, edge use link): the
-/// level-2 tests dereference them unguarded in C++.
+/// Why op 2 refuses mutations 8 and 9 (null face surface, edge curve): the level-2 tests
+/// dereference them unguarded in C++ (UB-281); a null edge use link (10) is compared.
 /// The capi check level of a case (levels 0 to 2).
 fn capi_level(i: &Inputs) -> Result<validation::CheckLevel, HarnessError> {
     Ok(match i.level {
@@ -600,7 +620,7 @@ fn copy_check(k: &mut Kernel, src: &Brep, i: &Inputs) -> Result<Output, HarnessE
     let mut state = solidcore::topology::brep::p2::ArenaNotifyState::new(&Brep::new());
     let mut env = state.env(None);
     env.key_of = &copy_key;
-    let mut copy =
+    let copy =
         match solidcore::topology::brep::p3::api_brep_copy(k, &mut env, Some(src), &key) {
             Ok(c) => c,
             Err(e) => {
@@ -609,9 +629,111 @@ fn copy_check(k: &mut Kernel, src: &Brep, i: &Inputs) -> Result<Output, HarnessE
                 ))
             }
         };
-    capi_output(validation::check_brep(k, &mut copy, level)).map(copy_summary)
+    let mut result = match copy_operation(k, copy, i) {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            return Ok(copy_summary(
+                Output::unported(&e).unwrap_or_else(|| Output::err(e.to_string())),
+            ))
+        }
+        Err(e) => return Err(e),
+    };
+    capi_output(validation::check_brep(k, &mut result, level)).map(copy_summary)
 }
-const NULL_LINK_TESTS: &str = "the level-2 tests dereference the nulled link (crash in C++)";
+/// The operation of a copy case on the copy (`copy_operation` of the shim, through the
+/// Rust API): the copy itself without one; the operation's error inside.
+fn copy_operation(
+    k: &mut Kernel,
+    mut copy: Brep,
+    i: &Inputs,
+) -> Result<solidcore::Result<Brep>, HarnessError> {
+    use solidcore::boolean::api_brep::boolean_union;
+    use solidcore::primitive::api_primitives::create_box;
+    let v = i.value;
+    Ok(match i.copy_op {
+        0 => Ok(copy),
+        1 | 2 => (|| {
+            let mut other = create_box(k, Vec3::new(v, v, v), 10.0, 10.0, 10.0)?;
+            if i.copy_op == 2 {
+                let other_key = |e: EntityRef| {
+                    let r = key(e);
+                    ObjectRef {
+                        type_code: r.type_code,
+                        key: ObjectKey(r.key.0 | (2 << 40)),
+                    }
+                };
+                let mut state =
+                    solidcore::topology::brep::p2::ArenaNotifyState::new(&Brep::new());
+                let mut env = state.env(None);
+                env.key_of = &other_key;
+                other = solidcore::topology::brep::p3::api_brep_copy(k, &mut env, Some(&other), &key)?;
+            }
+            boolean_union(k, copy, other)
+        })(),
+        3 => (|| {
+            let edges = copy.edge_list().to_vec();
+            let edge = *edges
+                .get(i.index % edges.len().max(1))
+                .ok_or_else(|| solidcore::SolidError::invalid_input("difftest", "no edge"))?;
+            solidcore::blend::fillet_executive::api::fillet_edges(k, &mut copy, &[edge], v, 1, 1, 1.0)?;
+            Ok(copy)
+        })(),
+        4 => shell_copy(k, copy, i),
+        _ => return Err(herr("copy_op takes 0 to 4")),
+    })
+}
+/// `SmApiShellBrepFull` of a copy case: the copy shelled by `value` (extended convex
+/// edges, merged results, no offset solid) with face `index` of its face list open.
+fn shell_copy(k: &mut Kernel, mut copy: Brep, i: &Inputs) -> solidcore::Result<Brep> {
+    use super::offset_offset_executive_p2 as off;
+    use solidcore::geom::attribute::AttributeStore;
+    use solidcore::offset::offset_executive::p1::OffsetExecutive;
+    use solidcore::offset::offset_executive::p2::{OffsetNotifications, OffsetOptions, ShellOptions};
+    let faces = copy.face_list().to_vec();
+    let open = *faces
+        .get(i.index % faces.len().max(1))
+        .ok_or_else(|| solidcore::SolidError::invalid_input("difftest", "no face"))?;
+    let mut records = solidcore::topology::topology::NotifyRecords::new();
+    let mut attributes = AttributeStore::default();
+    off::register_notification_brep(&mut records, &mut copy, off::NAMESPACE_SOURCE);
+    let result_brep =
+        off::result_notification_key(EntityRef::Brep(solidcore::topology::BrepId::from_index(0)));
+    records.insert(result_brep.key, solidcore::topology::topology::Topology::new());
+    let mut notifications = OffsetNotifications {
+        records: &mut records,
+        attributes: &mut attributes,
+        original_key_of: &off::original_notification_key,
+        result_key_of: &off::result_notification_key,
+        original_curve_ref: &off::original_curve_key,
+        result_curve_ref: &off::result_curve_key,
+        boolean_source_lists: &off::boolean_source_lists,
+        result_brep,
+        merge_identities: Some(&off::MergeBodies),
+    };
+    OffsetExecutive::shell_brep(
+        k,
+        copy,
+        ShellOptions {
+            offset: OffsetOptions {
+                distance: i.value,
+                extend_convex_edges: true,
+                merge_results: true,
+            },
+            create_offset_solid: false,
+            merge_sheet_side_walls: false,
+        },
+        &[open],
+        &mut notifications,
+    )
+    .result
+    .map(|mut b| {
+        // as `api_shell_brep_full` does for its caller: the port's cached topology fields
+        b.refresh_cached_topology();
+        b
+    })
+}
+const NULL_LINK_TESTS: &str =
+    "the level-2 tests dereference the nulled surface or curve (crash in C++, UB-281)";
 
 impl UnitDiff for Runner {
     fn id(&self) -> &'static str {
@@ -619,12 +741,14 @@ impl UnitDiff for Runner {
     }
     fn run_cpp(&self, case: &Case) -> Result<Output, HarnessError> {
         let i: Inputs = case.parse()?;
-        if i.tests && i.mutation >= 8 {
+        if i.tests && (i.mutation == 8 || i.mutation == 9) {
             return Ok(Output::rejected(NULL_LINK_TESTS));
         }
         let (path, block) = block(&i.brep)?;
         let op = if i.tests {
             2
+        } else if i.copy && i.copy_op != 0 {
+            4
         } else if i.copy {
             3
         } else {
@@ -743,6 +867,7 @@ impl UnitDiff for Runner {
             capi,
             tests: false,
             copy: false,
+            copy_op: 0,
             mutation,
             index: rng.below(100) as usize,
             value,

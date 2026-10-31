@@ -100,6 +100,13 @@ enum SurfaceIn {
     Ruled { curve1: Vec<P>, curve2: Vec<P> },
     /// `SmApiCreateSurfaceFromCornerPoints(uminvmin, umaxvmin, uminvmax, umaxvmax)`.
     Corners { corners: [P; 4] },
+    /// `SmApiCreateSurfaceFromOrderedPoints(points, rows, cols)`: the bicubic
+    /// least-squares surface of a `rows x cols` grid (`points[i * cols + j]`).
+    Ordered {
+        rows: usize,
+        cols: usize,
+        points: Vec<P>,
+    },
     /// An analytic surface's `CreateCanonical`, then `AdjustSTEPUVDomain(domain)` when
     /// given (`[umin, vmin, umax, vmax]`, STEP parameters).
     Analytic {
@@ -304,6 +311,12 @@ fn push_surface(o: &mut Vec<f64>, s: &SurfaceIn) {
         SurfaceIn::Corners { corners } => {
             o.push(5.);
             for p in corners {
+                o.extend(p);
+            }
+        }
+        SurfaceIn::Ordered { rows, cols, points } => {
+            o.extend([7., *rows as f64, *cols as f64]);
+            for p in points {
                 o.extend(p);
             }
         }
@@ -608,6 +621,25 @@ fn build_surface(k: &mut Kernel, s: &SurfaceIn) -> SolidResult<Surface> {
         SurfaceIn::Corners { corners: [a, b, c, d] } => Surface::from(
             BSplineSurface::create_bilinear_surface(v(*a), v(*b), v(*c), v(*d))?,
         ),
+        SurfaceIn::Ordered { rows, cols, points } => {
+            // the shim's guard (its stream holds rows * cols points)
+            if !(2..=16).contains(rows)
+                || !(2..=16).contains(cols)
+                || points.len() != rows * cols
+            {
+                return Err(SolidError::invalid_input(
+                    "difftest::intersect_api_intersectors::build_surface",
+                    "ordered grid",
+                ));
+            }
+            Surface::from(
+                solidcore::primitive::api_surface_ops::create_surface_from_ordered_points(
+                    &points_of(points),
+                    *rows as u64,
+                    *cols as u64,
+                )?,
+            )
+        }
         SurfaceIn::Analytic { shape, domain } => {
             let frame = |origin: &P, x: &P, y: &P| -> SolidResult<Axis2Placement> {
                 let mut f = Axis2Placement::default();
@@ -975,13 +1007,35 @@ fn gen_curve(rng: &mut Rng, scale: f64) -> CurveIn {
         },
         _ => {
             let start = rng.uniform(0., 300.);
+            let center = point(rng, 0.3 * scale);
+            let radius = rng.uniform(0.2, 1.0) * scale;
+            let end = start + rng.uniform(20., 359.);
+            // CreateCircleSegment takes angles in [-360, 360]: an arc ending past 360 is
+            // drawn as the same arc one turn down (the draws are unchanged)
+            let (start, end) = if end > 360. {
+                (start - 360., end - 360.)
+            } else {
+                (start, end)
+            };
             CurveIn::Arc {
-                center: point(rng, 0.3 * scale),
-                radius: rng.uniform(0.2, 1.0) * scale,
+                center,
+                radius,
                 start,
-                end: start + rng.uniform(20., 359.),
+                end,
             }
         }
+    }
+}
+
+/// The number of faces the shim's (and the port's) constructor gives `body`
+/// (`GetFaces`): a drawn face index is taken modulo it, so it names a face of the body
+/// (the draws are unchanged).
+fn face_count(body: &BodyIn) -> usize {
+    match body {
+        BodyIn::Box { .. } => 6,
+        BodyIn::Sphere { .. } => 1,
+        BodyIn::Cylinder { .. } => 3,
+        BodyIn::HoledBox { .. } => 7,
     }
 }
 
@@ -1366,11 +1420,9 @@ fn gen_hit(rng: &mut Rng) -> Option<Value> {
         }
         1 => {
             let body = gen_hit_body(rng, scale);
-            Inputs::CurveFace {
-                curve: gen_body_curve(rng, scale, &body),
-                face: rng.below(7) as usize,
-                body,
-            }
+            let curve = gen_body_curve(rng, scale, &body);
+            let face = rng.below(7) as usize % face_count(&body);
+            Inputs::CurveFace { curve, face, body }
         }
         _ => {
             let body = gen_hit_body(rng, scale);
@@ -1430,11 +1482,13 @@ impl UnitDiff for Runner {
             2 => {
                 let body1 = gen_body(rng, scale);
                 let body2 = (!rng.chance(0.15)).then(|| gen_body(rng, scale));
+                let face1 = rng.below(6) as usize % face_count(&body1);
+                let face2 = rng.below(6) as usize % face_count(body2.as_ref().unwrap_or(&body1));
                 Inputs::Faces {
                     body1,
                     body2,
-                    face1: rng.below(6) as usize,
-                    face2: rng.below(6) as usize,
+                    face1,
+                    face2,
                     want_points: rng.chance(0.7),
                 }
             }
@@ -1470,5 +1524,48 @@ impl UnitDiff for Runner {
             cases.push(case);
         }
         Ok(cases)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The face counts the generators reduce drawn face indices by are the bodies' own
+    /// (`GetFaces`), for every body kind (the holed box: four sides, the top and bottom
+    /// with the hole, the hole's wall).
+    #[test]
+    fn face_counts_are_the_bodies_own() {
+        let bodies = [
+            BodyIn::Box {
+                origin: [0.; 3],
+                size: [10.; 3],
+            },
+            BodyIn::Sphere {
+                origin: [0.; 3],
+                radius: 2.,
+            },
+            BodyIn::Cylinder {
+                origin: [0.; 3],
+                radius: 1.,
+                height: 3.,
+            },
+            BodyIn::HoledBox {
+                origin: [0.; 3],
+                size: [10.; 3],
+                hole_origin: [5., 5., -1.],
+                hole_radius: 2.,
+                hole_height: 12.,
+            },
+        ];
+        for body in &bodies {
+            let mut k = Kernel::default();
+            let b = build_body(&mut k, body).unwrap();
+            assert_eq!(
+                brep1::faces(&b, None).unwrap().len(),
+                face_count(body),
+                "{body:?}"
+            );
+        }
     }
 }

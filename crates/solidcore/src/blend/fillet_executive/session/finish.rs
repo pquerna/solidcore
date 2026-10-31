@@ -14,11 +14,17 @@
 //! The original-trim mark lock encloses the tail, as upstream's `sMarkLocks` scope.
 //! `delete m_pFilletBrep` clears the session attributes and notification records of
 //! every entity of the intermediate body before `~SmBrep`. `RemoveTopoEdges` and
-//! `BooleanPostProcess` notify through local environments (their ports take none);
-//! afterwards the attributes of target edges they deleted are cleared from the
-//! session store. With the opt-in `Kernel::fixes.fillet_refuse_non_manifold_result`
+//! `BooleanPostProcess` notify through the session's records and attributes, so their
+//! face and edge merges carry the dying objects' attributes to the survivors
+//! (`SM_NO_MERGE_IN_BREP`); afterwards the attributes of target edges they deleted are
+//! cleared from the session store. With the opt-in `Kernel::fixes.fillet_refuse_non_manifold_result`
 //! `do_fillet` ends with the closed-manifold check of the generic
-//! `FilletExecutive::do_fillet` (not upstream, WR-212, tangency-labs/solidcore#422).
+//! `FilletExecutive::do_fillet` (not upstream, WR-212, tangency-labs/solidcore#422);
+//! the public wrappers that drive it put the caller's body back on that refusal.
+//! After the in-place merge (also on error) the geometry bound to the target's
+//! edges, edge uses and faces under the session's kernel identities is rebound to the
+//! target's naming, as the piecewise merge does (owners are pointers upstream;
+//! tangency-labs/solidcore#423).
 //! No public API entry point reaches `DoPiecewiseMerge` or a live-session
 //! `IntersectInsertRelate` (global merge): `SetFilletParameters` resets both flags;
 //! [`FilletSession::set_do_piecewise_merge`] selects the piecewise merge after it.
@@ -37,6 +43,36 @@ use crate::topology::brep::{p1, p3};
 use crate::topology::{BrepId, EdgeId};
 
 const OP: &str = "blend::fillet_executive::session::finish";
+
+/// Whether `error` is the refusal of `fixes.fillet_refuse_non_manifold_result`
+/// (WR-212): a result that is not a closed manifold solid, the only status 1001 of
+/// this file that names an edge. The public wrappers recognise it to put the caller's
+/// body back.
+pub(crate) fn is_non_manifold_refusal(error: &SolidError) -> bool {
+    matches!(
+        error,
+        SolidError::Upstream {
+            operation: OP,
+            code: 1001,
+            entity: Some(EntityRef::Edge(_)),
+        }
+    )
+}
+
+/// `error` without the entity it names (the refused result's edge, gone once the
+/// caller's body is put back).
+pub(crate) fn without_entity(error: SolidError) -> SolidError {
+    match error {
+        SolidError::Upstream {
+            operation, code, ..
+        } => SolidError::Upstream {
+            operation,
+            code,
+            entity: None,
+        },
+        other => other,
+    }
+}
 
 /// `FILEXEC_ERR`: the executive's generic failure status.
 fn failure() -> SolidError {
@@ -84,7 +120,39 @@ impl FinishAccess<'_, '_> {
         }
     }
 
-    /// `ClearAttributes` of target edges a local-environment edit deleted.
+    /// `body` on the target with a notification environment over the session's records
+    /// and attributes under the target's issued identities.
+    fn with_target_env<T>(
+        &mut self,
+        k: &mut Kernel,
+        body: impl FnOnce(
+            &mut Kernel,
+            &mut crate::topology::Brep,
+            &mut crate::topology::edge::NotifyEnv<'_>,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        let serial = self.0.target_serial;
+        let key_of = |entity| p3::topology_ref(serial, entity);
+        let SessionObjects {
+            target,
+            notification_records,
+            attributes,
+            ..
+        } = &mut *self.0;
+        p3::seed_records(notification_records, target, &key_of);
+        crate::geom::context::Context::with_notification_context(k, |k, context| {
+            let mut env = crate::topology::edge::NotifyEnv {
+                records: notification_records,
+                attributes,
+                context: Some(context),
+                key_of: &key_of,
+            };
+            body(k, target, &mut env)
+        })
+        .and_then(|result| result)
+    }
+
+    /// `ClearAttributes` of target edges an edit deleted.
     fn clear_deleted_edges(&mut self, before: &[EdgeId]) -> Result<()> {
         let serial = self.0.target_serial;
         for &edge in before {
@@ -256,8 +324,15 @@ impl FilletFinishAccess<FilletObject> for FinishAccess<'_, '_> {
             .map(|edge| edge.map(target_edge).transpose())
             .collect::<Result<Vec<_>>>()?;
         let before = p1::edges(self.0.target, None)?;
-        let result =
-            crate::blend::fillet_executive::p1::remove_topo_edges(k, self.0.target, &edges);
+        // As the cleanup below: the merges notify through the session's store.
+        let result = self.with_target_env(k, |k, target, env| {
+            crate::blend::fillet_executive::p1::remove_topo_edges_with_notifications(
+                k,
+                target,
+                &edges,
+                Some(env),
+            )
+        });
         let cleared = self.clear_deleted_edges(&before);
         result.and(cleared)
     }
@@ -308,12 +383,17 @@ impl FilletFinishAccess<FilletObject> for FinishAccess<'_, '_> {
             relations.kept_faces.clone_from(faces);
         }
         let before = p1::edges(self.0.target, None)?;
-        let result = crate::boolean::merge::p1::boolean_post_process(
-            k,
-            self.0.target,
-            &relations,
-            check_all_edges,
-        );
+        // The cleanup's face and edge merges notify through the session's store, so the
+        // survivors keep the attributes of the objects merged into them.
+        let result = self.with_target_env(k, |k, target, env| {
+            crate::boolean::merge::p1::boolean_post_process_with_notifications(
+                k,
+                target,
+                &relations,
+                check_all_edges,
+                Some(env),
+            )
+        });
         let cleared = self.clear_deleted_edges(&before);
         result.and(cleared)
     }
@@ -510,6 +590,17 @@ impl FilletSession<'_> {
             session.mark_corner_patches()?;
             let editing = session.objects.target.editing_enabled();
             session.objects.target.set_editing_enabled(true);
+            // The fork's (WR-631, WR-638): a cliff overflow closes the fillet faces into the
+            // region the blends remove and subtracts it from the target, instead of merging
+            // the fillet faces in; the error a failed subtraction noted stands.
+            if session.executive.cliff_overflow {
+                let result = session.subtract_removal_region(k);
+                session.objects.target.set_editing_enabled(editing);
+                if let Some(output) = error_out {
+                    output.assign(&session.executive.error);
+                }
+                return result;
+            }
             let result = session.merge_fillet(k);
             session.objects.target.set_editing_enabled(editing);
             result?;
@@ -531,14 +622,40 @@ impl FilletSession<'_> {
             // DoPiecewiseMerge deletes m_pFilletBrep inside its mark scope
             return self.do_piecewise_merge(k);
         }
+        // the keys a caller-named target recorded before the merge name its entities
+        // afterwards (`Brep::owner_identity`)
+        let recorded = self.objects.target.geometry_owner_keys().clone();
+        let result = self.merge_fillet_in_place(k);
+        // (not upstream: owners are pointers there) the insertion names the geometry
+        // it binds to the target's edges and faces by the session's kernel identity
+        // of the entity; rebind it to the same entity's identity in the target's
+        // naming, as the piecewise merge does, so the curve owner test of
+        // `SmEdge::ValidateGeometry` (`SmBrep` test #61) finds its edge
+        // (tangency-labs/solidcore#423). Also after an error.
+        let naming = self.objects.target.naming();
+        let serial = self.objects.target_serial;
+        let session_owner = |e| p3::topology_ref(serial, e);
+        let restored =
+            super::piecewise::normalize_session_owners(self.objects.target, session_owner, |e| {
+                super::piecewise::naming_owner(naming, recorded.get(&e).copied(), e)
+                    .unwrap_or_else(|| session_owner(e))
+            });
+        result.and(restored)
+    }
+
+    /// The in-place (non-piecewise) body of [`Self::merge_fillet`].
+    fn merge_fillet_in_place(&mut self, k: &mut Kernel) -> Result<()> {
         // SetFilletBrepEdgeMap, then the geometry and corner insertion.
         self.insert_fillet_intersection_topology(k)?;
         // Upstream cbi_MAP_TOPO_EDGES=0: do not collect mapped intersections.
         if self.executive.options.global_merge {
             // SmTol::GetApproxTol3d(m_pTargetBrep), then m_vTI.IntersectInsertRelate()
             // between the target and the intermediate body.
-            let tolerance =
-                crate::geom::tol::approx_tol3d(k, 0.5 * self.objects.target.tolerance());
+            let tolerance = crate::geom::tol::brep_approx_tol_3d(
+                k,
+                &*self.objects.target,
+                crate::geom::tol::SmallTopoType::NormalSize,
+            );
             self.executive.intersector.set_this_approx_tol_3d(tolerance);
             self.with_insertion_geometry(k, |k, ti, geometry| {
                 ti.intersect_insert_relate(k, geometry, FilletObject::Intersector)

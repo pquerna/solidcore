@@ -7,17 +7,30 @@
 //! | Rust                | Upstream                  |
 //! |---------------------|---------------------------|
 //! | [`local_operation`] | `SmBrep::LocalOperation`  |
+//! | [`local_operation_simple`] | (not upstream) `SmBrep::LocalOperation` with its own notification identities |
 //!
 //! Deviations: the offset executive's local-operation geometry creator
 //! (`SmLocalOperationGeometryCreation`) is the face and surface lists the executive
 //! holds ([`OffsetExecutive::set_local_surfaces`]). The executive's notifications are
 //! the caller's ([`OffsetNotifications`]). Upstream removes every face of the B-rep and
 //! copies the faces of the offset B-rep in with a merge (`RemoveFaces`, `CopyFaces`), as
-//! here; the copy notifies through an arena-only store. `SmTemporaryChangeValue` of
+//! here; the copy notifies through an arena-only store. (not upstream) The B-rep's own
+//! attributes ([`Brep::add_attribute`]) are lent to the offset under the caller's
+//! original identities, the offset B-rep takes what the offset leaves on its objects,
+//! and the copy back gives them to the B-rep (SMLib's Copy handler), so each face keeps
+//! its attributes as upstream's do. `SmTemporaryChangeValue` of
 //! `m_bEditingEnabled` is a set and restore of the flag. The debug drawing code is omitted. No
-//! recursion is introduced here.
+//! recursion is introduced here. Opt-in (WR-534,
+//! `Kernel::fixes.local_operation_box_holds_new_surfaces`, the fork's
+//! tangency-labs/smlib@a1ee273): the box that sizes the executive's offset distance also
+//! holds the replacement surfaces. (not upstream) The B-rep's cached topology fields are
+//! refreshed before the operation returns ([`Brep::refresh_cached_topology`]), as every
+//! public operation leaves them.
+
+use std::collections::BTreeSet;
 
 use crate::error::{Result, SolidError};
+use crate::geom::attribute::ObjectKey;
 use crate::kernel::Kernel;
 use crate::nurbs::b_spline_surface::p1::SurfParamType;
 use crate::nurbs::knots::Side;
@@ -26,12 +39,13 @@ use crate::offset::offset_executive::p2::OffsetNotifications;
 use crate::query::brep::{calculate_bounding_box, BoundingBoxOptions};
 use crate::surface::surface::Surface;
 use crate::topology::brep::p1 as bp1;
-use crate::topology::brep::p2::ArenaNotifyState;
+use crate::topology::brep::p2;
 use crate::topology::brep::p5;
-use crate::topology::brep::p7;
 use crate::topology::brep_cache::{arena_identity, CacheObject};
 use crate::topology::face::p2 as face_ops;
 use crate::topology::{Brep, FaceId};
+
+pub use crate::offset::offset_executive::p2::local_operation_simple;
 
 const OP: &str = "topology::brep::local_operation::local_operation";
 
@@ -43,6 +57,14 @@ fn null() -> SolidError {
 /// `faces[i]` (turned about if its normal opposes the old one's), every other face
 /// keeping a copy of its surface (as an analytic one when possible), and the faces are
 /// rebuilt by an extended offset that extends the surfaces to intersect.
+///
+/// To find where `surfaces[i]` went, mark `faces[i]` before the call
+/// ([`Brep::add_attribute`], [`Behavior::Copy`](crate::geom::attribute::Behavior::Copy))
+/// and look for the mark on the result's faces: upstream callers mark the `SmSurface`
+/// itself, but the port names a surface by its owning face, and `faces[i]`'s offset face
+/// takes `surfaces[i]`, so the mark travels with it as upstream's does with the surface
+/// (tangency-labs/solidcore#1875; the one difference, a merge keeping an unpicked
+/// survivor, is `plan/findings/topology.brep_local_operation--1875-face-mark-for-surface-mark.md`).
 ///
 /// # Errors
 ///
@@ -66,8 +88,13 @@ pub fn local_operation(
     let all_faces = bp1::faces(b, None)?;
     let mut given: Vec<Option<Surface>> = surfaces.into_iter().map(Some).collect();
     let mut new_list = Vec::with_capacity(all_faces.len());
+    // (WR-534) where each given surface went in the new list
+    let mut placed: Vec<Option<usize>> = vec![None; given.len()];
     for &face in &all_faces {
         let surface = if let Some(index) = faces.iter().position(|&f| f == face) {
+            if let Some(slot) = placed.get_mut(index) {
+                *slot = Some(new_list.len());
+            }
             let mut new = given
                 .get_mut(index)
                 .and_then(Option::take)
@@ -98,9 +125,28 @@ pub fn local_operation(
     }
 
     // the Brep's bounding sphere gives the executive an offset distance it does not use
-    let radius = calculate_bounding_box(k, &mut *b, BoundingBoxOptions::default())?
-        .sphere_bound()
-        .radius;
+    let mut bbox = calculate_bounding_box(k, &mut *b, BoundingBoxOptions::default())?;
+    // Not upstream (WR-534), opt-in `local_operation_box_holds_new_surfaces` (the fork's
+    // tangency-labs/smlib@a1ee273): the box also holds the replacement surfaces. Their
+    // faces' edges are found by extending the neighbouring surfaces to meet them, by a
+    // distance sized from this box: sized from the original body alone, a face moved
+    // further than about its size away left the extended neighbours short of it.
+    if k.fixes.local_operation_box_holds_new_surfaces {
+        for (j, slot) in placed.iter().enumerate() {
+            let surface = match (given.get(j).and_then(Option::as_ref), slot) {
+                (Some(surface), _) => surface,
+                (None, Some(at)) => new_list.get(*at).ok_or_else(null)?,
+                (None, None) => continue,
+            };
+            let domain = surface.natural_uv_domain_with_nurb(k)?;
+            let surf_box = surface
+                .calculate_bounding_box(k, &domain, [true, false, false], true)?
+                .normal_box
+                .ok_or_else(null)?;
+            bbox = bbox.union(&surf_box);
+        }
+    }
+    let radius = bbox.sphere_bound().radius;
     let tolerance = b.tolerance();
     let mut executive = OffsetExecutive::new(
         OffsetOperation::LocalOperation,
@@ -113,8 +159,22 @@ pub fn local_operation(
     // extend/intersect to fill new convex edge gaps rather than adding a fillet
     executive.set_extend_convex_edges(true);
 
+    // (not upstream) `b`'s own attributes go to the offset under the original
+    // identities, as upstream's live on the faces it copies (`SM_NO_COPY` of each
+    // source face); the caller's store does not keep them afterwards
+    let seeded: BTreeSet<ObjectKey> = b
+        .attributed_entities()
+        .into_iter()
+        .map(|e| (notifications.original_key_of)(e).key)
+        .collect();
+    p2::seed_brep_attributes(
+        notifications.attributes,
+        b.attribute_store().clone(),
+        notifications.original_key_of,
+    )?;
+
     // Build a new Brep by merging in all the faces with their new surfaces
-    let mut new_brep = executive
+    let offset = executive
         .do_extended_offset(k, Some(&mut *b), notifications)
         .map_err(|e| {
             if e.is_unported() || k.fixes.local_operation_offset_status {
@@ -122,8 +182,23 @@ pub fn local_operation(
             } else {
                 SolidError::sm_err(OP)
             }
-        })?;
+        });
     drop(executive);
+    let new_brep = offset.and_then(|mut new_brep| {
+        // the offset B-rep's objects carry what the offset gave them
+        p2::restore_keyed_attributes(
+            &mut new_brep,
+            notifications.attributes,
+            notifications.result_key_of,
+        )?;
+        Ok(new_brep)
+    });
+    if !seeded.is_empty() {
+        notifications
+            .attributes
+            .retain_rekeyed(&|key| (!seeded.contains(&key)).then_some(key))?;
+    }
+    let mut new_brep = new_brep?;
 
     // remove all faces from this Brep, then move all faces of the new Brep into it
     // (`CopyFaces` with a merge, which also grows this Brep's tolerance to the new one's)
@@ -131,6 +206,8 @@ pub fn local_operation(
     b.set_editing_enabled(true);
     let moved = move_faces(k, b, &mut new_brep);
     b.set_editing_enabled(editing);
+    // (not upstream: the port's cached topology fields, true again for the caller)
+    b.refresh_cached_topology();
     moved
 }
 
@@ -141,19 +218,10 @@ fn move_faces(k: &mut Kernel, b: &mut Brep, new_brep: &mut Brep) -> Result<()> {
     let new_faces = bp1::faces(new_brep, None)?;
     let face_ref = |face| arena_identity(CacheObject::Face(face));
     // the arena entry carries no attribute records: the copy notifies through an
-    // arena-only store (a default record per object of both B-reps)
-    let mut state = ArenaNotifyState::new(new_brep);
-    state.seed(b);
-    p7::copy_faces(
-        k,
-        new_brep,
-        &new_faces,
-        b,
-        true,
-        &face_ref,
-        &mut state.env(None),
-    )?;
-    Ok(())
+    // arena-only store (a default record per object of both B-reps) whose source
+    // identities are distinct from `b`'s, holding both B-reps' attributes; `b` gets the
+    // attributes its objects end with (the merge branch of `p7::copy_faces`)
+    crate::boolean::merge::p3::copy_component(k, new_brep, &new_faces, b, &face_ref)
 }
 
 #[cfg(test)]
@@ -284,6 +352,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(bp1::faces(&b, None).unwrap().len(), 6);
+        // the cached topology fields agree with the links (the public integrity check)
+        crate::topology::integrity::check(&b).unwrap();
         let e = calculate_bounding_box(&k, &mut b, BoundingBoxOptions::default()).unwrap();
         // the box carries the body's tolerance
         let near = |a: f64, b: f64| (a - b).abs() < 1e-4;
@@ -299,5 +369,48 @@ mod tests {
             local_operation(&mut k, b, &[face], Vec::new(), notes)
         });
         assert!(r.is_err());
+    }
+
+    /// WR-534 (the fork's tangency-labs/smlib@a1ee273): a 20 mm cube's top moved up by
+    /// 60, further than the cube's size, is a 20 x 20 x 80 box with the opt-in.
+    #[test]
+    fn moves_the_top_of_a_box_further_than_its_size() {
+        let mut k = Kernel::default();
+        k.fixes.local_operation_box_holds_new_surfaces = true;
+        let mut b = create_box(&mut k, Point3::new(0.0, 0.0, 0.0), 20.0, 20.0, 20.0).unwrap();
+        let top = bp1::faces(&b, None)
+            .unwrap()
+            .into_iter()
+            .find(|&f| {
+                let s = face_ops::surface(&b, f).unwrap().unwrap();
+                let p = s
+                    .evaluate_point(
+                        &k,
+                        s.natural_uv_domain_with_nurb(&k)
+                            .unwrap()
+                            .evaluate(0.5, 0.5),
+                    )
+                    .unwrap();
+                (p.z - 20.0).abs() < 1e-9
+            })
+            .unwrap();
+        let raised = Surface::from(Plane::new(
+            Vec3::new(0.0, 0.0, 80.0),
+            Vec3::X,
+            Vec3::Y,
+            crate::math::Vec2::new(20.0, 20.0),
+            &crate::geom::extent2d::Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
+        ));
+        with_notifications(&mut b, |b, notes| {
+            local_operation(&mut k, b, &[top], vec![raised], notes)
+        })
+        .unwrap();
+        assert_eq!(bp1::faces(&b, None).unwrap().len(), 6);
+        let e = calculate_bounding_box(&k, &mut b, BoundingBoxOptions::default()).unwrap();
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-3;
+        assert!(
+            near(e.max_at(2), 80.0) && near(e.min_at(2), 0.0) && near(e.max_at(0), 20.0),
+            "{e:?}"
+        );
     }
 }

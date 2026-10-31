@@ -17,6 +17,7 @@
 //! | `root_surface` (private)                | `GetRootSurface` (virtual)                   |
 //! | [`BSplineSurface::degree_elevate`]      | `SmBSplineSurface::DegreeElevate`            |
 //! | [`BSplineSurface::insert_knots`]        | `SmBSplineSurface::InsertKnots` (NLib form)  |
+//! | [`BSplineSurface::insert_one_knot`]     | `SmBSplineSurface::InsertOneKnot`            |
 //! | [`BSplineSurface::remove_knots`]        | `SmBSplineSurface::RemoveKnots`              |
 //!
 //! None of these is in `harness/callgraph/units.json`: they are listed in
@@ -35,7 +36,10 @@
 //! - **Patch index check.** When a starter surface's knots are not all of full
 //!   multiplicity, a patch's control points lie outside the net; upstream signals
 //!   `SM_ERR` but returns `SM_SUCCESS` without surface, as the port does (`Ok` with
-//!   `surface: None`).
+//!   `surface: None`). With `Kernel::fixes.approximate_surface_bezier_starter`
+//!   (WR-573, the fork's tangency-labs/smlib@eae96cb) the starter's inner knots are
+//!   raised to full multiplicity before each round of patches, and an overrun is
+//!   `SM_ERR`.
 //! - **Root surface.** `GetRootSurface` of an offset, curve bounded surface or surface
 //!   in a volume follows its base; the chain is walked in a loop bounded by
 //!   [`MAX_GEOMETRY_NESTING`] (`InvalidInput` beyond). The root of a plane, cone,
@@ -65,7 +69,6 @@ use crate::geom::extent2d::Extent2d;
 use crate::geom::vector2d::Point2;
 use crate::geom::vector3d::{Point3, Vec3};
 use crate::kernel::Kernel;
-use crate::math::UNDEF_DOUBLE;
 use crate::nurbs::b_spline_curve::{ControlPointForm, KnotType};
 use crate::nurbs::b_spline_surface::{
     BSplineSurface, BSplineSurfaceForm, CanonicalSurfaceData, SurfParamType,
@@ -73,7 +76,7 @@ use crate::nurbs::b_spline_surface::{
 use crate::nurbs::b_spline_surface_n_lib::p2::EvaluateFlags;
 use crate::nurbs::knots::Side;
 use crate::nurbs::srf_basic::Direction;
-use crate::nurbs::srf_tool::p1::insert_knots;
+use crate::nurbs::srf_tool::p1::{insert_knot, insert_knots};
 use crate::nurbs::srf_tool::p2::elevate_degree;
 use crate::nurbs::srf_tool::p3::remove_all_knots;
 use crate::nurbs::srf_tool::p4::remove_knots_constrained;
@@ -81,10 +84,10 @@ use crate::nurbs::srf_tool::p4::remove_knots_constrained;
 use super::p2::{Surface, SurfaceKind, B_SPLINE_SURFACE_TYPE, MAX_GEOMETRY_NESTING};
 
 const OP_APPROX: &str = "surface::surface::approximate::approximate_surface";
-const OP_BEZIER: &str = "surface::surface::approximate::compute_cubic_bezier_approx";
 const OP_ROOT: &str = "surface::surface::approximate::root_surface";
 const OP_ELEVATE: &str = "surface::surface::approximate::degree_elevate";
 const OP_INSERT: &str = "surface::surface::approximate::insert_knots";
+const OP_INSERT_ONE: &str = "surface::surface::approximate::insert_one_knot";
 const OP_REMOVE: &str = "surface::surface::approximate::remove_knots";
 
 /// A bicubic Bezier patch (`SmCubicBezierSurface`): its 4x4 control points,
@@ -303,6 +306,31 @@ impl Surface {
 
             // Update pApproxSurf using cubic Bezier approximations to each patch.
 
+            // `Kernel::fixes.approximate_surface_bezier_starter` (WR-573): the patches
+            // below are the cubic Bezier pieces between knots, which needs every inner
+            // knot of full multiplicity (control points 3 apart per span). A starter
+            // copied from a root B-spline with simple inner knots is put in that form
+            // first, exactly, by knot insertion.
+            if k.fixes.approximate_surface_bezier_starter {
+                for (param, deg) in [(SurfParamType::U, u_deg), (SurfParamType::V, v_deg)] {
+                    let (knots, mult) = approx_surf.knots(param, None)?;
+                    more_knots.clear();
+                    for (knot, &m) in knots
+                        .iter()
+                        .zip(&mult)
+                        .take(knots.len().saturating_sub(1))
+                        .skip(1)
+                    {
+                        for _ in m..deg {
+                            more_knots.push(*knot);
+                        }
+                    }
+                    if !more_knots.is_empty() {
+                        approx_surf.insert_knots(param, &more_knots)?;
+                    }
+                }
+            }
+
             // get knots of the subdivided surface (statuses ignored: without NURB the
             // arrays keep their values)
             if let Some((knots, _mult)) = ignored(approx_surf.knots(SurfParamType::U, None))? {
@@ -332,6 +360,11 @@ impl Surface {
                     for iub in 0..=3 {
                         for ivb in 0..=3 {
                             if u_min + iub >= num_ctrl_u || v_min + ivb >= num_ctrl_v {
+                                // `Kernel::fixes.approximate_surface_bezier_starter`
+                                // (WR-573): an error, not success with no surface
+                                if k.fixes.approximate_surface_bezier_starter {
+                                    return Err(SolidError::sm_err(OP));
+                                }
                                 // SE(SM_ERR): some problem here with knots; upstream
                                 // returns SM_SUCCESS without surface
                                 return Ok(None);
@@ -497,7 +530,6 @@ impl Surface {
         k: &Kernel,
         uv_domain: &Extent2d,
     ) -> Result<CubicBezierSurface> {
-        const OP: &str = OP_BEZIER;
         // exact tangent values
         let flags = EvaluateFlags {
             u_side: Side::Left,
@@ -506,21 +538,15 @@ impl Surface {
             non_zero_tangents: false,
         };
         let size = uv_domain.size();
-        // `SmVector3d sMat[2][2]` starts at SM_UNDEF_DOUBLE (its members' default
-        // initializers); an evaluation that writes only the upper half leaves the twist
-        // `sMat[1][1]` at that value for every corner
-        let writes_twist = evaluation_writes_twist(self)?;
-        let undef = Vec3::new(UNDEF_DOUBLE, UNDEF_DOUBLE, UNDEF_DOUBLE);
-        let corner = |uv: Point2| -> Result<[[Vec3; 2]; 2]> {
-            let m = self.evaluate(k, uv, 1, 1, flags)?;
-            let at = |i: usize, j: usize| -> Result<Vec3> {
-                m.get(i)
-                    .and_then(|row| row.get(j))
-                    .copied()
-                    .ok_or_else(|| SolidError::sm_err(OP))
-            };
-            let twist = if writes_twist { at(1, 1)? } else { undef };
-            Ok([[at(0, 0)?, at(0, 1)?], [at(1, 0)?, twist]])
+        // `SmVector3d sMat[2][2]`: SM_UNDEF_DOUBLE at first (its members' default
+        // initializers), then what each corner's evaluation writes; an entry an
+        // evaluation does not write (the twist of an upper-half-only `EvaluateSTEP`)
+        // keeps its value
+        let mut s_mat = [Vec3::UNDEF; 4];
+        let mut corner = |uv: Point2| -> Result<[[Vec3; 2]; 2]> {
+            self.evaluate_into(k, uv, 1, 1, flags, &mut s_mat)?;
+            let [d00, d01, d10, d11] = s_mat;
+            Ok([[d00, d01], [d10, d11]])
         };
         let mut cb = CubicBezierSurface::default();
         let p = &mut cb.points;
@@ -642,49 +668,6 @@ impl Surface {
     }
 }
 
-/// Whether `Evaluate(uv, 1, 1, .., bOnlyUpperHalf = FALSE, ..)` of `s` writes the
-/// twist `D[1][1]`. A curve bounded surface passes the call to its basis surface and a
-/// STEP surface to its base's `EvaluateSTEP`; there a curve bounded surface passes it
-/// along again, the cone, sphere, torus and surface of revolution overrides write the
-/// upper half only (`D[1][1]` needs `min(u, v) >= 2`), the surface of extrusion
-/// override zeroes the whole array first, and every other kind evaluates in full
-/// (`EvaluateSTEP`'s default is `Evaluate`).
-///
-/// # Errors
-///
-/// `InvalidInput` for a chain deeper than [`MAX_GEOMETRY_NESTING`] or a STEP surface
-/// without base surface.
-fn evaluation_writes_twist(s: &Surface) -> Result<bool> {
-    const OP: &str = OP_BEZIER;
-    let mut cur = s;
-    let mut step = false;
-    for _ in 0..=MAX_GEOMETRY_NESTING {
-        cur = match cur.kind() {
-            SurfaceKind::CurveBounded(c) => c.basis(),
-            // (a STEP surface's own `EvaluateSTEP` is the default, `Evaluate`: its base's
-            // `EvaluateSTEP` again)
-            SurfaceKind::Step(st) => {
-                step = true;
-                st.surface()
-                    .ok_or_else(|| SolidError::invalid_input(OP, "STEP surface without base"))?
-            }
-            SurfaceKind::Cone(_)
-            | SurfaceKind::Sphere(_)
-            | SurfaceKind::Torus(_)
-            | SurfaceKind::SurfOfRevolution(_)
-                if step =>
-            {
-                return Ok(false);
-            }
-            _ => return Ok(true),
-        };
-    }
-    Err(SolidError::invalid_input(
-        OP,
-        "surface chain deeper than MAX_GEOMETRY_NESTING",
-    ))
-}
-
 impl BSplineSurface {
     /// Raises the degree in `param`'s direction to `new_degree` (`DegreeElevate`).
     ///
@@ -734,6 +717,37 @@ impl BSplineSurface {
 
         // Make sur with the union of surP target knot vector and the new knots
         let sur = insert_knots(sur_p, new_knots, dir).map_err(SolidError::nl_ser(OP))?;
+
+        // build a surface from it and swap the NURBs
+        self.nurb = Self::from_gw_nurb(&sur).nurb;
+        Ok(())
+    }
+
+    /// Inserts the interior knot `new_knot` `count` times in `param`'s direction (v for
+    /// [`SurfParamType::V`], else u), its old and new multiplicities summing to at most
+    /// the degree (`InsertOneKnot`).
+    ///
+    /// # Errors
+    ///
+    /// `NULL` pointer without NURB; those of the NLib insertion (the surface is then
+    /// unchanged).
+    pub fn insert_one_knot(
+        &mut self,
+        new_knot: f64,
+        count: usize,
+        param: SurfParamType,
+    ) -> Result<()> {
+        const OP: &str = OP_INSERT_ONE;
+        let dir = if param == SurfParamType::V {
+            Direction::V
+        } else {
+            Direction::U
+        };
+        let sur_p = self
+            .nurb
+            .as_ref()
+            .ok_or_else(|| SolidError::null_pointer(OP))?;
+        let sur = insert_knot(sur_p, new_knot, count, dir).map_err(SolidError::nl_ser(OP))?;
 
         // build a surface from it and swap the NURBs
         self.nurb = Self::from_gw_nurb(&sur).nurb;
@@ -868,6 +882,85 @@ mod tests {
         let p = s.evaluate_point(&k, uv).unwrap();
         let q = off.evaluate_point(&k, uv).unwrap();
         assert!(p.distance(q) <= 2.0 * tol, "{}", p.distance(q));
+    }
+
+    /// Issue #1501 (WR-573): the offset 0.5 of a sheet on a cubic wave of 6 control
+    /// points with simple inner knots (0 0 0 0 1/3 2/3 1 1 1 1), extruded 10 along y.
+    fn offset_wave() -> Surface {
+        let xz = [
+            (0.0, 0.0),
+            (2.0, 0.4),
+            (4.0, -0.4),
+            (6.0, 0.4),
+            (8.0, -0.4),
+            (10.0, 0.0),
+        ];
+        let pts: Vec<Point3> = xz
+            .iter()
+            .flat_map(|&(x, z)| [Point3::new(x, 0.0, z), Point3::new(x, 10.0, z)])
+            .collect();
+        let wave = BSplineSurface::create_canonical(&CanonicalSurfaceData {
+            u_degree: 3,
+            v_degree: 1,
+            control_points: &pts,
+            form: BSplineSurfaceForm::Unspecified,
+            u_multiplicities: &[4, 1, 1, 4],
+            v_multiplicities: &[2, 2],
+            u_knots: &[0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0],
+            v_knots: &[0.0, 1.0],
+            knot_type: KnotType::Unspecified,
+            weights: None,
+            uv_domain: None,
+        })
+        .unwrap();
+        let k = kernel();
+        Surface::from(OffsetSurface::new(&k, 0.5, Surface::from(wave), true, 0).unwrap())
+    }
+
+    #[test]
+    fn wr573_default_gives_success_without_surface() {
+        // upstream: the starter's simple knots run its patches past its control points
+        let k = kernel();
+        let r = offset_wave()
+            .approximate_surface(&k, 1e-3, 3, false)
+            .unwrap();
+        assert!(r.surface.is_none());
+    }
+
+    #[test]
+    fn wr573_bezier_starter_approximates_the_offset_wave() {
+        let mut k = kernel();
+        k.fixes.approximate_surface_bezier_starter = true;
+        let off = offset_wave();
+        let tol = 1e-3;
+        let r = off.approximate_surface(&k, tol, 3, false).unwrap();
+        // the flag's path ran: the starter's patches no longer overrun its control
+        // points, so a pass was sampled and a surface returned (without the flag
+        // there is no surface and no sample)
+        let s = r.surface.unwrap();
+        // Upstream accepts a pass when its last row (or column) of patches is within
+        // `tol`: `bFailed` starts over with every row (SmSurface.cpp, the `outer`
+        // loop), so a pass can succeed with an earlier row outside `tol`. Its
+        // achieved tolerance is the largest deviation over the whole pass, above `tol`
+        // here. Pinned (the kernel is deterministic): any change in the fit shows.
+        let want = 0.001_620_828_043_730_338_3;
+        assert!(
+            (r.achieved_tol - want).abs() <= 1e-12 * want,
+            "{}",
+            r.achieved_tol
+        );
+        // the surface is that pass's, its excess knots removed within `tol`
+        let dom = off.natural_uv_domain_with_nurb(&k).unwrap();
+        for (fu, fv) in [(0.1, 0.2), (0.5, 0.5), (0.83, 0.9)] {
+            let uv = dom.evaluate(fu, fv);
+            let p = s.evaluate_point(&k, uv).unwrap();
+            let q = off.evaluate_point(&k, uv).unwrap();
+            assert!(
+                p.distance(q) <= r.achieved_tol + tol,
+                "{fu} {fv}: {}",
+                p.distance(q)
+            );
+        }
     }
 
     #[test]

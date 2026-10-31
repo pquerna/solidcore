@@ -46,6 +46,11 @@ struct Inputs {
     other_box: Option<[f64; 4]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_relationship: Option<i32>,
+    /// Rust side only (op 19): the solve over a bare [`LiveBrepObjects`], as a library
+    /// caller makes it (no B-rep cache, no `face_entity`), not this runner's [`Objects`]
+    /// adapter. The C++ side is the same `SmApiFaceClosestPoint`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    live: bool,
 }
 
 fn v(a: [f64; 3]) -> Vec3 {
@@ -85,6 +90,18 @@ fn compared_op(op: i32) -> std::result::Result<(), HarnessError> {
     } else {
         Err(HarnessError::new(format!("op {op} is not a compared query (1..=25)")))
     }
+}
+
+// Native null contracts are covered by the FFI tests; typed Rust APIs cannot
+// represent them. Refuse these fixtures on both sides of the comparison.
+fn compared_input(i: &Inputs) -> std::result::Result<(), HarnessError> {
+    compared_op(i.op)?;
+    if i.data[16] != 0. {
+        return Err(HarnessError::new(
+            "null pointers have no typed Rust equivalent; use the FFI contract tests",
+        ));
+    }
+    Ok(())
 }
 
 // Integer topology and status fields are compared exactly; only geometric
@@ -879,18 +896,35 @@ fn topology(k: &mut Kernel, i: &Inputs, b: &mut Brep, second: &mut Brep) -> Resu
                 &[],
             )?;
             let identities = identities();
-            let mut empty = Brep::new();
-            let objects = Objects::new(k, [&mut *b, &mut empty], &identities)?;
-            closest(
-                &mut o,
-                api::face_closest_point_in_shape(
-                    k,
-                    &shape,
-                    &objects,
-                    (BrepId::from_index(0), face),
-                    point,
-                )?,
-            );
+            if i.live {
+                // the library path: a bare live view of the B-rep, its geometry named by
+                // its owners' arena identities (`own_brep`)
+                let [identity, _] = &identities;
+                let objects = LiveBrepObjects::new(b, identity, None)?;
+                closest(
+                    &mut o,
+                    api::face_closest_point_in_shape(
+                        k,
+                        &shape,
+                        &objects,
+                        (BrepId::from_index(0), face),
+                        point,
+                    )?,
+                );
+            } else {
+                let mut empty = Brep::new();
+                let objects = Objects::new(k, [&mut *b, &mut empty], &identities)?;
+                closest(
+                    &mut o,
+                    api::face_closest_point_in_shape(
+                        k,
+                        &shape,
+                        &objects,
+                        (BrepId::from_index(0), face),
+                        point,
+                    )?,
+                );
+            }
         }
         21 => cclosest(
             &mut o,
@@ -932,7 +966,7 @@ impl UnitDiff for Runner {
     }
     fn run_cpp(&self, c: &Case) -> std::result::Result<Output, HarnessError> {
         let i: Inputs = c.parse()?;
-        compared_op(i.op)?;
+        compared_input(&i)?;
         let mut input = i.data.to_vec();
         if let Some(other) = i.other_box {
             input.extend(other);
@@ -949,14 +983,9 @@ impl UnitDiff for Runner {
     }
     fn run_rust(&self, c: &Case) -> std::result::Result<Output, HarnessError> {
         let i: Inputs = c.parse()?;
-        compared_op(i.op)?;
+        compared_input(&i)?;
         let a = &i.data;
         let mut k = Kernel::default();
-        if a[16] != 0. {
-            return Err(HarnessError::new(
-                "null pointers have no typed Rust equivalent; use the FFI contract tests",
-            ));
-        }
         let point = v([a[11], a[12], a[13]]);
         let result = match i.op {
             1 => curve(&k, a)
@@ -1055,6 +1084,7 @@ impl UnitDiff for Runner {
             data: a,
             other_box: None,
             expected_relationship: None,
+            live: false,
         })
         .ok()
     }

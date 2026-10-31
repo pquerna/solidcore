@@ -51,7 +51,9 @@
 //!   plus one step, past which the port returns [`SolidError::InvalidInput`].
 //! - **Law evaluation status.** `SmTemporaryRadiusChange::SetUp` ignores the status of
 //!   `SmFilletLaw::Evaluate` and reads its first value, uninitialised after a failure;
-//!   the port propagates the error.
+//!   the port propagates the error before reading that value (UB-252). Constructors
+//!   retain pinned status handling by default; `new_with_fixes` and the matching
+//!   scope helper opt into reporting setup errors before entering the body (#458).
 //! - The upstream debug drawing (`SM_GFX_CODE`) is omitted.
 //! - Calls into units that are not ported return [`SolidError::Unported`] through the
 //!   adapter defaults of [`ExecutiveAccess`].
@@ -601,6 +603,11 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
             trimming: true,
             classification: true,
         };
+        // the fork's (WR-631): no cliff overflow, no open ends yet
+        self.cliff_overflow = false;
+        self.open_ends.clear();
+        // the fork's (WR-634): no overflow edges yet
+        self.overflow_edges.clear();
 
         let num_filleted_edges = params.edges.len();
         if num_filleted_edges < 1 {
@@ -1223,8 +1230,14 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
 
             // Traverse forwards.
             if let Some(edge) = start_edge {
+                // fork 873c7c9 (SolidCraft change): GetFilletSolverOfEdge returns NULL
+                // when GetEdgeuses fails
+                let pass_on = k.fixes.fillet_statuses_pass_on;
                 fs = self
-                    .fillet_solver_of_edge_with(edge, |e| access.smooth_edge_edgeuses(e))?
+                    .fillet_solver_of_edge_with(edge, |e| match access.smooth_edge_edgeuses(e) {
+                        Err(err) if pass_on && !err.is_unported() => Ok(Vec::new()),
+                        r => r,
+                    })?
                     .ok_or_else(|| null!("no solver of edge"))?;
             }
 
@@ -1518,12 +1531,36 @@ pub struct TemporaryRadiusChange<O> {
 
 impl<O: ClassObject + SolutionObject + Ord> TemporaryRadiusChange<O> {
     /// The constructor: records the solver, rail and side edge use and runs
-    /// [`TemporaryRadiusChange::set_up`], whose status it ignores.
+    /// [`TemporaryRadiusChange::set_up`], ignoring ordinary statuses as upstream.
+    /// Use [`Self::new_with_fixes`] to opt into reporting setup failure.
     ///
     /// # Errors
     ///
-    /// [`SolidError::Unported`] from the set-up.
+    /// Unported dependencies or preparation requests from the setup.
     pub fn new<A>(access: &mut A, fs: O, rail_index: usize, side_eu: O) -> Result<Self>
+    where
+        A: ExecutiveAccess<O> + ?Sized,
+    {
+        Self::new_with_fixes(
+            access,
+            fs,
+            rail_index,
+            side_eu,
+            &crate::kernel::UpstreamFixes::default(),
+        )
+    }
+
+    /// Constructs a radius change with the caller's opt-in upstream policy.
+    /// `temporary_radius_setup_errors` reports a failed setup before the caller
+    /// starts filleting; the original constructor keeps its default call shape.
+    /// Unported dependencies still propagate under either policy.
+    pub fn new_with_fixes<A>(
+        access: &mut A,
+        fs: O,
+        rail_index: usize,
+        side_eu: O,
+        fixes: &crate::kernel::UpstreamFixes,
+    ) -> Result<Self>
     where
         A: ExecutiveAccess<O> + ?Sized,
     {
@@ -1535,7 +1572,14 @@ impl<O: ClassObject + SolutionObject + Ord> TemporaryRadiusChange<O> {
             fs,
             rail_idx: rail_index,
         };
-        ignored(change.set_up(access))?;
+        // fork 873c7c9 SERs inside SetUp (its constructor still cannot report, so the
+        // status reaches the caller only with temporary_radius_setup_errors)
+        let setup = change.set_up_with(access, fixes.fillet_statuses_pass_on);
+        if fixes.temporary_radius_setup_errors {
+            setup?;
+        } else {
+            ignored(setup)?;
+        }
         Ok(change)
     }
 
@@ -1549,6 +1593,15 @@ impl<O: ClassObject + SolutionObject + Ord> TemporaryRadiusChange<O> {
     /// `SM_ERR_NULL_POINTER` for a missing edge use or owning edge; those of the law
     /// evaluation (`SmFilletLaw::Evaluate`) and the constant law curve.
     pub fn set_up<A>(&mut self, access: &mut A) -> Result<()>
+    where
+        A: ExecutiveAccess<O> + ?Sized,
+    {
+        self.set_up_with(access, false)
+    }
+
+    /// [`Self::set_up`]; with `pass_on` the constant law curve's re-parameterization
+    /// status is returned (fork 873c7c9 `SER`) instead of ignored.
+    fn set_up_with<A>(&mut self, access: &mut A, pass_on: bool) -> Result<()>
     where
         A: ExecutiveAccess<O> + ?Sized,
     {
@@ -1642,7 +1695,11 @@ impl<O: ClassObject + SolutionObject + Ord> TemporaryRadiusChange<O> {
                 Point3::new(end_rad, 1.0, 0.0),
                 Point3::new(end_rad, 2.0, 0.0),
             )?;
-            ignored(const_bsp.edit_parameterization(&unit_ivl))?;
+            // fork 873c7c9 passes this on (SER)
+            ignored(crate::error::passed_on(
+                const_bsp.edit_parameterization(&unit_ivl),
+                pass_on,
+            )?)?;
 
             let vrfs = access
                 .variable_radius_solver_mut(self.fs)?
@@ -1739,7 +1796,32 @@ where
     O: ClassObject + SolutionObject + Ord,
     A: ExecutiveAccess<O> + ?Sized,
 {
-    let change = TemporaryRadiusChange::new(access, fs, rail_index, side_eu)?;
+    with_temporary_radius_change_with_fixes(
+        access,
+        fs,
+        rail_index,
+        side_eu,
+        &crate::kernel::UpstreamFixes::default(),
+        body,
+    )
+}
+
+/// Runs a temporary radius scope using the caller's upstream fix policy.
+/// With `temporary_radius_setup_errors`, a setup failure returns before `body`.
+/// A completed setup is reverted even when `body` fails.
+pub fn with_temporary_radius_change_with_fixes<O, A, T>(
+    access: &mut A,
+    fs: O,
+    rail_index: usize,
+    side_eu: O,
+    fixes: &crate::kernel::UpstreamFixes,
+    body: impl FnOnce(&mut A) -> Result<T>,
+) -> Result<T>
+where
+    O: ClassObject + SolutionObject + Ord,
+    A: ExecutiveAccess<O> + ?Sized,
+{
+    let change = TemporaryRadiusChange::new_with_fixes(access, fs, rail_index, side_eu, fixes)?;
     let result = body(access);
     let reverted = change.revert(access);
     match result {

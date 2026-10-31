@@ -1512,6 +1512,124 @@ impl Surface {
         }
     }
 
+    /// [`Surface::evaluate`] into the caller's array `d` (flat, entry
+    /// `i * (highest_v_deriv + 1) + j` the derivative of order `i` in u and `j` in v):
+    /// the entries upstream's evaluation does not write keep the caller's values, as
+    /// upstream's `aDerivatives` does. A curve bounded surface passes the call to its
+    /// basis surface and a STEP surface to its base's `EvaluateSTEP`
+    /// ([`Surface::evaluate_step_into`]); the other kinds write every entry, except
+    /// the lower half when `flags.only_upper_half` is set.
+    ///
+    /// # Errors
+    ///
+    /// Those of the evaluation; `InvalidInput` when `d` is too short, for a STEP
+    /// surface without base surface, or a chain deeper than
+    /// [`MAX_GEOMETRY_NESTING`](crate::surface::surface::p2::MAX_GEOMETRY_NESTING).
+    pub fn evaluate_into(
+        &self,
+        k: &Kernel,
+        uv: Point2,
+        highest_u_deriv: usize,
+        highest_v_deriv: usize,
+        flags: EvaluateFlags,
+        d: &mut [Vec3],
+    ) -> Result<()> {
+        self.evaluate_into_at(k, uv, highest_u_deriv, highest_v_deriv, flags, d, 0)
+    }
+
+    /// [`Surface::evaluate_step`] into the caller's array `d`, as
+    /// [`Surface::evaluate_into`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Surface::evaluate_into`].
+    pub fn evaluate_step_into(
+        &self,
+        k: &Kernel,
+        uv: Point2,
+        highest_u_deriv: usize,
+        highest_v_deriv: usize,
+        flags: EvaluateFlags,
+        d: &mut [Vec3],
+    ) -> Result<()> {
+        self.evaluate_step_into_at(k, uv, highest_u_deriv, highest_v_deriv, flags, d, 0)
+    }
+
+    /// [`Surface::evaluate_into`] at chain depth `depth`.
+    fn evaluate_into_at(
+        &self,
+        k: &Kernel,
+        uv: Point2,
+        hu: usize,
+        hv: usize,
+        flags: EvaluateFlags,
+        d: &mut [Vec3],
+        depth: usize,
+    ) -> Result<()> {
+        const OP: &str = "surface::surface::p1::evaluate_into";
+        match self.kind() {
+            // pass the call along
+            SurfaceKind::CurveBounded(s) => {
+                s.basis()
+                    .evaluate_into_at(k, uv, hu, hv, flags, d, nesting_depth(depth, OP)?)
+            }
+            SurfaceKind::Step(s) => {
+                let base = s
+                    .surface()
+                    .ok_or_else(|| SolidError::invalid_input(OP, "STEP surface without base"))?;
+                base.evaluate_step_into_at(k, uv, hu, hv, flags, d, nesting_depth(depth, OP)?)
+            }
+            _ => {
+                let m = self.evaluate(k, uv, hu, hv, flags)?;
+                copy_written(&m, hu, hv, flags.only_upper_half, d, OP)
+            }
+        }
+    }
+
+    /// [`Surface::evaluate_step_into`] at chain depth `depth`.
+    fn evaluate_step_into_at(
+        &self,
+        k: &Kernel,
+        uv: Point2,
+        hu: usize,
+        hv: usize,
+        flags: EvaluateFlags,
+        d: &mut [Vec3],
+        depth: usize,
+    ) -> Result<()> {
+        const OP: &str = "surface::surface::p1::evaluate_step_into";
+        self.check_evaluation_copy_depth(0)?;
+        match self.kind_with_nurb(k)? {
+            SurfaceKind::CurveBounded(s) => {
+                s.basis()
+                    .evaluate_step_into_at(k, uv, hu, hv, flags, d, nesting_depth(depth, OP)?)
+            }
+            // the overrides (the side and half flags are not used)
+            SurfaceKind::Cone(s) => s.evaluate_step_into(uv, hu, hv, d),
+            SurfaceKind::Sphere(s) => s.evaluate_step_into(uv, hu, hv, d),
+            SurfaceKind::Torus(s) => s.evaluate_step_into(uv, hu, hv, d),
+            SurfaceKind::SurfOfRevolution(s) => s.evaluate_step_at_into(k, uv, hu, hv, d),
+            SurfaceKind::SurfOfExtrusion(s) => s.evaluate_step_into(k, uv, hu, hv, d),
+            // pass the call along (the base default, `Evaluate`)
+            SurfaceKind::BSpline(_)
+            | SurfaceKind::Plane(_)
+            | SurfaceKind::Step(_)
+            | SurfaceKind::OffsetSurface(_)
+            | SurfaceKind::SrfInVolume(_) => self.evaluate_into_at(
+                k,
+                uv,
+                hu,
+                hv,
+                EvaluateFlags {
+                    non_zero_tangents: true,
+                    ..flags
+                },
+                d,
+                nesting_depth(depth, OP)?,
+            ),
+        }
+    }
+
     /// [`Surface::evaluate_step`] for a caller that ignores its status: the derivative
     /// array it leaves, `None` when it fails before writing it. A curve bounded surface
     /// passes the caller's array on to its basis surface; the `SmSurfOfRevolution`
@@ -1798,7 +1916,6 @@ impl Surface {
     ///
     /// Those of [`Surface::domain_with_continuity`] and of the context's cache
     /// preparation.
-    #[allow(clippy::too_many_arguments)]
     pub fn domain_with_continuity_with_context<O: Copy + PartialEq>(
         &self,
         k: &Kernel,
@@ -1811,7 +1928,6 @@ impl Surface {
         self.domain_with_continuity_in(k, min_continuity, uv, uv_vector, Some(context), handle)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn domain_with_continuity_in<O: Copy + PartialEq>(
         &self,
         k: &Kernel,
@@ -2393,6 +2509,19 @@ impl Surface {
             SurfaceKind::Plane(p) => Ok(Some(Self::from(
                 p.create_offset_surface(k, signed_offset_distance)?,
             ))),
+            // `Kernel::fixes.revolution_round_offset_collapses` (WR-567): an offset that
+            // shrinks the generatrix arc onto its centre or past it is no surface
+            SurfaceKind::SurfOfRevolution(s)
+                if k.fixes.revolution_round_offset_collapses
+                    && self.revolution_offset_collapses(
+                        k,
+                        s,
+                        signed_offset_distance,
+                        approx_tol_3d,
+                    )? =>
+            {
+                Ok(None)
+            }
             SurfaceKind::SurfOfRevolution(s) => Ok(Some(Self::from(s.create_offset_surface(
                 k,
                 signed_offset_distance,
@@ -2424,7 +2553,9 @@ impl Surface {
     /// Not upstream (`SmSurface::OffsetCollapses`, WR-464): whether the offset by
     /// `signed_offset_distance` shrinks a cone, cylinder, sphere or torus onto its spine
     /// (radius below `tol`), the only case where [`Self::create_offset_surface`] gives no
-    /// surface. `false` for every other surface.
+    /// surface. With `Kernel::fixes.revolution_round_offset_collapses` (WR-567) also a
+    /// surface of revolution of one circular arc moved in past the arc's radius
+    /// (`revolution_offset_collapses`). `false` for every other surface.
     ///
     /// # Errors
     ///
@@ -2439,8 +2570,74 @@ impl Surface {
             SurfaceKind::Cone(s) => s.offset_collapses(k, signed_offset_distance, tol),
             SurfaceKind::Sphere(s) => s.offset_collapses(signed_offset_distance, tol),
             SurfaceKind::Torus(s) => s.offset_collapses(signed_offset_distance, tol),
+            SurfaceKind::SurfOfRevolution(s) if k.fixes.revolution_round_offset_collapses => {
+                self.revolution_offset_collapses(k, s, signed_offset_distance, tol)?
+            }
             _ => false,
         })
+    }
+
+    /// Not upstream (the fork's `SmSurfOfRevolution::OffsetCollapses`, WR-567): whether
+    /// the offset by `signed_offset_distance` shrinks this surface of revolution `s`
+    /// onto its spine or past it. Its generatrix is one circular arc of radius `r`
+    /// (`IsArc(9, tol)`, `r > tol`; a fillet's round along a circular edge), and the
+    /// offset leaves a radius `r - d (N . k) r` below `tol`, with `k` the curvature
+    /// vector of the generatrix-direction iso-curve (the arc revolved: `|k| = 1/r`,
+    /// pointing at the arc's centre) and `N` the surface normal, both at the middle of
+    /// the natural UV domain. A failed arc test or evaluation, or a pole there, is
+    /// `false`.
+    ///
+    /// # Errors
+    ///
+    /// [`SolidError::Unported`] from the arc test or the evaluations; those of the
+    /// natural UV domain.
+    fn revolution_offset_collapses(
+        &self,
+        k: &Kernel,
+        s: &crate::surface::surf_of_revolution::SurfOfRevolution,
+        signed_offset_distance: f64,
+        tol: f64,
+    ) -> Result<bool> {
+        // a failure upstream answers FALSE (except an unported call here)
+        fn or_false<T>(r: Result<T>) -> Result<Option<T>> {
+            match r {
+                Ok(v) => Ok(Some(v)),
+                Err(e) if e.is_unported() => Err(e),
+                Err(_) => Ok(None),
+            }
+        }
+        let Some(gen) = s.gen_curve() else {
+            return Ok(false);
+        };
+        let Some(Some((_, radius, _, _))) = or_false(gen.is_arc(k, 9, tol))? else {
+            return Ok(false);
+        };
+        if radius <= tol {
+            return Ok(false);
+        }
+
+        // the curvature of the generatrix direction's iso-curve, at the middle of the domain
+        let uv = self.natural_uv_domain_with_nurb(k)?.mid();
+        let Some([_, du, dv, _, duu, dvv]) =
+            or_false(self.evaluate_2nd_derivatives(k, uv, true, true))?
+        else {
+            return Ok(false);
+        };
+        let Some(normal) = or_false(self.evaluate_normal(k, uv, side(true), side(true)))? else {
+            return Ok(false);
+        };
+        let (d1, d2) = if s.swap_uv() { (du, duu) } else { (dv, dvv) };
+        let speed_sq = d1.length_squared();
+        if speed_sq < EFF_ZERO_SQ {
+            // at a pole: no generatrix tangent to measure
+            return Ok(false);
+        }
+        let curvature = (d2 - d1 * (d2.dot(d1) / speed_sq)) / speed_sq;
+
+        // radius r - d (N . k) r: N . k r is +1 where the normal points at the centre, -1
+        // away from it
+        let towards_centre = normal.dot(curvature) * radius;
+        Ok(radius - signed_offset_distance * towards_centre < tol)
     }
 
     /// The silhouette curves of the surface over `uv_domain` for a parallel
@@ -3371,6 +3568,13 @@ pub(crate) fn convert_domain_from_nurbs_to_step_with(
     Ok(d)
 }
 
+/// The fraction of the domain, in `u` and in `v`, a step of `CoverCoincidentSurface`'s
+/// drops may cover before [`crossed_seam_or_pole`] calls it a crossing of a seam or a pole
+/// (`sdMaxStepRatio`, local to `sm_CrossedSeamOrPole` upstream; at file scope in the
+/// SolidCraft fork, tangency-labs/smlib@16bf1cb, so the seam-jump test of
+/// `Kernel::fixes.cover_wraps_across_closed_seam` reads the same limit).
+pub(crate) const MAX_STEP_RATIO: f64 = 0.4;
+
 /// Whether a step from `prev_uv` to `curr_uv` crossed a seam or a pole
 /// (`sm_CrossedSeamOrPole`): never on planes and bilinear B-splines (the B-spline kinds'
 /// `GetDegree`, which makes a missing NURB: [`Surface::degree_with_nurb`]); else a step
@@ -3386,8 +3590,6 @@ pub fn crossed_seam_or_pole(
     curr_uv: Point2,
     domain: &Extent2d,
 ) -> Result<bool> {
-    const MAX_STEP_RATIO: f64 = 0.4;
-
     // First special cases: SmPlane or bilinear.
     match surface.kind() {
         SurfaceKind::Plane(_) => return Ok(false),
@@ -3941,7 +4143,6 @@ impl<'t, 's, O: SolutionObject> CsGlobalSolver<'t, 's, O> {
 impl<'t, 's, O: SolutionObject> LsiGlobalSolver<'t, 's, O> {
     /// The constructor (`SmLSIGlobalSolver`): one tree, two variables.
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // upstream's constructor arguments
     pub fn new(
         k: &'s Kernel,
         surface_tree: &'t Tree<O>,
@@ -4311,6 +4512,36 @@ impl<'a> SssIntersectEnfo<'a> {
             srf_tangents: [[undef; 2]; 3],
         }
     }
+}
+
+/// Copies an evaluation matrix `m` into the flat caller array `d` (entry
+/// `i * (hv + 1) + j`): every entry, or only the upper half (`i + j <= hu`) when
+/// `only_upper_half` is set, leaving the others untouched.
+fn copy_written(
+    m: &[Vec<Vec3>],
+    hu: usize,
+    hv: usize,
+    only_upper_half: bool,
+    d: &mut [Vec3],
+    op: &'static str,
+) -> Result<()> {
+    for i in 0..=hu {
+        for j in 0..=hv {
+            if only_upper_half && i + j > hu {
+                continue;
+            }
+            let v = m
+                .get(i)
+                .and_then(|row| row.get(j))
+                .copied()
+                .ok_or_else(|| SolidError::invalid_input(op, "evaluation matrix too small"))?;
+            let slot = d
+                .get_mut(i * (hv + 1) + j)
+                .ok_or_else(|| SolidError::invalid_input(op, "derivative array too short"))?;
+            *slot = v;
+        }
+    }
+    Ok(())
 }
 
 /// The next depth of a curve bounded, STEP or volume chain walk, `InvalidInput` past

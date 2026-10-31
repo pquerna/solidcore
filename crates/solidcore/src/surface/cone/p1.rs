@@ -146,8 +146,8 @@ const OP_EVAL_STEP: &str = "surface::cone::p1::Cone::evaluate_step";
 const OP_GEN: &str = "surface::cone::p1::Cone::gen_curve";
 const OP_TRANSFORM: &str = "surface::cone::p1::Cone::transform";
 
-/// Upstream `SmStatus` value `SM_ERR_INVALID_INPUT`.
-const SM_ERR_INVALID_INPUT: i32 = 1007;
+// Upstream `SmStatus` value `SM_ERR_INVALID_INPUT`.
+use crate::error::SM_ERR_INVALID_INPUT;
 
 /// `SM_DEG2RAD(a)` = `a * (SM_PI / 180.0)`.
 fn deg2rad(a: f64) -> f64 {
@@ -1487,6 +1487,31 @@ impl Cone {
     ///
     /// `SM_ERR` for orders above 3.
     pub fn evaluate_step(&self, uv: Point2, hu: usize, hv: usize) -> Result<Vec<Vec3>> {
+        // (an order above the limit is refused before the array is read)
+        let n = if hu <= 5 && hv <= 5 {
+            (hu + 1) * (hv + 1)
+        } else {
+            0
+        };
+        let mut d = vec![Vec3::ZERO; n];
+        self.evaluate_step_into(uv, hu, hv, &mut d)?;
+        Ok(d)
+    }
+
+    /// [`Self::evaluate_step`] into the caller's array `d` (`(hu + 1) * (hv + 1)` entries):
+    /// the entries upstream does not write keep the caller's values, as upstream's
+    /// `aDerivatives` does (a fresh `SmVector3d` array holds `SM_UNDEF_DOUBLE`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::evaluate_step`]; `InvalidInput` when `d` is too short.
+    pub(crate) fn evaluate_step_into(
+        &self,
+        uv: Point2,
+        hu: usize,
+        hv: usize,
+        d: &mut [Vec3],
+    ) -> Result<()> {
         // check input
         if hu > 3 || hv > 3 {
             return Err(SolidError::sm_err(OP_EVAL_STEP)); // Not implemented
@@ -1516,7 +1541,9 @@ impl Cone {
         let sin_u = (uv.x * PI / 180.0).sin();
 
         let n = (hu + 1) * (hv + 1);
-        let mut d = vec![Vec3::ZERO; n];
+        let d = d
+            .get_mut(..n)
+            .ok_or_else(|| SolidError::invalid_input(OP_EVAL_STEP, "derivative array too short"))?;
         let mut set = |i: usize, val: Vec3| {
             if let Some(slot) = d.get_mut(i) {
                 *slot = val;
@@ -1566,8 +1593,8 @@ impl Cone {
         }
 
         // The formulas above are per radian; STEP U is in degrees.
-        scale_step_angular_derivatives(&mut d, hu, hv, true, false)?;
-        Ok(d)
+        scale_step_angular_derivatives(d, hu, hv, true, false)?;
+        Ok(())
     }
 
     /// The point at the STEP parameters `uv` (`EvaluateSTEPPoint`).
@@ -1630,22 +1657,13 @@ impl Cone {
         tol_3d: f64,
         uv_guess: Option<Point2>,
     ) -> Result<ConeStepInversion> {
-        self.step_inversion_on_domain(k, &self.rev.anal_uv_domain, point_on_surf, tol_3d, uv_guess)
-    }
-
-    pub(crate) fn step_inversion_on_domain(
-        &self,
-        k: &Kernel,
-        anal_domain: &Extent2d,
-        point_on_surf: Point3,
-        tol_3d: f64,
-        uv_guess: Option<Point2>,
-    ) -> Result<ConeStepInversion> {
         // mirror points on the negative side of the apex to the positive side
         let pos = self.positive_point(k, point_on_surf)?;
 
-        // do the conversion
-        let mut inv = self.rev_step_inversion(k, anal_domain, pos.point, tol_3d, uv_guess)?;
+        // do the conversion (over the cone's own STEP domain: the caller's crAnalDomain
+        // is ignored upstream)
+        let anal_domain = self.rev.anal_uv_domain;
+        let mut inv = self.rev_step_inversion(k, &anal_domain, pos.point, tol_3d, uv_guess)?;
 
         // when point is on far side of apex - flip the Z coordinate about the apex point
         if pos.negated {

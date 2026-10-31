@@ -176,9 +176,12 @@ pub(crate) fn corner_of<'c>(
 }
 
 /// `SM_CAST_PTR(SmBSplineCurve, pCopy)` after an ignored `Copy`: the copy when it is a
-/// B-spline curve, else `NULL`.
+/// B-spline curve, else `NULL`. Every caller's `Copy` is one fork 9b7cd48 passes on
+/// (SER): with `fillet_statuses_pass_on` its error is returned.
 fn copy_as_b_spline(k: &Kernel, curve: &Curve) -> Result<Option<Curve>> {
-    Ok(ignored(curve.copy(k))?.filter(|c| c.is_kind_of(BSPLINE_CURVE_TYPE)))
+    // fork 9b7cd48 passes this on (SER)
+    let copy = crate::error::passed_on(curve.copy(k), k.fixes.fillet_statuses_pass_on)?;
+    Ok(ignored(copy)?.filter(|c| c.is_kind_of(BSPLINE_CURVE_TYPE)))
 }
 
 /// `SmCurve::Evaluate(t, 1, TRUE, aPV)`: the position and first derivative.
@@ -228,9 +231,14 @@ fn drop_param(
 }
 
 /// `SM_CAST_PTR(SmBSplineSurface, pCopy)` after an ignored `Copy`: the copy when it
-/// `IsKindOf(SmBSplineSurface_TYPE)`, else `NULL`.
+/// `IsKindOf(SmBSplineSurface_TYPE)`, else `NULL`. Its one caller's `Copy` is one fork
+/// 9b7cd48 passes on (SER): with `fillet_statuses_pass_on` its error is returned.
 fn copy_as_b_spline_surface(k: &Kernel, surface: &Surface) -> Result<Option<Surface>> {
-    match ignored(surface.copy(k))? {
+    // fork 9b7cd48 passes this on (SER)
+    match ignored(crate::error::passed_on(
+        surface.copy(k),
+        k.fixes.fillet_statuses_pass_on,
+    )?)? {
         Some(s) if s.is_kind_of(B_SPLINE_SURFACE_TYPE)? => Ok(Some(s)),
         _ => Ok(None),
     }
@@ -1559,8 +1567,12 @@ impl FilletBrep {
 
             // when given an OffsetSurface to copy - copy it
             if let Some(off) = other_off_surf {
-                // SmOffsetSurface::Copy(); a failed copy leaves the slot unchanged
-                if let Some(surface) = ignored(off.surface.copy(k))? {
+                // SmOffsetSurface::Copy(); a failed copy leaves the slot unchanged; fork
+                // 9b7cd48 passes this on (SER)
+                if let Some(surface) = ignored(crate::error::passed_on(
+                    off.surface.copy(k),
+                    k.fixes.fillet_statuses_pass_on,
+                )?)? {
                     let new_off = OffsetSurface {
                         surface,
                         base_id: off.base_id,
@@ -2322,7 +2334,43 @@ impl FilletBrep {
                 // for every Orig m_pTargetBrep->pBrepEdge->Edgeuse - find the Face
                 // connected to the edgeuse no longer needed
                 let edgeuses = edge::edgeuses(target, brep_edge, None, None)?;
-                for &eu in edgeuses.iter().step_by(2) {
+                // With `fillet_trim_inside_by_best_dot` (WR-611, fork de4dae6): of the original
+                // face's pieces along the rail, the one 'inside' is the one whose binormal
+                // points most the way the fillet's does. The pieces' binormals are opposite,
+                // so its dot is the positive one, however steeply the fillet meets the face;
+                // only a fillet square to the face (no side) is ambiguous.
+                let inside = if k.fixes.fillet_trim_inside_by_best_dot {
+                    let mut inside = None;
+                    let mut best_dot = EFF_ZERO_SQRT;
+                    for (index, &eu) in edgeuses.iter().enumerate().step_by(2) {
+                        let eu_face = eu1::face(target, eu)?;
+                        if !(eu_face == orig_face
+                            || eu_face.is_some_and(|f| splt_faces.contains(&f)))
+                        {
+                            continue;
+                        }
+                        let mut bin2 = evaluate_binormal(
+                            k,
+                            target,
+                            eu,
+                            dropped_parameter,
+                            false,
+                            &BinormalOptions::default(),
+                        )?
+                        .binormal;
+                        if fs.reverse_trim {
+                            bin2 = -bin2;
+                        }
+                        if fillet_bin.dot(bin2) > best_dot {
+                            best_dot = fillet_bin.dot(bin2);
+                            inside = Some(index);
+                        }
+                    }
+                    Some(inside)
+                } else {
+                    None
+                };
+                for (index, &eu) in edgeuses.iter().enumerate().step_by(2) {
                     // skip Orig m_pTargetBrep->pBrepEdge->Edgeuses not attached to the
                     // original Face(s).
                     let eu_face = eu1::face(target, eu)?;
@@ -2351,8 +2399,12 @@ impl FilletBrep {
                     // m_pTargetBrep->Edgeuse->Face is 'inside' the closed loop of common
                     // edges and it (and all Faces connected to it) get marked for
                     // deletion.
-                    if fillet_bin.dot(bin2) > 0.2 {
+                    let is_inside = match inside {
+                        Some(chosen) => chosen == Some(index),
                         // 0.2: just to avoid noise around 0.0.
+                        None => fillet_bin.dot(bin2) > 0.2,
+                    };
+                    if is_inside {
                         let matched_orig_face = eu1::face(target, eu)?;
                         let radial = eu1::radial(target, eu)?
                             .ok_or_else(|| invalid(OP_TRIM, "edge use without radial"))?;

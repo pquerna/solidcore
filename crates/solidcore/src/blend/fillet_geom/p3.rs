@@ -54,9 +54,15 @@
 //! - **Analytic fillets.** `CalcConeFilletGeom` / `CalcTorusFilletGeom`
 //!   (`blend.fillet_solver_p2`) read copies of the sorted vertex uses' points
 //!   (`SmTArray<SmTsectPnt*>` upstream; the builders only read them).
-//! - **Unported callees.** `SmFilletEdge::CalcCrossSection`
-//!   (`blend.fillet_geom_p5`) after the intersection (it needs a solver table `ReCalcFilletGeom` does
-//!   not have); after a failed intersection in the edge's `CalcFilletIntFillet`,
+//!   With `fixes.fillet_exact_round_classes` (WR-669, the SolidCraft fork's
+//!   tangency-labs/smlib@b5f2867 and 7ac037e) they are `ClassifyExactBlend` and
+//!   `CalcExactFilletGeom(.., TRUE)` instead (`blend::fillet_exact`), with errors passed on,
+//!   and only when there are points.
+//! - **Unported callees.** `SmFilletEdge::CalcCrossSection` (`blend.fillet_geom_p5`)
+//!   after the intersection reads only the recalculated geometry's own solver; a
+//!   neighbour's is a port invariant (`SolidError::PortInvariant`; plan/findings
+//!   `blend.fillet_geom_p3--calc-cross-section-neighbour-unreachable`). After a failed
+//!   intersection in the edge's `CalcFilletIntFillet`,
 //!   `SmFilletCorner::RecordFilletError` (`blend.fillet_corner_p2`) records into the
 //!   caller's [`ErrorInfo`] (a scratch record when the caller has none; the
 //!   dispatchers' vertex and edge calculators of parts 2, 4, 5 and 6 are called); in
@@ -1153,7 +1159,37 @@ impl FilletBrep {
         } // end loop on both main rails, sorting SmTsectPnts
 
         let mut fillet_created = false;
-        if is_analytic_fillet && geom_type != FilletGeomType::TangentRollover {
+        let exact_classes = k.fixes.fillet_exact_round_classes;
+        if exact_classes
+            && is_analytic_fillet
+            && geom_type != FilletGeomType::TangentRollover
+            && !tsect_pnts.is_empty()
+        {
+            // Not upstream (WR-669, the SolidCraft fork's tangency-labs/smlib@b5f2867 and
+            // 7ac037e): rebuilt exactly by the round's class (`ClassifyExactBlend`,
+            // `CalcExactFilletGeom(.., this, TRUE)`); errors are passed on
+            let tsects = tsect_pnts
+                .iter()
+                .map(|&vu| Ok(self.fillet_vertexuse(vu)?.tsect_pnt().clone()))
+                .collect::<Result<Vec<TsectPnt>>>()?;
+            let first = tsects
+                .first()
+                .ok_or_else(|| invalid(OP_RECALC, "no rail-end point"))?;
+            let blend = crate::blend::fillet_exact::classify_exact_blend(solver, k, target, first)?;
+            fillet_created = crate::blend::fillet_exact::calc_exact_fillet_geom(
+                solver,
+                k,
+                target,
+                self,
+                &blend,
+                &tsects,
+                Some(g),
+                true,
+            )?;
+        } else if !exact_classes
+            && is_analytic_fillet
+            && geom_type != FilletGeomType::TangentRollover
+        {
             // Create analytics (the solver reads copies of the vertex uses' points)
             let tsects = tsect_pnts
                 .iter()
@@ -1351,13 +1387,15 @@ impl FilletBrep {
                     if id == own {
                         return Ok(own_solver);
                     }
-                    // UNPORTED(blend.fillet_geom_p5): SmFilletEdge::CalcCrossSection (a neighbouring geometry's solver: ReCalcFilletGeom holds only its own)
-                    // Unreachable by construction upstream: no geometry's m_vEdges holds a cross-section
-                    // edge with a use on another solver's geometry; see
+                    // A port invariant, not a missing port: no geometry's m_vEdges holds a
+                    // cross-section edge whose mate use has another solver's geometry
+                    // (CreateEndCurve gives the primary use none; TopologySplit leaves the
+                    // mate without one), so upstream's CalcCrossSection never reads a
+                    // neighbouring geometry's solver here; see
                     // plan/findings/blend.fillet_geom_p3--calc-cross-section-neighbour-unreachable.md
-                    Err(SolidError::unported(
-                        "SmFilletEdge::CalcCrossSection (neighbouring geometry's solver)",
-                        "blend.fillet_geom_p5",
+                    Err(SolidError::port_invariant(
+                        OP_RECALC,
+                        "a cross-section edge never needs another geometry's solver here",
                     ))
                 };
                 self.calc_cross_section_with_lookup(

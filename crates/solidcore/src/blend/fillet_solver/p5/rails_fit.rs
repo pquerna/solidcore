@@ -7,9 +7,10 @@
 //! with the opt-in `Kernel::fixes.fillet_refuse_rails_leaving_faces`.
 //!
 //! Deviations: a run of off-face intervals between two stretches on the face is skipped
-//! when it both leaves and returns past an end of the filleted edge (#1580); `518566f`
-//! tries [`leaves_past_an_end`] only for the first and last runs and refuses such a
-//! round. The fork's later cliff-overflow construction (`SmFilletCliffOverflow.cpp`,
+//! when it both leaves and returns on or beyond the cross section at the same end of the
+//! filleted edge (#1580; a run past one end and back past the other, round the far side
+//! of a closed rail, is judged, #2175); `518566f` tries [`leaves_past_an_end`] only for
+//! the first and last runs and refuses such a round. The fork's later cliff-overflow construction (`SmFilletCliffOverflow.cpp`,
 //! which builds a convex blend over a cliff and subtracts what it removes) is not
 //! ported, so every blend that leaves its face between its ends is refused, as in
 //! `fc43974`. With the opt-in `Kernel::fixes.fillet_cliff_overflow` (WR-631, the fork's
@@ -17,6 +18,8 @@
 //! edge and whether a rail that leaves its face runs on into the body's material
 //! ([`RailsFit`], `IsConcaveEdge`, `sm_InsideMaterial`), for the executive's choice
 //! between a refusal and a cliff overflow; those judgements run only with that flag. The
+//! fork's `IsKnifeEdge` ([`is_knife_edge`], `e418750`, WR-665) is here too, used by
+//! `SmFilletCorner::Create` with `fixes.fillet_corner_per_vertex_fan`. The
 //! nearest-edge search of `sm_InsideMaterial` keeps the first of equally near edges, in
 //! the face's edge order, as the fork's strict `<` does. There is no recursion.
 
@@ -51,6 +54,46 @@ pub struct RailsFit {
     /// `rbIntoMaterial`: a rail that leaves its face runs on inside the body (judged only
     /// when asked; `false` otherwise).
     pub into_material: bool,
+}
+
+/// `SmFilletSolver::IsKnifeEdge` (the fork's, tangency-labs/smlib `e418750`, WR-665):
+/// whether `edge_id` is a knife edge, its two faces tangent along it and folded back on
+/// each other, the body's material between them of zero angle (a hole whose wall
+/// touches the bottom face along a line). The sector from the edge's primary edge use to
+/// its radial at the middle of the edge's interval (`SmEdgeuse::CalcSectorAngle`) is
+/// within `tangency_tol_rad` of none or a whole turn (a smooth edge's is a half turn).
+/// An edge without primary edge use or radial, or whose sector cannot be computed, is
+/// not one.
+///
+/// # Errors
+///
+/// [`SolidError::NotFound`] for a dangling id; [`SolidError::Unported`] from the binormal
+/// evaluation (any other failure of the sector angle reads as not a knife edge, as the
+/// fork's status test does).
+pub fn is_knife_edge(
+    k: &Kernel,
+    target: &mut Brep,
+    edge_id: EdgeId,
+    tangency_tol_rad: f64,
+) -> Result<bool> {
+    let Some(primary) = eu::primary_edgeuse(target, edge_id)? else {
+        return Ok(false);
+    };
+    if eu::radial(target, primary)?.is_none() {
+        return Ok(false);
+    }
+    // the sector between the faces, a whole turn or none (a smooth edge's is a half turn)
+    let parameter = edge::interval(target, edge_id)?.evaluate(0.5);
+    let angle = match crate::topology::edgeuse::p3::calc_sector_angle(k, target, primary, parameter)
+    {
+        Ok(angle) => angle,
+        Err(e @ SolidError::Unported { .. }) => return Err(e),
+        Err(_) => return Ok(false),
+    };
+    // smos_Min
+    let other = crate::math::TWO_PI - angle;
+    let smaller = if angle < other { angle } else { other };
+    Ok(smaller < tangency_tol_rad)
 }
 
 /// `SmFilletSolver::IsConcaveEdge` (fork, WR-631): whether the body's material wedge
@@ -138,7 +181,8 @@ fn leaves_past_an_end(
         .edgeuse(0)?
         .ok_or_else(|| SolidError::null_pointer(OP))?;
     let fil_edge = eu::edge(target, fil_eu)?.ok_or_else(|| SolidError::null_pointer(OP))?;
-    let edge_curve = edge::curve(target, fil_edge)?.ok_or_else(|| SolidError::null_pointer(OP))?;
+    // `NER(pEdgeCurve)` before either test
+    edge::curve(target, fil_edge)?.ok_or_else(|| SolidError::null_pointer(OP))?;
 
     // Across or through the face's side edge at an end.
     let (leave_edge, leave_vertex) = match (leave.point_class(), leave.object()) {
@@ -179,6 +223,25 @@ fn leaves_past_an_end(
     }
 
     // On or beyond the cross section at an end.
+    Ok(beyond_end_section(solver, k, target, rail, rail_param)?.is_some())
+}
+
+/// The second test of `SmFilletSolver::LeavesPastAnEnd`: the end of the filleted edge (0
+/// its interval's start, 1 its end) on or beyond whose cross section the rail's point at
+/// `rail_param` lies (the edge point nearest it is that end, within the solver's 3D
+/// tolerance), if any.
+fn beyond_end_section(
+    solver: &FilletSolver,
+    k: &Kernel,
+    target: &Brep,
+    rail: &Curve,
+    rail_param: f64,
+) -> Result<Option<usize>> {
+    let fil_eu = solver
+        .edgeuse(0)?
+        .ok_or_else(|| SolidError::null_pointer(OP))?;
+    let fil_edge = eu::edge(target, fil_eu)?.ok_or_else(|| SolidError::null_pointer(OP))?;
+    let edge_curve = edge::curve(target, fil_edge)?.ok_or_else(|| SolidError::null_pointer(OP))?;
     let ivl = edge::interval(target, fil_edge)?;
     let leave_point = rail.evaluate_point(k, rail_param)?;
     let dropped = edge_curve.drop_point(
@@ -194,19 +257,19 @@ fn leaves_past_an_end(
         return Err(SolidError::sm_err(OP));
     }
     let foot = edge_curve.evaluate_point(k, dropped.parameter)?;
-    for end in [ivl.min(), ivl.max()] {
+    for (index, end) in [ivl.min(), ivl.max()].into_iter().enumerate() {
         if foot.distance(edge_curve.evaluate_point(k, end)?) <= solver.approx_tol_3d {
-            return Ok(true);
+            return Ok(Some(index));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 impl FilletSolver {
     /// `SmFilletSolver::RailsFitTheirFaces` (the fork's refusal, see the module doc):
     /// whether every rail of this solver's fillet, untrimmed, stays on the face it rolls
     /// on. Each rail is classified against its face. It may run off the face past the
-    /// filleted edge's ends ([`leaves_past_an_end`]) and off across a tangent side edge (a
+    /// filleted edge's ends (`leaves_past_an_end`) and off across a tangent side edge (a
     /// rollover onto the next face). A rail that is nowhere on its face, or that leaves it
     /// between its ends across an edge that is not tangent (a wall, an opening's rim)
     /// means the blend is larger than the faces: `false`. Touching or running along the
@@ -336,13 +399,27 @@ impl FilletSolver {
                         if past_end(leave, d_leave)? {
                             continue;
                         }
-                    } else if past_end(leave, d_leave)? && past_end(&last.end, last.interval.max())?
+                    } else if let Some(end) =
+                        beyond_end_section(solver.solver(), k, target, &curve, d_leave)?
                     {
                         // A run between two stretches on the face that lies wholly past an
-                        // end (it leaves and comes back past it) is trimmed by the corner
-                        // there too (tangency-labs/solidcore#1580; the fork's `518566f`
-                        // tried only the first and last runs).
-                        continue;
+                        // end (it leaves and comes back on or beyond the cross section at
+                        // that end) is trimmed by the corner there too
+                        // (tangency-labs/solidcore#1580; the fork's `518566f` tried only
+                        // the first and last runs). A run that leaves past one end and
+                        // comes back past the other runs round the far side of a closed
+                        // rail, and is judged as the fork judges it
+                        // (tangency-labs/solidcore#2175).
+                        let back = beyond_end_section(
+                            solver.solver(),
+                            k,
+                            target,
+                            &curve,
+                            last.interval.max(),
+                        )?;
+                        if back == Some(end) {
+                            continue;
+                        }
                     }
                     let side = match (leave.point_class(), leave.object()) {
                         (PointClassType::Edge, Some(o)) => match o.target_entity()? {

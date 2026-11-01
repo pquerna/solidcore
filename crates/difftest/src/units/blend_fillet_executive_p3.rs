@@ -415,13 +415,9 @@ impl ExecutiveAccess<Handle> for Access {
         _: Handle,
         _: &mut FilletExecutive<Handle>,
     ) -> SolidResult<()> {
-        // No concrete object is constructed here. Future fixtures must dispatch
-        // derived types to their owners, as documented on ExecutiveAccess.
-        // UNPORTED(blend.fillet_corner_p1): SmFilletCorner::AdjustTopology
-        Err(SolidError::unported(
-            "SmFilletCorner::AdjustTopology",
-            "blend.fillet_corner_p1",
-        ))
+        // This fixture owns no corners, so no handle resolves to one. The virtual
+        // dispatch is `blend::fillet_corner::p3::FilletCorner::adjust_topology`.
+        missing()
     }
     fn adjust_tangent_corner(
         &mut self,
@@ -429,13 +425,9 @@ impl ExecutiveAccess<Handle> for Access {
         _: Handle,
         _: &mut FilletExecutive<Handle>,
     ) -> SolidResult<()> {
-        // No concrete object is constructed here. Future fixtures must dispatch
-        // derived types to their owners, as documented on ExecutiveAccess.
-        // UNPORTED(blend.fillet_corner_p1): SmFilletCorner::AdjustTangentCorner
-        Err(SolidError::unported(
-            "SmFilletCorner::AdjustTangentCorner",
-            "blend.fillet_corner_p1",
-        ))
+        // This fixture owns no corners, so no handle resolves to one. The virtual
+        // dispatch is `blend::fillet_corner::p3::FilletCorner::adjust_tangent_corner`.
+        missing()
     }
     fn calc_fillet_geom(
         &mut self,
@@ -881,6 +873,8 @@ fn rust(input: &Inputs) -> Result<Output, HarnessError> {
         overflow_first: false,
         classify_only: false,
         overflow_edges: Vec::new(),
+        mitred_edges: Vec::new(),
+        fan_split_points: Vec::new(),
     };
     // The executive constructor sets this after constructing its SmMerge base.
     executive.intersector.ignore_tangency = true;
@@ -1017,7 +1011,10 @@ impl UnitDiff for Runner {
             return surface_bodies::cpp(pair);
         }
         if let Some(pair) = &input.surface_surface {
-            if input.real_solid.is_some() || input.upstream_case.is_some() || !input.record.is_empty() {
+            if input.real_solid.is_some()
+                || input.upstream_case.is_some()
+                || !input.record.is_empty()
+            {
                 return Err(HarnessError::new("mixed fixture forms"));
             }
             return end_to_end::surface_surface_cpp(pair);
@@ -1076,7 +1073,10 @@ impl UnitDiff for Runner {
             return surface_bodies::rust(pair);
         }
         if let Some(pair) = &input.surface_surface {
-            if input.real_solid.is_some() || input.upstream_case.is_some() || !input.record.is_empty() {
+            if input.real_solid.is_some()
+                || input.upstream_case.is_some()
+                || !input.record.is_empty()
+            {
                 return Err(HarnessError::new("mixed fixture forms"));
             }
             return end_to_end::surface_surface_rust(pair);

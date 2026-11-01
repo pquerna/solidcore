@@ -461,13 +461,19 @@ pub fn check_and_fix_uv_trim_curves(k: &Kernel, b: &mut Brep) -> Result<()> {
 }
 
 /// `SwapUV`: claims an unlocked mark and swaps the UV parameterisation of every face
-/// (`sm_SwapFaceUV`, which skips faces already marked).
+/// (`sm_SwapFaceUV`, which skips faces already marked). Each face's and surface's
+/// edit notifications go through `env` ([`p1::swap_face_uv`]).
 ///
 /// # Errors
 ///
 /// [`SolidError::Unported`] from `sm_SwapFaceUV` (`SmFace::SwapUV`,
 /// `topology.face_p1`).
-pub fn swap_uv(k: &mut Kernel, b: &mut Brep, marks: &mut Marks) -> Result<()> {
+pub fn swap_uv(
+    k: &mut Kernel,
+    b: &mut Brep,
+    marks: &mut Marks,
+    env: &mut NotifyEnv<'_>,
+) -> Result<()> {
     let faces = brep_faces(b)?;
 
     // increment and lock an unlocked mark
@@ -479,7 +485,7 @@ pub fn swap_uv(k: &mut Kernel, b: &mut Brep, marks: &mut Marks) -> Result<()> {
     for f in faces {
         // swap the face's orientation - watch for composites (sm_SwapFaceUV is void:
         // only an unported callee stops the loop)
-        if let Err(e) = p1::swap_face_uv(k, b, marks, f, mark) {
+        if let Err(e) = p1::swap_face_uv(k, b, marks, f, mark, env) {
             if e.is_unported() {
                 res = Err(e);
                 break;
@@ -763,7 +769,7 @@ impl RegionNotifyState {
 /// carries its `SmTopology` part and attributes; such a caller models neither, so the
 /// notification runs on a default record for every object of the B-rep, keyed by its
 /// arena identity (`loopuse::notify_ref`), and an attribute store that is empty, or
-/// holds the B-rep's own attributes for the edit ([`Self::with_attributes_of`]). The records are never read back: they exist so that
+/// holds the B-rep's own attributes for the edit (`Self::with_attributes_of`). The records are never read back: they exist so that
 /// `SmTopology::Notify`'s flag propagation finds both objects, as upstream it always does.
 /// The identities are unique within one B-rep only.
 #[derive(Debug, Default)]
@@ -908,7 +914,7 @@ impl CopyNotifyState {
     /// both B-reps' attributes. Pass an empty `dest` for a copy constructor.
     ///
     /// # Errors
-    /// Those of [`seed_brep_attributes`] (a B-rep store that names no object).
+    /// Those of `seed_brep_attributes` (a B-rep store that names no object).
     pub fn with_attributes_of(src: &mut Brep, dest: &mut Brep) -> Result<Self> {
         let mut state = Self::default();
         // (the destination's records, and under the destination identities those of
@@ -2329,7 +2335,7 @@ fn shell_transfer_children(k: &mut Kernel, b: &mut Brep, from: ShellId, to: Shel
 // ---- merging curves into faces ------------------------------------------------------------
 
 /// What [`merge_curves_on_surface`] needs of the caller's classification handles, on
-/// top of [`CurveOnClassifyObjects`] (which includes [`ClassGeometry`]) and
+/// top of [`CurveOnClassifyObjects`](crate::query::face::p2::CurveOnClassifyObjects) (which includes [`ClassGeometry`]) and
 /// [`MergeIntervalBrep`]: the adapter holds the B-rep the curves merge into, which
 /// upstream's `MergeIntervals` edits through the classification's topology pointers.
 pub trait MergeCurvesObjects<O: ClassObject>:

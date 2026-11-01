@@ -422,6 +422,19 @@ impl OffsetExecutive {
         self.tangency_tol_radians * 180.0 / PI
     }
 
+    /// Takes the geometry creator's constructor tolerance under `kernel`'s fixes
+    /// ([`OffsetGeometryCreation::default_tangency_tol_radians`]): half a degree with
+    /// `Kernel::fixes.offset_four_face_vertex_split` and `offset_closes_loop_gaps` (WR-666),
+    /// else the 2 degrees of
+    /// [`Self::new`] unchanged. Called right after construction by the executives that
+    /// `SmApiOffsetBrepFull`, `SmApiShellBrepFull` and `SmBrep::LocalOperation` build.
+    pub fn use_creator_tangency_tol(&mut self, kernel: &Kernel) {
+        if crate::offset::offset_geometry_creation::four_face_vertex_split(&kernel.fixes) {
+            self.tangency_tol_radians =
+                OffsetGeometryCreation::default_tangency_tol_radians(&kernel.fixes);
+        }
+    }
+
     /// Offset distance supplied by the geometry creator.
     pub const fn offset_distance(&self) -> f64 {
         self.offset_distance
@@ -1797,29 +1810,23 @@ impl OffsetExecutive {
                     if edge::is_manifold(original, edge_id)? {
                         let primary = required(eu::primary_edgeuse(original, edge_id)?)?;
                         // Not upstream (WR-344, tangency-labs/solidcore#469), opt-in
-                        // `Kernel::fixes.offset_extended_edges_mated`: with extended convex edges,
-                        // every edge without an offset cap face had its two faces' offsets
-                        // mated along it (EdgeuseOffset), so they share their intersection
-                        // edge already, as a tangent sector's do (the tangency test is then
-                        // skipped, as the fork's `||` does). An edge whose mate failed in
-                        // `EdgeuseOffset` (#1795: the offsets stop meeting round a closed
-                        // edge) was not mated: its faces' offsets are intersected as upstream
-                        // does.
-                        let mated = kernel.fixes.offset_extended_edges_mated
-                            && self.extend_convex_edges()
-                            && !edge::edgeuses(original, edge_id, None, None)?
+                        // `Kernel::fixes.offset_extended_edges_mated`: see
+                        // `relates_mated_offsets`.
+                        let flag = kernel.fixes.offset_extended_edges_mated;
+                        let unmated = flag
+                            && edge::edgeuses(original, edge_id, None, None)?
                                 .iter()
                                 .any(|eu| self.unmated_edgeuses.contains(eu));
-                        if mated
-                            || eu2::is_tangent_sector(
+                        if relates_mated_offsets(flag, self.extend_convex_edges(), unmated, || {
+                            eu2::is_tangent_sector(
                                 kernel,
                                 original,
                                 primary,
                                 self.tangency_tol_degrees(),
                                 false,
                                 true,
-                            )?
-                        {
+                            )
+                        })? {
                             for edgeuse in edge::edgeuses(original, edge_id, None, None)? {
                                 if eu::faceuse(original, edgeuse)? == Some(faceuse) {
                                     let radial = required(eu::radial(original, edgeuse)?)?;
@@ -2629,6 +2636,18 @@ impl OffsetExecutive {
                                 offset_key_of,
                             )
                         })?;
+                        // Not upstream (WR-671, tangency-labs/solidcore#2111), opt-in
+                        // `Kernel::fixes.offset_edges_keep_source_tolerance`: the offset
+                        // edge and its vertices, made at the B-rep's zone tolerance, keep
+                        // the matched original edge's tolerance and its vertices' largest.
+                        if kernel.kernel().fixes.offset_edges_keep_source_tolerance {
+                            keep_source_tolerances(
+                                original,
+                                original_edge,
+                                required(self.offset_brep.as_mut())?,
+                                offset_edge,
+                            )?;
+                        }
                         if let Some(slot) = original_uses.get_mut(slot) {
                             *slot = None;
                         }
@@ -2675,6 +2694,41 @@ impl OffsetExecutive {
     }
 }
 
+/// (Not upstream, WR-671, `Kernel::fixes.offset_edges_keep_source_tolerance`.) Raises
+/// `offset_edge` of `result` to the tolerance of the original edge it was matched to,
+/// and both its vertices to the larger of the original edge's vertices' tolerances
+/// (matched edge uses may run in opposite directions, so the ends are not paired).
+/// Tolerances only grow (`SetTolerance(.., bUpdateOnlyIfLarger = TRUE)`).
+fn keep_source_tolerances(
+    original: &Brep,
+    original_edge: EdgeId,
+    result: &mut Brep,
+    offset_edge: EdgeId,
+) -> Result<()> {
+    let edge_tolerance = edge::tolerance(original, original_edge)?;
+    let mut vertex_tolerance = 0.0_f64;
+    for v in [
+        edge::start_vertex(original, original_edge)?,
+        edge::end_vertex(original, original_edge)?,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        vertex_tolerance = vertex_tolerance.max(vertex::tolerance(original, v)?);
+    }
+    edge::set_tolerance(result, offset_edge, edge_tolerance, true, true)?;
+    for v in [
+        edge::start_vertex(result, offset_edge)?,
+        edge::end_vertex(result, offset_edge)?,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        vertex::set_tolerance(result, v, vertex_tolerance, true, true)?;
+    }
+    Ok(())
+}
+
 /// The notification environment of offset-side entities: the caller's records,
 /// attributes and context under the offset keys.
 fn offset_env<'a>(
@@ -2687,6 +2741,35 @@ fn offset_env<'a>(
         context: notifications.context.as_deref_mut(),
         key_of: offset_key_of,
     }
+}
+
+/// Whether `PiecewiseMerge` lists the offsets of the two faces at a manifold original
+/// edge with no offset cap face among the pairs that already share their intersection
+/// edge (`sNoSSI`), so the merge does not intersect them. `tangent_sector` is
+/// `IsTangentSector` of the edge's primary edge use, evaluated only when needed.
+///
+/// Upstream relates a tangent sector only. Not upstream (WR-344, tangency-labs/solidcore#469;
+/// the fork's tangency-labs/smlib@85bbfaf), opt-in `flag`
+/// (`Kernel::fixes.offset_extended_edges_mated`): with `extend_convex` (extended convex
+/// edges) every such edge had its faces' offsets mated along it (`EdgeuseOffset`), so it is
+/// related without the tangency test, as the fork's `||` does. Under the same flag an edge
+/// whose mate failed in `EdgeuseOffset` (`unmated`; #1795: the offsets stop meeting round a
+/// closed edge) is related in neither case, tangent sector or not, and its faces' offsets are
+/// intersected as any other pair's (the fork's tangency-labs/smlib@9d8ace9:
+/// `!m_sUnmatedEdges.IsIn(pE) && (m_bExtendConvexEdges || IsTangentSector(..))`).
+fn relates_mated_offsets(
+    flag: bool,
+    extend_convex: bool,
+    unmated: bool,
+    tangent_sector: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
+    if flag && unmated {
+        return Ok(false);
+    }
+    if flag && extend_convex {
+        return Ok(true);
+    }
+    tangent_sector()
 }
 
 fn relate_surface_pair(
@@ -2947,7 +3030,7 @@ fn extract_gaps(
 /// geometry is owned under (upstream compares pointers, so geometry belongs to the
 /// record that holds it), and by [`arena_identity`] when it has no owner; every other
 /// object by [`arena_identity`].
-struct OriginalKeys {
+pub(super) struct OriginalKeys {
     edges: BTreeMap<EdgeId, ObjectRef>,
     faces: BTreeMap<FaceId, ObjectRef>,
 }
@@ -2999,7 +3082,10 @@ impl OriginalKeys {
     }
 }
 
-fn make_original_brep_cache(kernel: &Kernel, original: &Brep) -> Result<(BrepCache, OriginalKeys)> {
+pub(super) fn make_original_brep_cache(
+    kernel: &Kernel,
+    original: &Brep,
+) -> Result<(BrepCache, OriginalKeys)> {
     let keys = OriginalKeys::new(original)?;
     let cache = make_brep_cache(kernel, CacheSource::Brep(original), &|object| {
         keys.key(object)
@@ -3011,7 +3097,7 @@ fn make_original_brep_cache(kernel: &Kernel, original: &Brep) -> Result<(BrepCac
 /// (`smsurf_GetSurfaceCache`, which may create UV trim curves on `original`): the
 /// read-only solve requests each missing cache or trim, which is prepared on
 /// `original` before the solve runs again from its start.
-fn solve_original_brep_point(
+pub(super) fn solve_original_brep_point(
     kernel: &Kernel,
     original: &mut Brep,
     cache: &BrepCache,
@@ -3172,6 +3258,39 @@ mod tests {
     use crate::nurbs::b_spline_surface::BSplineSurface;
     use crate::surface::plane::Plane;
     use crate::topology::{Edge, Edgeuse, Face, Faceuse, ShellId, Vertex, Vertexuse};
+
+    /// The fork's tangency-labs/smlib@9d8ace9 (tangency-labs/solidcore#1795, WR-344):
+    /// under `offset_extended_edges_mated` an edge whose mate failed is left out of the
+    /// merge's no-SSI pairs in the tangent-sector branch too, not only the extended
+    /// convex one. A tangent sector whose mate failed is intersected; with the flag off
+    /// the tangency test alone decides, as upstream.
+    #[test]
+    fn fork_9d8ace9_unmated_tangent_sector_is_intersected() {
+        let tangent = || Ok(true);
+        let not_tangent = || Ok(false);
+        // the fork's fix: an unmated edge is related in neither branch
+        for extend_convex in [false, true] {
+            assert!(!relates_mated_offsets(true, extend_convex, true, tangent).unwrap());
+            assert!(!relates_mated_offsets(true, extend_convex, true, not_tangent).unwrap());
+        }
+        // a mated edge: related with extended convex edges, else when tangent
+        assert!(relates_mated_offsets(true, true, false, not_tangent).unwrap());
+        assert!(relates_mated_offsets(true, false, false, tangent).unwrap());
+        assert!(!relates_mated_offsets(true, false, false, not_tangent).unwrap());
+        // flag off (upstream): the tangency test alone, whatever the mate did
+        for extend_convex in [false, true] {
+            for unmated in [false, true] {
+                assert!(relates_mated_offsets(false, extend_convex, unmated, tangent).unwrap());
+                assert!(
+                    !relates_mated_offsets(false, extend_convex, unmated, not_tangent).unwrap()
+                );
+            }
+        }
+        // the tangency test is not evaluated where the fork short-circuits it
+        let unreachable = || -> Result<bool> { Err(SolidError::sm_err("test: not evaluated")) };
+        assert!(!relates_mated_offsets(true, true, true, unreachable).unwrap());
+        assert!(relates_mated_offsets(true, true, false, unreachable).unwrap());
+    }
 
     /// Runs `run` with empty notification stores keyed by arena identity.
     fn with_state<R>(run: impl FnOnce(&mut NotifyState<'_>) -> R) -> R {

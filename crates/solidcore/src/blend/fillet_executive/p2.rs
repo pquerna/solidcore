@@ -6,12 +6,14 @@
 //!
 //! | Rust | Upstream |
 //! |------|----------|
-//! | [`FilletExecutive::set_fillet_parameters`], [`FilletParameters`] | `SmFilletExecutive::SetFilletParameters` (edge pointers, per-edge parameters) |
+//! | [`FilletExecutive::set_fillet_parameters`], [`FilletParameters`] | `SmFilletExecutive::SetFilletParameters` (edge pointers, per-edge parameters; the fork's `pOptSecondRadii`, `f653ac9`) |
+//! | `reset_parameter_state` (crate-private) | `SmFilletExecutive::SetFilletParameters` reset block |
 //! | `check_edges_are_in_brep` (private) | `SmFilletExecutive::CheckEdgesAreInBrep` |
+//! | [`FilletParametersAccess::parameters_split_blended_vertex_fans`] | the fork's `SmFilletExecutive::SplitBlendedVertexFans` (`e418750`, WR-665; with `fixes.fillet_corner_per_vertex_fan`) |
 //! | [`surface_surface_fillet`], [`SurfaceFilletOptions`] | `SmFilletExecutive::SurfaceSurfaceFillet` |
 //! | [`FilletExecutive::do_surface_filleting`] | `SmFilletExecutive::DoSurfaceFilleting` |
 //! | [`FilletExecutive::set_fillet_brep_edge_map`] | `SmFilletExecutive::SetFilletBrepEdgeMap` |
-//! | [`FilletExecutive::process_smooth_edge_sequences`], [`FilletExecutive::process_smooth_edge_sequences_with`] | `SmFilletExecutive::ProcessSmoothEdgeSequences` |
+//! | [`FilletExecutive::process_smooth_edge_sequences`], `FilletExecutive::process_smooth_edge_sequences_with` | `SmFilletExecutive::ProcessSmoothEdgeSequences` |
 //! | [`FilletExecutive::collect_tangent_edge_sequence`] | `SmFilletExecutive::CollectTangentEdgeSequence` |
 //! | [`TemporaryRadiusChange::new`], [`TemporaryRadiusChange::revert`], [`with_temporary_radius_change`] | `SmTemporaryRadiusChange` (constructor, destructor) |
 //! | [`TemporaryRadiusChange::set_up`] | `SmTemporaryRadiusChange::SetUp` |
@@ -338,7 +340,8 @@ fn law_evaluate(
 /// `SurfaceSurfaceFillet` applies right after construction.
 #[derive(Debug, Clone, Copy)]
 pub enum SolverSpec<'a, O> {
-    /// `SmConstantRadiusFS(ctx, dApproxTol, dAngTolRad, dTanTolRad, dRadius, pEU)`.
+    /// `SmConstantRadiusFS(ctx, dApproxTol, dAngTolRad, dTanTolRad, dRadius, pEU,
+    /// pdOptSecondRadius)`.
     ConstantRadius {
         /// `dApproxTol`.
         approx_tol: f64,
@@ -350,6 +353,9 @@ pub enum SolverSpec<'a, O> {
         radius: f64,
         /// `pEU`.
         edgeuse: O,
+        /// `pdOptSecondRadius`: the offset of the second edge use's surface (`None` for
+        /// null, the upstream call; the fork's `pOptSecondRadii` entry, f653ac9).
+        second_radius: Option<f64>,
     },
     /// `SmConstantDistanceFS(ctx, dApproxTol, dAngTolRad, dTanTolRad, dRadius, pEU)`.
     ConstantDistance {
@@ -453,6 +459,24 @@ pub trait FilletParametersAccess<O: ClassObject + SolutionObject + Ord>:
     /// # Errors
     /// Object resolution failures.
     fn parameters_edge_is_live(&self, brep: O, edge: O) -> Result<bool>;
+    /// The fork's `SplitBlendedVertexFans` (tangency-labs/smlib `e418750`, WR-665; run only
+    /// with `fixes.fillet_corner_per_vertex_fan`): each filleted edge's start and end
+    /// vertex, once each and not one made here, split into one vertex per fan of faces
+    /// (`SmBrep::SplitVertexByFans`); the points of the vertices split, in order, for
+    /// `JoinBlendedVertexFans`. Only an adapter over a live target can split; the default
+    /// splits nothing.
+    ///
+    /// # Errors
+    /// Those of the split.
+    fn parameters_split_blended_vertex_fans(
+        &mut self,
+        k: &Kernel,
+        brep: O,
+        edges: &[O],
+    ) -> Result<Vec<Point3>> {
+        let _ = (k, brep, edges);
+        Ok(Vec::new())
+    }
 }
 
 impl<O, A> FilletParametersAccess<O> for A
@@ -516,6 +540,11 @@ pub struct FilletParameters<'a, O> {
     pub continuity: u32,
     /// `dThumbweight` (header default 1.0).
     pub thumbweight: f64,
+    /// The fork's `pOptSecondRadii` (tangency-labs/smlib `f653ac9`; header default
+    /// `NULL`, here `None`): one entry per edge, the offset of each constant-radius
+    /// solver's second edge use's surface (`radius_values` gives the first's), for a
+    /// chamfer with unequal setbacks. Read only for `SM_FS_CONST_RADIUS` edges.
+    pub second_radii: Option<&'a [f64]>,
 }
 
 /// `SetFilletParameters`' factor from an edge's tolerance to its solver's
@@ -565,6 +594,27 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
         Ok(())
     }
 
+    /// Reset the execution switches and per-preparation bookkeeping shared by
+    /// native parameter setup and the session's two-offset convenience setup.
+    pub(crate) fn reset_parameter_state(&mut self) {
+        // First set some standard flags.
+        self.options = ExecutionOptions {
+            piecewise_merge: false,
+            topology_insertion: true,
+            global_merge: false,
+            trimming: true,
+            classification: true,
+        };
+        // the fork's (WR-631): no cliff overflow, no open ends yet
+        self.cliff_overflow = false;
+        self.open_ends.clear();
+        // the fork's (WR-634): no overflow edges yet, no mitred edges (9ba2b12)
+        self.overflow_edges.clear();
+        self.mitred_edges.clear();
+        // the fork's (WR-665, e418750): no fan split points yet
+        self.fan_split_points.clear();
+    }
+
     /// `SetFilletParameters`: resets the five operation switches to their common
     /// values and, for each edge, creates its fillet solver (of the edge's radius type
     /// and value, on its blend edge use) and gives it the surface generator of its
@@ -595,19 +645,7 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
             self.target = Some(brep);
         }
 
-        // First set some standard flags.
-        self.options = ExecutionOptions {
-            piecewise_merge: false,
-            topology_insertion: true,
-            global_merge: false,
-            trimming: true,
-            classification: true,
-        };
-        // the fork's (WR-631): no cliff overflow, no open ends yet
-        self.cliff_overflow = false;
-        self.open_ends.clear();
-        // the fork's (WR-634): no overflow edges yet
-        self.overflow_edges.clear();
+        self.reset_parameter_state();
 
         let num_filleted_edges = params.edges.len();
         if num_filleted_edges < 1 {
@@ -615,6 +653,12 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
         }
 
         self.check_edges_are_in_brep(access, params.brep, params.edges)?;
+        // the fork's SplitBlendedVertexFans (WR-665, tangency-labs/smlib@e418750)
+        if k.fixes.fillet_corner_per_vertex_fan {
+            let brep = params.brep.ok_or_else(|| null!("null B-rep"))?;
+            let points = access.parameters_split_blended_vertex_fans(k, brep, params.edges)?;
+            self.fan_split_points.extend(points);
+        }
 
         let single_xsect_type = single(params.xsect_types.len(), num_filleted_edges);
         let single_radius_type = single(params.radius_types.len(), num_filleted_edges);
@@ -734,13 +778,28 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
             let approx_tol = TOL_FACTOR * access.parameters_edge_tolerance(edge)?;
 
             let spec = match radius_type {
-                FilletSolverType::ConstRadius => Some(SolverSpec::ConstantRadius {
-                    approx_tol,
-                    ang_tol_rad,
-                    tan_tol_rad,
-                    radius,
-                    edgeuse: eu,
-                }),
+                FilletSolverType::ConstRadius => {
+                    // the fork's pOptSecondRadii (tangency-labs/smlib f653ac9)
+                    let mut second_radius = None;
+                    if let Some(second_radii) = params.second_radii {
+                        if second_radii.len() != num_filleted_edges {
+                            self.error.note_error(
+                                FilletErrorType::InvalidInput,
+                                Some("SetFilletParameters: second radii size mismatch."),
+                            );
+                            return Err(status(SM_ERR_INVALID_INPUT));
+                        }
+                        second_radius = second_radii.get(ii).copied();
+                    }
+                    Some(SolverSpec::ConstantRadius {
+                        approx_tol,
+                        ang_tol_rad,
+                        tan_tol_rad,
+                        radius,
+                        edgeuse: eu,
+                        second_radius,
+                    })
+                }
                 FilletSolverType::ConstDist => Some(SolverSpec::ConstantDistance {
                     approx_tol,
                     ang_tol_rad,

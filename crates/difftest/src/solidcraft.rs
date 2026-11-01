@@ -1567,7 +1567,9 @@ fn measure(k: &Kernel, b: &mut Brep) -> Result<Measured, SolidError> {
     })
 }
 
-/// Turns on the `UpstreamFixes` field `name` a case asks for.
+/// Turns on the `UpstreamFixes` field `name` a case asks for: any field, by its name
+/// ([`solidcore::kernel::UpstreamFixes::flag_mut`]; the arms below predate it and
+/// resolve the same fields).
 fn enable_fix(k: &mut Kernel, name: &str) -> Result<(), String> {
     let field = match name {
         "sweep_frame_on_planar_path_normal" => &mut k.fixes.sweep_frame_on_planar_path_normal,
@@ -1597,6 +1599,9 @@ fn enable_fix(k: &mut Kernel, name: &str) -> Result<(), String> {
             &mut k.fixes.precise_properties_split_at_surface_knots
         }
         "precise_properties_trim_base_v" => &mut k.fixes.precise_properties_trim_base_v,
+        "precise_properties_span_end_from_below" => {
+            &mut k.fixes.precise_properties_span_end_from_below
+        }
         "loops_go_on_round_the_vertex" => &mut k.fixes.loops_go_on_round_the_vertex,
         "revolve_nested_shells_as_cavities" => &mut k.fixes.revolve_nested_shells_as_cavities,
         "revolve_splits_curves_on_axis" => &mut k.fixes.revolve_splits_curves_on_axis,
@@ -1612,6 +1617,7 @@ fn enable_fix(k: &mut Kernel, name: &str) -> Result<(), String> {
         "fillet_3x2_tangent_side_edge_roles" => &mut k.fixes.fillet_3x2_tangent_side_edge_roles,
         "fillet_mitre_concave_face_corners" => &mut k.fixes.fillet_mitre_concave_face_corners,
         "fillet_mitre_gap_patch" => &mut k.fixes.fillet_mitre_gap_patch,
+        "fillet_corner_per_vertex_fan" => &mut k.fixes.fillet_corner_per_vertex_fan,
         "fillet_nx1_tangent_side_edge_same_convexity" => {
             &mut k.fixes.fillet_nx1_tangent_side_edge_same_convexity
         }
@@ -1620,7 +1626,10 @@ fn enable_fix(k: &mut Kernel, name: &str) -> Result<(), String> {
         "fillet_cliff_overflow" => &mut k.fixes.fillet_cliff_overflow,
         "offset_extension_as_itself" => &mut k.fixes.offset_extension_as_itself,
         "fillet_run_on_past_far_end_only" => &mut k.fixes.fillet_run_on_past_far_end_only,
-        _ => return Err(format!("unknown `fixes` entry `{name}`")),
+        _ => k
+            .fixes
+            .flag_mut(name)
+            .ok_or_else(|| format!("unknown `fixes` entry `{name}`"))?,
     };
     *field = true;
     Ok(())
@@ -2218,6 +2227,22 @@ mod tests {
         assert!(k.fixes.fillet_refuse_non_manifold_result);
         assert!(k.fixes.fillet_refuse_ball_not_fitting);
         assert!(enable_fix(&mut k, "no_such_fix").is_err());
+    }
+
+    /// Every `UpstreamFixes` field can be named, also one without an arm of its own.
+    #[test]
+    fn every_fix_can_be_enabled_by_name() {
+        for &name in solidcore::kernel::UpstreamFixes::NAMES {
+            let mut k = Kernel::default();
+            enable_fix(&mut k, name).unwrap();
+            let on: Vec<&str> = k
+                .fixes
+                .flags()
+                .filter(|&(_, on)| on)
+                .map(|(n, _)| n)
+                .collect();
+            assert_eq!(on, [name]);
+        }
     }
 
     #[test]

@@ -62,6 +62,10 @@
 //!   pairs processed and their order are the same, and a join of two bodies of n faces
 //!   no longer walks all n^2 pairs to skip them. With an intersection table registered
 //!   every pair is still visited (its lookup copies curves before the box test).
+//! - **Opt-in (WR-528).** With `Kernel::fixes.close_loop_relates_only_coincident_edges`,
+//!   `CloseIntersectionLoop` relates the target edge to the sole other edge between the
+//!   mated vertices only when its midpoint drops within the edges' tolerance (the
+//!   fork's tangency-labs/smlib@e881cdb).
 //! - **Deleted curves.** `IntersectTopology` and `IntersectInsertRelate` return the
 //!   curve handles deleted (by `SplitIntersectingProtoEdges`, the resolution, the
 //!   imprint and the manager's destructor), as [`p1`](super::p1) does.
@@ -71,7 +75,8 @@
 //!   goes on with both B-reps half imprinted (upstream: reads of freed vertex uses).
 //!   The port deletes the manager and returns the imprint's error, unless every
 //!   failing imprint stopped before editing a B-rep (an edge definition without a
-//!   final vertex): the B-reps are then consistent and the port goes on as upstream.
+//!   final vertex, or whose `MakeEdgeInFace` finds no vertex sector) or the only
+//!   other failure is `GlueCoincidentBrepVertices`: the port then goes on as upstream.
 //! - **Statuses upstream ignores** (`SmBrep` edits whose status is unchecked,
 //!   `RemoveRelationship` in `DeleteFaces` / `FixGaps`, bounding boxes, `DropPoint`,
 //!   `SimpleCoincidenceChecker`, `CalculateUVDomainFromUVTrimCurves`, `Relate` in
@@ -1054,8 +1059,24 @@ impl<O: ClassObject + SolutionObject + Ord> TopologyIntersector<O> {
                     SolverOperation::Minimize,
                 )?;
 
+                // Opt-in (WR-528, fork e881cdb): the closest point must lie within the
+                // edges' tolerance (the closest-point drop always succeeds): two
+                // different edges between the same pair of vertices, such as a circle's
+                // long arc and another solid's arc that only shares its ends, were
+                // related as one
+                let within = if k.fixes.close_loop_relates_only_coincident_edges {
+                    let tol = |e| {
+                        brep.topology_tolerance(e)
+                            .ok_or(invalid(OP_CLOSE_LOOP, "topology handle is unknown"))
+                    };
+                    let on_tol = max2(max_dist * 2.0, max2(tol(be)?, tol(o_edge)?));
+                    dropped.distance <= on_tol
+                } else {
+                    true
+                };
+
                 // when point dropped to curve within tolerance
-                if dropped.success {
+                if dropped.success && within {
                     // add the edge pair to the list of mated object
                     // thus filling a potential intersection loop gap
                     // (status unchecked)
@@ -1206,7 +1227,8 @@ impl<O: ClassObject + SolutionObject + Ord> TopologyIntersector<O> {
     /// it); every error of the imprint that may have edited a B-rep, after deleting
     /// the manager (SolidCraft fix af8db37: upstream goes on with the half-imprinted
     /// B-reps, UB-242, which [`Kernel::note_upstream_ub`] records); an imprint failure
-    /// that edited nothing only warns, as upstream;
+    /// that edited nothing, or a failing `GlueCoincidentBrepVertices`, only warns, as
+    /// upstream;
     /// [`SolidError::InvalidInput`] without both B-reps. Where the manager's
     /// destructor would read a freed proto edge upstream (UB-175) the port's defined
     /// teardown goes on and [`Kernel::note_upstream_ub`] records `"UB-175"`, also when
@@ -1259,7 +1281,8 @@ impl<O: ClassObject + SolutionObject + Ord> TopologyIntersector<O> {
         // measure them (SolidCraft change, tangency-labs/smlib af8db37; upstream only
         // warns and overwrites the status). A failure that edited nothing (an edge
         // definition without a final vertex, or a MakeEdgeInFace that finds no vertex
-        // sector before its first edit) leaves the Breps consistent, and upstream goes on.
+        // sector before its first edit) leaves the Breps consistent, and upstream goes on;
+        // so does a failing GlueCoincidentBrepVertices (UB-242 addendum, glue failure).
         let outcome = self
             .imprint_intersections_reporting_edits(k, brep)
             .and_then(|o| {

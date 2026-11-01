@@ -704,6 +704,8 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
             overflow_first: false,
             classify_only: false,
             overflow_edges: Vec::new(),
+            mitred_edges: Vec::new(),
+            fan_split_points: Vec::new(),
         }
     }
 
@@ -868,6 +870,14 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
     #[must_use]
     pub fn overflow_edges(&self) -> &[O] {
         &self.overflow_edges
+    }
+
+    /// `GetMitredEdges` (the fork's, WR-634, tangency-labs/smlib@9ba2b12): when
+    /// `CreateFilletBrep` stopped with `FilletErrorType::OverflowFirst`, the edges of each
+    /// two blends mitred at a face's concave corner, two by two; empty otherwise.
+    #[must_use]
+    pub fn mitred_edges(&self) -> &[O] {
+        &self.mitred_edges
     }
 
     /// `SetSelfIntersectionHandler`.
@@ -1517,7 +1527,7 @@ pub trait SmoothSequenceAccess<O: ClassObject + SolutionObject + Ord> {
 /// removed by `DeleteTopologicalVertex`, merging the edges; when that fails the
 /// vertex stays, as upstream ignores the status. The faces of `b` own their surfaces
 /// (as every face here does); the edits notify through local environments
-/// ([`remove_topo_edges_with_notifications`] takes the caller's).
+/// (`remove_topo_edges_with_notifications` takes the caller's).
 ///
 /// # Errors
 ///

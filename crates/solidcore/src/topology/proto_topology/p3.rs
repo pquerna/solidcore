@@ -95,7 +95,7 @@
 
 use crate::curve::curve::p2::Curve;
 use crate::curve::curve::p8::CurveIntersectOptions;
-use crate::error::{Result, SolidError};
+use crate::error::{passed_on, Result, SolidError};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::solution_array::{ObjectKind, SolutionObject, SolutionType};
 use crate::geom::tol::{xsect_tol3d, zone_tol3d, USE_DEFAULT};
@@ -314,16 +314,25 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         }
 
         // sm_FindPositionFromPCs, status ignored; the position stays SM_UNDEF on failure
-        let position = ignore_soft(find_position_from_pcs(k, geometry, pc1, pc2))?
-            .map_or(Vec3::UNDEF, |p| p.position);
+        // (passed on with `ssi_proto_topology_statuses_pass_on`, fork bcc6f01)
+        let pass = k.fixes.ssi_proto_topology_statuses_pass_on;
+        let position = ignore_soft(passed_on(
+            find_position_from_pcs(k, geometry, pc1, pc2),
+            pass,
+        )?)?
+        .map_or(Vec3::UNDEF, |p| p.position);
 
         // find closest ProtoVertex within m_dTol to sPt
         let (found, _dist) = self.find_proto_vertex(position)?;
 
         // when nearby PV exists
         if let Some(pv) = found {
-            // AddVertexDefinition(rPC1, rPC2, pNewVD): status ignored
-            ignore_soft(self.add_vertex_definition_from_pcs(k, geometry, pv, pc1, pc2))?;
+            // AddVertexDefinition(rPC1, rPC2, pNewVD): status ignored (passed on with the
+            // flag)
+            ignore_soft(passed_on(
+                self.add_vertex_definition_from_pcs(k, geometry, pv, pc1, pc2),
+                pass,
+            )?)?;
             return Ok((Some(pv), false));
         }
 
@@ -358,10 +367,13 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         let this_ivl = ci1.interval;
         let tol = ti_approx_tol_3d;
 
-        // DD3: Check for overlapping PEs; the status is ignored.
-        let overlapping: Vec<Option<ProtoEdgeId>> = ignore_soft(
+        // DD3: Check for overlapping PEs; the status is ignored (passed on with
+        // `ssi_proto_topology_statuses_pass_on`, fork bcc6f01).
+        let pass = k.fixes.ssi_proto_topology_statuses_pass_on;
+        let overlapping: Vec<Option<ProtoEdgeId>> = ignore_soft(passed_on(
             self.check_overlapping_proto_edges(k, geometry, classification1, ci1, ci2),
-        )?
+            pass,
+        )?)?
         .unwrap_or_default();
 
         // when CrvInterval is degenerate - find or create a ProtoVertex for Interval
@@ -496,16 +508,19 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         } else if !is_identical {
             // Create new EdgeDef and add it to NewPE's EdgeDef list
             if let Some(pe) = new_pe {
-                // (status ignored upstream)
-                ignore_soft(self.add_edge_definition_from_intervals(
-                    k,
-                    &mut *geometry,
-                    pe,
-                    classification1,
-                    ci1,
-                    classification2,
-                    ci2,
-                ))?;
+                // (status ignored upstream, passed on with the flag)
+                ignore_soft(passed_on(
+                    self.add_edge_definition_from_intervals(
+                        k,
+                        &mut *geometry,
+                        pe,
+                        classification1,
+                        ci1,
+                        classification2,
+                        ci2,
+                    ),
+                    pass,
+                )?)?;
             }
         }
         Ok((new_pe, was_created))
@@ -546,9 +561,12 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         let tol = d.raw_tolerance();
 
         // Takes reversal into account; status ignored.
-        let crv_pt = ignore_soft(d.evaluate(k, &*geometry, param_pe, true, false))?
-            .and_then(|r| r.0)
-            .unwrap_or(Vec3::UNDEF);
+        let crv_pt = ignore_soft(passed_on(
+            d.evaluate(k, &*geometry, param_pe, true, false),
+            k.fixes.ssi_proto_topology_statuses_pass_on,
+        )?)?
+        .and_then(|r| r.0)
+        .unwrap_or(Vec3::UNDEF);
 
         // Use distance to end of this EdgeDef, not distance to our VertexDefs.
         let pe = d
@@ -574,21 +592,24 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         let mut pc2 = PointClassification::new(zone_tol3d(k, tol));
         // (statuses ignored: a failed classification keeps its cleared state)
         let tol_3d = zone_tol3d(k, tol);
-        if let Some(pc) =
-            ignore_soft(geometry.brep_point_3d_classify(k, brep1, crv_pt, tol_3d, true))?
-        {
+        if let Some(pc) = ignore_soft(passed_on(
+            geometry.brep_point_3d_classify(k, brep1, crv_pt, tol_3d, true),
+            k.fixes.ssi_proto_topology_statuses_pass_on,
+        )?)? {
             pc1 = pc;
         }
-        if let Some(pc) =
-            ignore_soft(geometry.brep_point_3d_classify(k, brep2, crv_pt, tol_3d, true))?
-        {
+        if let Some(pc) = ignore_soft(passed_on(
+            geometry.brep_point_3d_classify(k, brep2, crv_pt, tol_3d, true),
+            k.fixes.ssi_proto_topology_statuses_pass_on,
+        )?)? {
             pc2 = pc;
         }
 
         let mid_pv = mid_pv.ok_or(dangling("mid proto vertex is null"))?;
-        let (new_vd, created) = ignore_soft(
+        let (new_vd, created) = ignore_soft(passed_on(
             self.add_vertex_definition_from_pcs(k, &*geometry, mid_pv, &mut pc1, &mut pc2),
-        )?
+            k.fixes.ssi_proto_topology_statuses_pass_on,
+        )?)?
         .map_or((None, false), |(vd, created)| (Some(vd), created));
         let new_vd = new_vd.ok_or(SolidError::null_pointer(OP_ED_SPLIT))?;
 
@@ -614,17 +635,26 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
             .edge_def(ed)
             .ok_or(dangling("edge definition is deleted"))?
             .xsect_interval();
-        ignore_soft(this_ivl.set_max(param_pe))?;
+        ignore_soft(passed_on(
+            this_ivl.set_max(param_pe),
+            k.fixes.ssi_proto_topology_statuses_pass_on,
+        )?)?;
         self.set_ed_interval(ed, this_ivl)?;
         let mut new_ivl = self
             .edge_def(new_ed)
             .ok_or(dangling("edge definition is deleted"))?
             .xsect_interval();
-        ignore_soft(new_ivl.set_min(param_pe))?;
+        ignore_soft(passed_on(
+            new_ivl.set_min(param_pe),
+            k.fixes.ssi_proto_topology_statuses_pass_on,
+        )?)?;
         self.set_ed_interval(new_ed, new_ivl)?;
 
         let top = top_pe.ok_or(dangling("top proto edge is null"))?;
-        ignore_soft(self.add_edge_definition(k, &mut *geometry, top, new_ed))?;
+        ignore_soft(passed_on(
+            self.add_edge_definition(k, &mut *geometry, top, new_ed),
+            k.fixes.ssi_proto_topology_statuses_pass_on,
+        )?)?;
 
         // Copy the three curves; trim the copies and the originals.
         let this_crv3d = self
@@ -692,7 +722,10 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         let crv = curve
             .and_then(|c| geometry.curve_mut(c))
             .ok_or(dangling("curve handle is null or unknown"))?;
-        ignore_soft(crv.trim(k, &mut ivl, TrimMode::Notify))?;
+        ignore_soft(passed_on(
+            crv.trim(k, &mut ivl, TrimMode::Notify),
+            k.fixes.ssi_proto_topology_statuses_pass_on,
+        )?)?;
         self.set_ed_interval(ed, ivl)
     }
 
@@ -728,9 +761,12 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         }
         let tol = e.raw_tolerance();
 
-        let crv_pt = ignore_soft(self.proto_edge_evaluate(k, &*geometry, pe, dt, true, false))?
-            .and_then(|r| r.0)
-            .unwrap_or(Vec3::UNDEF);
+        let crv_pt = ignore_soft(passed_on(
+            self.proto_edge_evaluate(k, &*geometry, pe, dt, true, false),
+            k.fixes.ssi_proto_topology_statuses_pass_on,
+        )?)?
+        .and_then(|r| r.0)
+        .unwrap_or(Vec3::UNDEF);
         let start_pt = self.proto_edge_end_position(k, &*geometry, pe, true)?;
         let end_pt = self.proto_edge_end_position(k, &*geometry, pe, false)?;
 
@@ -767,7 +803,10 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         // WR-101: upstream reads this maximum after clamping it, giving the upper child
         // `[dT, dT]`; the opt-in keeps the old maximum (`[dT, old_max]`).
         let old_max = lower.max();
-        ignore_soft(lower.set_min_max(lower.min(), dt))?;
+        ignore_soft(passed_on(
+            lower.set_min_max(lower.min(), dt),
+            k.fixes.ssi_proto_topology_statuses_pass_on,
+        )?)?;
         self.proto_edge_mut(pe)
             .ok_or(dangling("proto edge is deleted"))?
             .set_xsect_interval(lower);
@@ -780,7 +819,10 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         } else {
             lower.max()
         };
-        ignore_soft(upper.set_min_max(dt, upper_max))?;
+        ignore_soft(passed_on(
+            upper.set_min_max(dt, upper_max),
+            k.fixes.ssi_proto_topology_statuses_pass_on,
+        )?)?;
         self.proto_edge_mut(new_pe)
             .ok_or(dangling("proto edge is deleted"))?
             .set_xsect_interval(upper);
@@ -817,7 +859,10 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                 .proto_vertex_mut(end)
                 .ok_or(dangling("proto vertex is deleted"))?;
             v.add_proto_edge(new_pe);
-            ignore_soft(v.remove_proto_edge(pe))?;
+            ignore_soft(passed_on(
+                v.remove_proto_edge(pe),
+                k.fixes.ssi_proto_topology_statuses_pass_on,
+            )?)?;
         }
 
         // Add the new ProtoEdge to the ProtoTopoMgr ProtoTopo list
@@ -836,14 +881,10 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
             .clear_edge_definitions();
 
         for ed in eds {
-            ignore_soft(self.edge_definition_split(
-                k,
-                geometry,
-                ed,
-                dt,
-                Some(new_pv),
-                Some(new_pe),
-            ))?;
+            ignore_soft(passed_on(
+                self.edge_definition_split(k, geometry, ed, dt, Some(new_pv), Some(new_pe)),
+                k.fixes.ssi_proto_topology_statuses_pass_on,
+            )?)?;
         }
 
         // relate newPE to this_PE->CoincPFs
@@ -876,6 +917,9 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         pe2: ProtoEdgeId,
     ) -> Result<Vec<O>> {
         let mut deleted: Vec<O> = Vec::new();
+        // fork bcc6f01 (`SplitIntersectingProtoEdges`): the splits, combines and
+        // removals pass on their statuses.
+        let pass = k.fixes.ssi_proto_topology_statuses_pass_on;
         let e1 = self
             .proto_edge(pe1)
             .ok_or(dangling("proto edge is deleted"))?;
@@ -948,14 +992,20 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                     .ok_or(dangling("proto edge is deleted"))?
                     .xsect_interval();
                 if iv1.contains_value(t1, -EFF_ZERO) {
-                    ignore_soft(self.proto_edge_split(k, geometry, pe1, t1))?;
+                    ignore_soft(passed_on(
+                        self.proto_edge_split(k, geometry, pe1, t1),
+                        pass,
+                    )?)?;
                 }
                 let iv2 = self
                     .proto_edge(pe2)
                     .ok_or(dangling("proto edge is deleted"))?
                     .xsect_interval();
                 if iv2.contains_value(t2, -EFF_ZERO) {
-                    ignore_soft(self.proto_edge_split(k, geometry, pe2, t2))?;
+                    ignore_soft(passed_on(
+                        self.proto_edge_split(k, geometry, pe2, t2),
+                        pass,
+                    )?)?;
                 }
             } else if sol.solution_type == SolutionType::RangeOfValues {
                 // Check whether the two PEs run in the same direction or opposite.
@@ -963,35 +1013,45 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
 
                 // T1:
                 let t11 = sol.start.param(0)?;
-                let (npv11, npe11) = ignore_soft(self.proto_edge_split(k, geometry, pe1, t11))?
-                    .unwrap_or((None, None));
+                let (npv11, npe11) = ignore_soft(passed_on(
+                    self.proto_edge_split(k, geometry, pe1, t11),
+                    pass,
+                )?)?
+                .unwrap_or((None, None));
                 let t21 = sol.start.param(1)?;
-                let (npv21, npe21) = ignore_soft(self.proto_edge_split(k, geometry, pe2, t21))?
-                    .unwrap_or((None, None));
+                let (npv21, npe21) = ignore_soft(passed_on(
+                    self.proto_edge_split(k, geometry, pe2, t21),
+                    pass,
+                )?)?
+                .unwrap_or((None, None));
 
                 // Combine PVs:
                 let pv1 = self.which_pv_to_combine(k, &*geometry, pe1, t11, npv11)?;
                 let pv2 = self.which_pv_to_combine(k, &*geometry, pe1, t21, npv21)?;
-                self.combine_and_delete_pvs(pv1, pv2)?;
+                self.combine_and_delete_pvs(pv1, pv2, pass)?;
 
                 // T2: first decide which pieces to split.
                 let pe1_to_split = npe11.unwrap_or(pe1);
                 let pe2_to_split = if same_dir { npe21.unwrap_or(pe2) } else { pe2 };
 
                 let t12 = sol.end.param(0)?;
-                let (npv12, npe12) =
-                    ignore_soft(self.proto_edge_split(k, geometry, pe1_to_split, t12))?
-                        .unwrap_or((None, None));
+                let (npv12, npe12) = ignore_soft(passed_on(
+                    self.proto_edge_split(k, geometry, pe1_to_split, t12),
+                    pass,
+                )?)?
+                .unwrap_or((None, None));
                 let t22 = sol.end.param(1)?;
-                let (npv22, npe22) =
-                    ignore_soft(self.proto_edge_split(k, geometry, pe2_to_split, t22))?
-                        .unwrap_or((None, None));
+                let (npv22, npe22) = ignore_soft(passed_on(
+                    self.proto_edge_split(k, geometry, pe2_to_split, t22),
+                    pass,
+                )?)?
+                .unwrap_or((None, None));
                 let _ = npe12;
 
                 // Combine PVs:
                 let pv1 = self.which_pv_to_combine(k, &*geometry, pe1_to_split, t12, npv12)?;
                 let pv2 = self.which_pv_to_combine(k, &*geometry, pe2_to_split, t22, npv22)?;
-                self.combine_and_delete_pvs(pv1, pv2)?;
+                self.combine_and_delete_pvs(pv1, pv2, pass)?;
 
                 // Combine ProtoEdges
                 let pe1_to_combine = npe11.unwrap_or(pe1);
@@ -1000,14 +1060,12 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                 } else {
                     npe22.unwrap_or(pe2)
                 };
-                ignore_soft(self.combine_proto_edge(
-                    k,
-                    &mut *geometry,
-                    pe1_to_combine,
-                    pe2_to_combine,
-                ))?;
+                ignore_soft(passed_on(
+                    self.combine_proto_edge(k, &mut *geometry, pe1_to_combine, pe2_to_combine),
+                    pass,
+                )?)?;
 
-                ignore_soft(self.remove_proto_edge(pe2_to_combine))?;
+                ignore_soft(passed_on(self.remove_proto_edge(k, pe2_to_combine), pass)?)?;
                 self.forget_proto_edge(pe2_to_combine);
                 deleted.extend(self.delete_proto_edge_object(pe2_to_combine));
             }
@@ -1021,14 +1079,15 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         &mut self,
         pv1: Option<ProtoVertexId>,
         pv2: Option<ProtoVertexId>,
+        pass: bool,
     ) -> Result<()> {
         if let (Some(a), Some(b)) = (pv1, pv2) {
             if a != b {
-                ignore_soft(self.combine_proto_vertex(a, b))?;
+                ignore_soft(passed_on(self.combine_proto_vertex(a, b), pass)?)?;
                 self.proto_vertex_mut(b)
                     .ok_or(dangling("proto vertex is deleted"))?
                     .clear_vertex_definitions();
-                ignore_soft(self.remove_proto_vertex(b))?;
+                ignore_soft(passed_on(self.remove_proto_vertex(b), pass)?)?;
                 self.delete_proto_vertex_object(b);
             }
         }
@@ -1053,6 +1112,9 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         brep: &mut (impl ProtoBrep<O> + BrepGlue<O>),
         mates: &mut dyn Mates<O>,
     ) -> Result<Vec<O>> {
+        // statuses SMLib drops, passed on with `ssi_proto_topology_statuses_pass_on`
+        // (fork bcc6f01)
+        let pass = k.fixes.ssi_proto_topology_statuses_pass_on;
         let mut deleted_curves: Vec<O> = Vec::new();
         let pvs: Vec<ProtoVertexId> = self.proto_vertices().to_vec();
 
@@ -1186,13 +1248,10 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                     if dist > xs {
                     } else if edges.is_empty() {
                         if v1 != v2 {
-                            ignore_soft(brep.glue_vertices(
-                                k,
-                                self.which_brep(which),
-                                v1,
-                                v2,
-                                None,
-                            ))?;
+                            ignore_soft(passed_on(
+                                brep.glue_vertices(k, self.which_brep(which), v1, v2, None),
+                                pass,
+                            )?)?;
                             set_slot(deleted_v, jj, v2);
                             self.vertex_def_mut(vd2)
                                 .ok_or(dangling("vertex definition is deleted"))?
@@ -1241,10 +1300,16 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                                     Ok(()) => {
                                         *flag = true;
                                         if let Some(m) = edge_mate {
-                                            ignore_soft(mates.remove_relationship(edge, m))?;
+                                            ignore_soft(passed_on(
+                                                mates.remove_relationship(edge, m),
+                                                pass,
+                                            )?)?;
                                         }
                                         if let Some(m) = vertex_mate {
-                                            ignore_soft(mates.remove_relationship(v2, m))?;
+                                            ignore_soft(passed_on(
+                                                mates.remove_relationship(v2, m),
+                                                pass,
+                                            )?)?;
                                         }
                                         let found =
                                             self.find_edge_definition_from_edge(Some(edge), which)?;
@@ -1264,7 +1329,10 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                                             d.set_xsect_curve_uv(1, None);
                                             d.set_xsect_curve_uv(2, None);
                                             // Don't remove the PE if empty.
-                                            ignore_soft(self.remove_edge_definition(ed, false))?;
+                                            ignore_soft(passed_on(
+                                                self.remove_edge_definition(k, ed, false),
+                                                pass,
+                                            )?)?;
                                             deleted_curves.extend(
                                                 self.edge_def_mut(ed)
                                                     .ok_or(dangling("edge definition is deleted"))?
@@ -1283,13 +1351,10 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                                 }
                                 // coincident Vertices connected by a long Edge: Glue.
                                 if v1 != v2 {
-                                    ignore_soft(brep.glue_vertices(
-                                        k,
-                                        self.which_brep(which),
-                                        v1,
-                                        v2,
-                                        None,
-                                    ))?;
+                                    ignore_soft(passed_on(
+                                        brep.glue_vertices(k, self.which_brep(which), v1, v2, None),
+                                        pass,
+                                    )?)?;
                                     set_slot(deleted_v, jj, v2);
                                     self.vertex_def_mut(vd2)
                                         .ok_or(dangling("vertex definition is deleted"))?
@@ -1302,11 +1367,12 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                 }
 
                 if was_deleted1 || was_deleted2 {
-                    ignore_soft(
+                    ignore_soft(passed_on(
                         self.proto_vertex_mut(pv)
                             .ok_or(dangling("proto vertex is deleted"))?
                             .remove_vertex_definition(vd2),
-                    )?;
+                        pass,
+                    )?)?;
                     if let Some(slot) = vds.get_mut(jj) {
                         *slot = None;
                     }
@@ -1362,11 +1428,12 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                         let hit = d.final_edge(1).is_some_and(|e| deleted_edges1.contains(&e))
                             || d.final_edge(2).is_some_and(|e| deleted_edges2.contains(&e));
                         if hit {
-                            ignore_soft(
+                            ignore_soft(passed_on(
                                 self.proto_edge_mut(this_pe)
                                     .ok_or(dangling("proto edge is deleted"))?
                                     .remove_edge_definition(ed),
-                            )?;
+                                pass,
+                            )?)?;
                             // No Destruct(): this EdgeDefinition was imprinted, so its
                             // curves belong to the Breps' Edges (the deleted Edge took
                             // its own along). The destructor deletes only the curves no
@@ -1400,7 +1467,10 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                             let hit = d.final_edge(1).is_some_and(|e| deleted_edges1.contains(&e))
                                 || d.final_edge(2).is_some_and(|e| deleted_edges2.contains(&e));
                             if hit {
-                                ignore_soft(self.remove_edge_definition(ed, false))?;
+                                ignore_soft(passed_on(
+                                    self.remove_edge_definition(k, ed, false),
+                                    pass,
+                                )?)?;
                             }
                             nn += 1;
                         }
@@ -1427,6 +1497,9 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         geometry: &mut impl ProtoBrep<O>,
         ti_approx_tol_3d: f64,
     ) -> Result<Vec<O>> {
+        // statuses SMLib drops, passed on with `ssi_proto_topology_statuses_pass_on`
+        // (fork bcc6f01)
+        let pass = k.fixes.ssi_proto_topology_statuses_pass_on;
         let mut deleted_curves: Vec<O> = Vec::new();
         let tol = self.raw_tolerance();
 
@@ -1532,7 +1605,7 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
 
                 // Remove and delete all EdgeDefs from this OverlappingPE
                 for ed in eds {
-                    ignore_soft(self.remove_edge_definition(ed, false))?;
+                    ignore_soft(passed_on(self.remove_edge_definition(k, ed, false), pass)?)?;
                     deleted_curves.extend(
                         self.edge_def_mut(ed)
                             .ok_or(dangling("edge definition is deleted"))?
@@ -1542,16 +1615,18 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                 }
 
                 // remove PE from End and Start ProtoVertex->PE list
-                ignore_soft(
+                ignore_soft(passed_on(
                     self.proto_vertex_mut(start)
                         .ok_or(dangling("proto vertex is deleted"))?
                         .remove_proto_edge(overlap),
-                )?;
-                ignore_soft(
+                    pass,
+                )?)?;
+                ignore_soft(passed_on(
                     self.proto_vertex_mut(end)
                         .ok_or(dangling("proto vertex is deleted"))?
                         .remove_proto_edge(overlap),
-                )?;
+                    pass,
+                )?)?;
 
                 // remove the OverlappingPEs from this PE; clear the end vertices
                 {
@@ -1564,7 +1639,7 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                 }
 
                 // remove OverlapPE from ProtoTopoMgr, then delete it
-                ignore_soft(self.remove_proto_edge(overlap))?;
+                ignore_soft(passed_on(self.remove_proto_edge(k, overlap), pass)?)?;
                 self.forget_proto_edge(overlap);
                 deleted_curves.extend(self.delete_proto_edge_object(overlap));
             }
@@ -1579,7 +1654,7 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                     let vds: Vec<VertexDefId> = v.vertex_definitions().to_vec();
                     for vd in vds {
                         // TRUE = delete ProtoVertexOwner when its count goes to zero
-                        ignore_soft(self.remove_vertex_definition(vd, true))?;
+                        ignore_soft(passed_on(self.remove_vertex_definition(k, vd, true), pass)?)?;
                         self.delete_vertex_definition(vd);
                     }
                 }
@@ -1619,15 +1694,18 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                 let sols = {
                     let c1 = curve_of(&*geometry, h1)?;
                     let c2 = curve_of(&*geometry, h2)?;
-                    ignore_soft(c1.global_coincidence_checker::<CurveHandle>(
-                        k,
-                        &ivl1,
-                        c2,
-                        &ivl2,
-                        tol,
-                        true,
-                        [None, None],
-                    ))?
+                    ignore_soft(passed_on(
+                        c1.global_coincidence_checker::<CurveHandle>(
+                            k,
+                            &ivl1,
+                            c2,
+                            &ivl2,
+                            tol,
+                            true,
+                            [None, None],
+                        ),
+                        pass,
+                    )?)?
                     .map(|c| c.solutions)
                     .unwrap_or_default()
                 };
@@ -1643,8 +1721,14 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                         // Classify the coincident curves against their faces
                         let face1 = f1.ok_or(dangling("face is null"))?;
                         let face2 = f2.ok_or(dangling("face is null"))?;
-                        ignore_soft(geometry.face_curve_on_classify_mut(k, face1, true, &mut cc1))?;
-                        ignore_soft(geometry.face_curve_on_classify_mut(k, face2, true, &mut cc2))?;
+                        ignore_soft(passed_on(
+                            geometry.face_curve_on_classify_mut(k, face1, true, &mut cc1),
+                            pass,
+                        )?)?;
+                        ignore_soft(passed_on(
+                            geometry.face_curve_on_classify_mut(k, face2, true, &mut cc2),
+                            pass,
+                        )?)?;
 
                         // a curve for every common interval classified in both
                         let _ = cc1.extract_geometry(
@@ -1655,8 +1739,14 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                         )?;
 
                         // Make sure that a parameter is set in each PointClass object.
-                        ignore_soft(geometry.set_point_class_parameters_mut(k, &mut cc1, false))?;
-                        ignore_soft(geometry.set_point_class_parameters_mut(k, &mut cc2, false))?;
+                        ignore_soft(passed_on(
+                            geometry.set_point_class_parameters_mut(k, &mut cc1, false),
+                            pass,
+                        )?)?;
+                        ignore_soft(passed_on(
+                            geometry.set_point_class_parameters_mut(k, &mut cc2, false),
+                            pass,
+                        )?)?;
 
                         cc1s.push(cc1);
                         cc2s.push(cc2);
@@ -1685,22 +1775,34 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                 }
 
                 // Classify Edge->Curve against both SrcFaces
-                ignore_soft(geometry.face_curve_on_classify_mut(
-                    k,
-                    f1.ok_or(dangling("face is null"))?,
-                    true,
-                    &mut cc1,
-                ))?;
-                ignore_soft(geometry.face_curve_on_classify_mut(
-                    k,
-                    f2.ok_or(dangling("face is null"))?,
-                    true,
-                    &mut cc2,
-                ))?;
+                ignore_soft(passed_on(
+                    geometry.face_curve_on_classify_mut(
+                        k,
+                        f1.ok_or(dangling("face is null"))?,
+                        true,
+                        &mut cc1,
+                    ),
+                    pass,
+                )?)?;
+                ignore_soft(passed_on(
+                    geometry.face_curve_on_classify_mut(
+                        k,
+                        f2.ok_or(dangling("face is null"))?,
+                        true,
+                        &mut cc2,
+                    ),
+                    pass,
+                )?)?;
 
                 let _ = cc1.extract_geometry(k, &*geometry, &mut cc2, ExtractOptions::default())?;
-                ignore_soft(geometry.set_point_class_parameters_mut(k, &mut cc1, false))?;
-                ignore_soft(geometry.set_point_class_parameters_mut(k, &mut cc2, false))?;
+                ignore_soft(passed_on(
+                    geometry.set_point_class_parameters_mut(k, &mut cc1, false),
+                    pass,
+                )?)?;
+                ignore_soft(passed_on(
+                    geometry.set_point_class_parameters_mut(k, &mut cc2, false),
+                    pass,
+                )?)?;
                 cc1s.push(cc1);
                 cc2s.push(cc2);
             }
@@ -1711,15 +1813,18 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                     let mut ci1 = *cc1.at(kk)?;
                     let mut ci2 = *cc2.at(kk)?;
                     // the status is ignored
-                    let result = ignore_soft(self.find_or_create_proto_edge(
-                        k,
-                        &mut *geometry,
-                        ti_approx_tol_3d,
-                        cc1,
-                        &mut ci1,
-                        cc2,
-                        &mut ci2,
-                    ))?;
+                    let result = ignore_soft(passed_on(
+                        self.find_or_create_proto_edge(
+                            k,
+                            &mut *geometry,
+                            ti_approx_tol_3d,
+                            cc1,
+                            &mut ci1,
+                            cc2,
+                            &mut ci2,
+                        ),
+                        pass,
+                    )?)?;
                     *cc1.at_mut(kk)? = ci1;
                     *cc2.at_mut(kk)? = ci2;
 

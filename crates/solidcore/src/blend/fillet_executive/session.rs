@@ -108,6 +108,7 @@ mod overflow_first;
 mod piecewise;
 mod surface;
 mod trace_reach;
+mod two_offsets;
 pub use original_trim::{OriginalSurfaceDeletion, OriginalSurfaceSelection};
 
 const OP: &str = "blend::fillet_executive::session";
@@ -239,6 +240,19 @@ impl SolverObject {
             Self::ConstantDistance(solver) => &solver.solver,
             Self::VariableRadius(solver) => &solver.curve_based.solver,
             Self::SurfaceSurface(solver) => &solver.base.solver,
+        }
+    }
+
+    /// `GetSolverType` of this actual concrete solver (the derived class's override).
+    ///
+    /// # Errors
+    /// Those of the concrete solver's [`FilletSolverOps::solver_type`].
+    pub fn solver_type(&self) -> Result<FilletSolverType> {
+        match self {
+            Self::ConstantRadius(solver) => FilletSolverOps::solver_type(solver.as_ref()),
+            Self::ConstantDistance(solver) => FilletSolverOps::solver_type(solver.as_ref()),
+            Self::VariableRadius(solver) => FilletSolverOps::solver_type(solver.as_ref()),
+            Self::SurfaceSurface(solver) => FilletSolverOps::solver_type(solver.as_ref()),
         }
     }
 
@@ -472,6 +486,12 @@ impl CornerSolverStore for SessionSolvers<'_> {
     }
     fn len(&self) -> usize {
         self.0.len()
+    }
+    fn solver_type(&self, index: usize) -> Option<Result<FilletSolverType>> {
+        self.0
+            .get(index)
+            .and_then(Option::as_ref)
+            .map(SolverObject::solver_type)
     }
 }
 
@@ -1511,6 +1531,7 @@ impl<'target> FilletSession<'target> {
                 xsect_tol: -1.0,
                 continuity,
                 thumbweight,
+                second_radii: None,
             },
         )
     }
@@ -1536,6 +1557,39 @@ impl<'target> FilletSession<'target> {
             k,
             edges,
             radii,
+            xsect_types,
+            FilletSolverType::ConstRadius,
+            continuity,
+            thumbweight,
+        )
+    }
+
+    /// [`FilletSession::prepare_per_edge_constant_radius`] with the fork's
+    /// `pOptSecondRadii` (tangency-labs/smlib `f653ac9`): `second_radii` holds one entry
+    /// per edge, the offset of the second edge use's surface (`radii` gives the first's).
+    /// With a linear cross-section that is a chamfer with setbacks `radii[i]` and
+    /// `second_radii[i]`. It runs the same `SetFilletParameters`, so the fork's vertex-fan
+    /// split (`fixes.fillet_corner_per_vertex_fan`) applies to it.
+    ///
+    /// # Errors
+    /// Those of [`FilletSession::prepare_per_edge_constant_radius`]; native invalid input
+    /// when `second_radii` does not hold one entry per edge.
+    #[allow(clippy::too_many_arguments)] // the native overload's parameters
+    pub fn prepare_per_edge_constant_radius_with_second(
+        &mut self,
+        k: &mut Kernel,
+        edges: &[EdgeId],
+        radii: &[f64],
+        second_radii: &[f64],
+        xsect_types: &[FilletSurfaceGeneratorType],
+        continuity: u32,
+        thumbweight: f64,
+    ) -> Result<()> {
+        self.prepare_per_edge_with_second(
+            k,
+            edges,
+            radii,
+            Some(second_radii),
             xsect_types,
             FilletSolverType::ConstRadius,
             continuity,
@@ -1615,6 +1669,7 @@ impl<'target> FilletSession<'target> {
                 xsect_tol: -1.0,
                 continuity,
                 thumbweight,
+                second_radii: None,
             },
         )
     }
@@ -1625,6 +1680,30 @@ impl<'target> FilletSession<'target> {
         k: &mut Kernel,
         edges: &[EdgeId],
         radii: &[f64],
+        xsect_types: &[FilletSurfaceGeneratorType],
+        radius_type: FilletSolverType,
+        continuity: u32,
+        thumbweight: f64,
+    ) -> Result<()> {
+        self.prepare_per_edge_with_second(
+            k,
+            edges,
+            radii,
+            None,
+            xsect_types,
+            radius_type,
+            continuity,
+            thumbweight,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // the native overload's parameters
+    fn prepare_per_edge_with_second(
+        &mut self,
+        k: &mut Kernel,
+        edges: &[EdgeId],
+        radii: &[f64],
+        second_radii: Option<&[f64]>,
         xsect_types: &[FilletSurfaceGeneratorType],
         radius_type: FilletSolverType,
         continuity: u32,
@@ -1659,6 +1738,7 @@ impl<'target> FilletSession<'target> {
                 xsect_tol: -1.0,
                 continuity,
                 thumbweight,
+                second_radii,
             },
         )
     }
@@ -1717,6 +1797,7 @@ impl<'target> FilletSession<'target> {
                 xsect_tol: -1.0,
                 continuity,
                 thumbweight: 1.0,
+                second_radii: None,
             },
         )
     }
@@ -2303,7 +2384,7 @@ impl CornerEdgeAccess<FilletObject> for SessionObjects<'_> {
         // cliff overflow (WR-631) the end is left open, noted for the subtraction.
         let cliff_overflow = executive.cliff_overflow;
         let mut open_ends = Vec::new();
-        let mut note_open_end = |eu, vertex, end_face| -> Result<()> {
+        let mut note_open_end = |eu, vertex, end_face, section| -> Result<()> {
             // GetFilletSolverOfEdgeuse(pFilEdgeuse), then NoteOpenEnd
             let solver = executive
                 .fillet_solver_of_edgeuse(FilletObject::Topology(
@@ -2315,10 +2396,20 @@ impl CornerEdgeAccess<FilletObject> for SessionObjects<'_> {
                 solver,
                 vertex: FilletObject::Topology(FilletBody::Target, EntityRef::Vertex(vertex)),
                 end_face: FilletObject::Topology(FilletBody::Target, EntityRef::Face(end_face)),
+                section,
             });
             Ok(())
         };
-        let dropped = corner.drop_end_rib(k, target, pseudo, cliff_overflow, &mut note_open_end)?;
+        // WR-674: a round's end where its edge runs on tangentially is left open too.
+        let tangent_ends = k.fixes.fillet_round_ends_at_tangent_continuation;
+        let dropped = corner.drop_end_rib(
+            k,
+            target,
+            pseudo,
+            cliff_overflow,
+            tangent_ends,
+            &mut note_open_end,
+        )?;
         executive.open_ends.append(&mut open_ends);
         if dropped == EndRibDrop::GlobalMerge {
             executive.options.global_merge = true;
@@ -3560,6 +3651,30 @@ impl SolverGeometryAccess<FilletObject> for SessionObjects<'_> {
             EntityRef::Edge(edge),
         )))
     }
+    fn geometry_mitred_corner_edges(
+        &self,
+        corner: FilletObject,
+    ) -> Result<Option<(FilletObject, FilletObject)>> {
+        let FilletObject::Corner(id) = corner else {
+            return Err(invalid("object is not a corner"));
+        };
+        let Some(corner) = self.corners.get(id.0 as usize) else {
+            return Ok(None);
+        };
+        if corner.corner_type() != FilletCornerType::NByTwo || !corner.is_mitre() {
+            return Ok(None);
+        }
+        let (first, second) = corner.filleted_edgeuses()?;
+        let edge = |edgeuse| -> Result<FilletObject> {
+            let edge = crate::topology::edgeuse::p1::edge(self.target, edgeuse)?
+                .ok_or_else(|| invalid("corner edgeuse without edge"))?;
+            Ok(FilletObject::Topology(
+                FilletBody::Target,
+                EntityRef::Edge(edge),
+            ))
+        };
+        Ok(Some((edge(first)?, edge(second)?)))
+    }
     fn geometry_rails_fit(
         &mut self,
         k: &mut Kernel,
@@ -4246,6 +4361,7 @@ impl FilletParametersAccess<FilletObject> for SessionObjects<'_> {
                 tan_tol_rad,
                 radius,
                 edgeuse,
+                second_radius,
             } => self.allocate_constant_radius_solver(
                 k,
                 target_edgeuse(edgeuse)?,
@@ -4253,7 +4369,7 @@ impl FilletParametersAccess<FilletObject> for SessionObjects<'_> {
                 approx_tol,
                 ang_tol_rad,
                 tan_tol_rad,
-                None,
+                second_radius,
             ),
             SolverSpec::ConstantDistance {
                 approx_tol,
@@ -4315,6 +4431,38 @@ impl FilletParametersAccess<FilletObject> for SessionObjects<'_> {
         };
         Ok(owner == which
             && crate::topology::brep::p1::is_live_topology_member(body, Some(EntityRef::Edge(id))))
+    }
+    fn parameters_split_blended_vertex_fans(
+        &mut self,
+        _k: &Kernel,
+        brep: FilletObject,
+        edges: &[FilletObject],
+    ) -> Result<Vec<crate::math::Point3>> {
+        // SplitBlendedVertexFans (the fork's, tangency-labs/smlib@e418750): the target only
+        let FilletObject::Body(FilletBody::Target) = brep else {
+            return Err(invalid("fan split outside the target"));
+        };
+        let mut done = BTreeSet::new();
+        let mut points = Vec::new();
+        for &edge in edges {
+            let FilletObject::Topology(FilletBody::Target, EntityRef::Edge(id)) = edge else {
+                return Err(invalid("edge is not in the target"));
+            };
+            let (start, end) = crate::topology::vertex::edge_vertex_pair(self.target, id)?;
+            for v in [start, end] {
+                let v = v.ok_or_else(|| SolidError::null_pointer(OP))?;
+                if !done.insert(v) {
+                    continue;
+                }
+                let made =
+                    crate::topology::brep::vertex_fans::split_vertex_by_fans(self.target, v)?;
+                if !made.is_empty() {
+                    points.push(crate::topology::vertex::point(self.target, v)?);
+                }
+                done.extend(made);
+            }
+        }
+        Ok(points)
     }
 }
 

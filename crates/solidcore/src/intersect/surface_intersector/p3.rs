@@ -178,7 +178,7 @@ fn unlink(list: &mut Vec<TsectId>, id: TsectId) {
 fn ignored<T>(r: Result<T>) -> Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Ok(None),
     }
 }
@@ -261,7 +261,7 @@ impl SurfaceIntersector<'_> {
         // get surface caches (NER: no cache is SM_ERR_NULL_POINTER)
         let get = |i: SrfIndex| match surface_cache::<SrfIndex>(k, self.surface(i), Some(i)) {
             Ok(c) => Ok(c),
-            Err(e) if e.is_unported() => Err(e),
+            Err(e) if e.is_unported_or_cancelled() => Err(e),
             Err(_) => Err(SolidError::Upstream {
                 operation: OP_FBSP,
                 code: SM_ERR_NULL_POINTER,
@@ -943,7 +943,7 @@ impl SurfaceIntersector<'_> {
                 do_boundary_testing,
             ) {
                 Ok(r) => Ok(r),
-                Err(e) if e.is_unported() => Err(e),
+                Err(e) if e.is_unported_or_cancelled() => Err(e),
                 Err(_) => Ok(None),
             }
         };
@@ -1421,6 +1421,29 @@ pub fn test_point_with<'s, V: super::p4::IntersectorVirtuals<'s> + ?Sized>(
         return Ok(Some(true));
     }
 
+    // Not upstream (#2500): an extension stops where it comes back onto the traced
+    // curve, in 3D, once it has left that point
+    if let Some(closure) = v.intersector().extension_closes_at {
+        let p1 = need_prev()?;
+        let on_span = super::p1::is_point_on_tsect_span_3d(
+            k,
+            closure,
+            v.intersector().point(p1)?,
+            v.intersector().point(next)?,
+            tol,
+        )?;
+        if v.intersector().extension_left_closure {
+            if on_span {
+                v.intersector_mut().extension_closed = true;
+                return Ok(Some(true));
+            }
+        } else {
+            // left once a span no longer reaches it and the curve is clear of it
+            let away = v.intersector().point(next)?.crv_pos().distance(closure) > 10.0 * tol;
+            v.intersector_mut().extension_left_closure = away && !on_span;
+        }
+    }
+
     // Check whether the point is inside of the domain of the surfaces.
     let next_tsp = v.intersector().point(next)?.clone();
     let mut on_boundary = false;
@@ -1483,6 +1506,8 @@ fn surface_is_singularity(k: &Kernel, surface: &Surface, uv: Point2) -> Result<b
         | SurfaceKind::Sphere(_)
         | SurfaceKind::Torus(_)
         | SurfaceKind::BSpline(_)
+        | SurfaceKind::ProceduralBlend(_)
+        | SurfaceKind::BallPatch(_)
         | SurfaceKind::CurveBounded(_)
         | SurfaceKind::SurfOfRevolution(_)
         | SurfaceKind::SurfOfExtrusion(_)

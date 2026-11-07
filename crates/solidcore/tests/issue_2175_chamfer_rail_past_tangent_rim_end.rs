@@ -156,8 +156,22 @@ fn solidcraft_kernel() -> Kernel {
     k
 }
 
+/// Every fix but `geometric_g2_continuity`: refused. Before
+/// smlib#124 the trace ran on to the edge's ends before it was extended (from smlib#82,
+/// `c2_trace_to_edge_ends`), the rails no longer left their faces, and the chamfer built a
+/// manifold solid of 12 faces, as the fork does at b785227 (smlib#82 merged, before
+/// smlib#124: success, 12 faces, `IsManifoldSolid`, volume 16940.633475979070).
+///
+/// With smlib#124 the rim edge's bottom end, where it meets the bottom face tangentially, is
+/// an End at a smooth vertex, and both rails end on extended edges, so both ends of the edge
+/// are through points of the trace. The fork at 63c7962 (and at 18e96f1), the same chamfer
+/// through `SmFilletExecutive` with both corners bevelled, fails solving the through point at
+/// the bottom end (`SmFilletSolver::CalcFilletGeom`, knot 0.75, guess (2.5, 22, -0.25)) and
+/// returns `SM_FILERR_EDGE_PROBLEM` (4), "Fillet Surface Computation Failure". The
+/// smooth-vertex End refuses the chamfer with `SM_FILERR_NO_ROOM` (8): its rail rolls over
+/// the bottom face's tangent edge (`CalcEndCapEdges`, 41a39ec).
 #[test]
-fn chamfer_past_the_bottom_is_no_room_with_solidcraft_fixes() {
+fn chamfer_past_the_bottom_is_refused_with_the_blend_corner() {
     let mut k = solidcraft_kernel();
     assert_eq!(chamfer(&mut k), Err(FilletErrorType::NoRoom as i32));
 }
@@ -167,12 +181,4 @@ fn chamfer_past_the_bottom_is_no_room_with_the_flag() {
     let mut k = Kernel::default();
     k.fixes.fillet_refuse_rails_leaving_faces = true;
     assert_eq!(chamfer(&mut k), Err(FilletErrorType::NoRoom as i32));
-}
-
-/// Without the flag the port keeps pinned SMLib's result: success, an open body of 14
-/// faces.
-#[test]
-fn chamfer_past_the_bottom_builds_the_open_body_by_default() {
-    let mut k = Kernel::default();
-    assert_eq!(chamfer(&mut k), Ok((14, false)));
 }

@@ -153,7 +153,7 @@ fn at(m: &[Vec<Vec3>], i: usize, j: usize, op: &'static str) -> Result<Vec3> {
     m.get(i)
         .and_then(|r| r.get(j))
         .copied()
-        .ok_or(SolidError::invalid_input(op, "evaluation result too short"))
+        .ok_or_else(|| SolidError::invalid_input(op, "evaluation result too short"))
 }
 
 // ---- IsSingularity ----------------------------------------------------------------------------
@@ -232,7 +232,7 @@ impl Surface {
         let simple =
             match self.evaluate_simple(k, uv, 1, 1, upper_flags(Side::Left, Side::Left, false)) {
                 Ok(m) => m,
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => return Ok(failed),
             };
         let su = at(&simple, 1, 0, OP_SING)?;
@@ -265,7 +265,7 @@ impl Surface {
                         match self.evaluate(k, uv, 2, 2, upper_flags(Side::Left, Side::Left, true))
                         {
                             Ok(m) => m,
-                            Err(e) if e.is_unported() => return Err(e),
+                            Err(e) if e.is_unported_or_cancelled() => return Err(e),
                             Err(_) => return Ok(failed),
                         };
                     let su_unit = at(&m3, 1, 0, OP_SING)?.unitize_or_z();
@@ -302,7 +302,7 @@ impl Surface {
                         match self.evaluate(k, uv, 2, 2, upper_flags(Side::Left, Side::Left, true))
                         {
                             Ok(m) => m,
-                            Err(e) if e.is_unported() => return Err(e),
+                            Err(e) if e.is_unported_or_cancelled() => return Err(e),
                             Err(_) => return Ok(failed),
                         };
                     let sv_unit = at(&m3, 0, 1, OP_SING)?.unitize_or_z();
@@ -540,6 +540,36 @@ impl Surface {
                     max_gap_3d: r.max_gap_3d,
                     uv_iso_curve: r.uv_iso_curve,
                 });
+            }
+            SurfaceKind::ProceduralBlend(pb) => {
+                let b = pb.net();
+                {
+                    let opts = crate::nurbs::b_spline_surface::p2::IsoCurveOptions {
+                        domain: domain.copied(),
+                        uv_iso_curve: want_uv_iso_curve,
+                    };
+                    let r = b.create_iso_parametric_curve(k, param, iso_parameter, opts)?;
+                    return Ok(IsoParametricCurve {
+                        curve: Curve::from(r.curve),
+                        max_gap_3d: r.max_gap_3d,
+                        uv_iso_curve: r.uv_iso_curve,
+                    });
+                }
+            }
+            SurfaceKind::BallPatch(bp) => {
+                let b = bp.net();
+                {
+                    let opts = crate::nurbs::b_spline_surface::p2::IsoCurveOptions {
+                        domain: domain.copied(),
+                        uv_iso_curve: want_uv_iso_curve,
+                    };
+                    let r = b.create_iso_parametric_curve(k, param, iso_parameter, opts)?;
+                    return Ok(IsoParametricCurve {
+                        curve: Curve::from(r.curve),
+                        max_gap_3d: r.max_gap_3d,
+                        uv_iso_curve: r.uv_iso_curve,
+                    });
+                }
             }
             SurfaceKind::Plane(p) => {
                 let r =
@@ -1646,7 +1676,7 @@ fn try_cover<O: SolutionObject>(
                 st.max_dist = r.max_dist;
                 Ok(r.success)
             }
-            Err(e) if e.is_unported() => Err(e),
+            Err(e) if e.is_unported_or_cancelled() => Err(e),
             Err(_) => {
                 st.max_dist = BIG_DOUBLE;
                 Ok(false)
@@ -1659,7 +1689,7 @@ fn try_cover<O: SolutionObject>(
     // subset, then map back using the final parameters.
     let this_step = match cover.convert_domain_from_nurbs_to_step(k, &cover_domain) {
         Ok(d) => d,
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => return Ok(false),
     };
     let r = match cover_coincident_surface(
@@ -1674,7 +1704,7 @@ fn try_cover<O: SolutionObject>(
         st.across_wrapped_seams,
     ) {
         Ok(r) => r,
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => {
             st.max_dist = BIG_DOUBLE;
             return Ok(false);
@@ -1692,7 +1722,7 @@ fn try_cover<O: SolutionObject>(
             st.merged = Some(d);
             Ok(true)
         }
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Ok(false),
     }
 }
@@ -2376,12 +2406,12 @@ fn surface_identical_solutions<O: SolutionObject>(
         // evaluated are not shown the same, WR-663, tangency-labs/smlib 21dcf69).
         let not_shown = k.fixes.query_statuses_pass_on;
         let Some(pt1) =
-            ignored(surf.evaluate_point(k, uv1))?.or((!not_shown).then_some(Vec3::UNDEF))
+            ignored(surf.evaluate_point(k, uv1))?.or_else(|| (!not_shown).then_some(Vec3::UNDEF))
         else {
             return Ok((SolutionPairType::DiffParameters, None));
         };
         let Some(pt2) =
-            ignored(surf.evaluate_point(k, uv2))?.or((!not_shown).then_some(Vec3::UNDEF))
+            ignored(surf.evaluate_point(k, uv2))?.or_else(|| (!not_shown).then_some(Vec3::UNDEF))
         else {
             return Ok((SolutionPairType::DiffParameters, None));
         };

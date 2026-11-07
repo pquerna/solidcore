@@ -57,6 +57,9 @@
 //!   `pSurfaceNode->GetOwnerObject()`) instead of the node and the unused patch.
 //!   `LocalCurveSolve`'s `cpdOptTargetDistance` (`NotUsed` upstream) and
 //!   `CreateParallelProjectionCurves`' context are dropped.
+//! - **A blend's net for averages (#2510).** `ApproxDerivativeLengths`, an average that
+//!   scales tolerances, evaluates a procedural blend as its certified net
+//!   ([`crate::surface::procedural_blend::NetScope::new`]).
 //! - **Debug-only work** compiled out of the release build (drawing, dumps, the
 //!   `SM_ASSERT`s, `EvaluateNormal`'s static list of bad surfaces) is not ported, nor
 //!   is `FindDegenParamForDirection`'s angle bookkeeping (`dBestRad`,
@@ -69,7 +72,8 @@
 //!   result distances with swapped names (the opt-in
 //!   `Kernel::fixes.good_drop_result_distances_in_order` compares them the right way round
 //!   and takes a foot only at the local solve's tight tolerance, WR-56); `FindDegenParamForDirection` compares a sample fraction with the parameter
-//!   `dS`.
+//!   `dS` (the opt-in `Kernel::fixes.degen_param_tiebreak_uses_actual_param` compares the
+//!   mapped singular parameter `s_ivl.evaluate(...)` instead, WR-57).
 //! - **Projection curve class.** `CreateParallelProjectionCurves` takes a [`Curve`] for
 //!   upstream's `const SmBSplineCurve&`; a curve outside the `SmBSplineCurve` classes
 //!   (B-spline, line, ellipse, hyperbola, parabola), which upstream's type rules out,
@@ -140,6 +144,7 @@ use crate::nurbs::b_spline_surface::{
 };
 use crate::nurbs::b_spline_surface_n_lib::p2::EvaluateFlags;
 use crate::nurbs::knots::Side;
+use crate::surface::procedural_blend::NetScope;
 use crate::surface::surface_cache::SurfaceCache;
 use crate::topology::BrepId;
 
@@ -694,7 +699,9 @@ pub fn base_is_closed<S: SurfaceEvaluate + ?Sized>(
                         geometric_g2: k.fixes.geometric_g2_continuity,
                     },
                 ) {
-                    Err(e) if not_shown && !e.is_unported() => return Ok((false, discontinuous)),
+                    Err(e) if not_shown && !e.is_unported_or_cancelled() => {
+                        return Ok((false, discontinuous))
+                    }
                     r => r?,
                 };
 
@@ -837,6 +844,8 @@ impl Surface {
             SurfaceKind::Cone(_)
             | SurfaceKind::Torus(_)
             | SurfaceKind::BSpline(_)
+            | SurfaceKind::ProceduralBlend(_)
+            | SurfaceKind::BallPatch(_)
             | SurfaceKind::SurfOfRevolution(_)
             | SurfaceKind::SurfOfExtrusion(_)
             | SurfaceKind::Step(_) => base_evaluate_normal(k, self, uv, u_side, v_side),
@@ -876,6 +885,8 @@ impl Surface {
             SurfaceKind::Cone(_)
             | SurfaceKind::Torus(_)
             | SurfaceKind::BSpline(_)
+            | SurfaceKind::ProceduralBlend(_)
+            | SurfaceKind::BallPatch(_)
             | SurfaceKind::CurveBounded(_)
             | SurfaceKind::SurfOfRevolution(_)
             | SurfaceKind::SurfOfExtrusion(_)
@@ -913,6 +924,32 @@ impl Surface {
             }
             SurfaceKind::BSpline(s) => {
                 Ok(planar_of(k, s, &self.natural_uv_domain_with_nurb(k)?)?.is_planar(tol_3d))
+            }
+            SurfaceKind::BallPatch(s) => {
+                Ok(planar_of(k, s.net(), &self.natural_uv_domain_with_nurb(k)?)?.is_planar(tol_3d))
+            }
+            // SmSurface::IsPlanar on the blend's own (virtual) CalculateBoundingBox: the
+            // net's pseudo box grown by the bound; a box that fails is not planar (the
+            // fork's IsPlanar, the only one a blend meets)
+            SurfaceKind::ProceduralBlend(pb) => {
+                let req = BoundingBoxRequest {
+                    normal: false,
+                    pseudo: true,
+                    polar: false,
+                    pseudo_guess: None,
+                    polar_guess: None,
+                    expand_by_zone_tol: false,
+                    expand_tolerance: None,
+                };
+                let domain = self.natural_uv_domain_with_nurb(k)?;
+                let boxed = ignored(pb.calculate_bounding_box(k, &domain, &req, self))?
+                    .and_then(|b| b.pseudo);
+                let shown = boxed.is_some();
+                let mut planar = boxed.unwrap_or_else(PseudoBox::new).is_planar(tol_3d);
+                if !shown {
+                    planar.is_planar = false;
+                }
+                Ok(planar)
             }
             // SmSurfOfRevolution (and SmCone, SmSphere, SmTorus) inherit
             // SmBSplineSurface::CalculateBoundingBox
@@ -1051,6 +1088,12 @@ impl Surface {
     /// the non-singular tangent best matches `dir` (`FindDegenParamForDirection`):
     /// samples ten parameters, then runs a Newton solve from the best one.
     ///
+    /// In the near-equal starting-guess tie-break, upstream compares the `[0, 1]`
+    /// sample fractions `dThisParam` and `dNearBestParam` directly against the input
+    /// singular parameter `dS`; with
+    /// `Kernel::fixes.degen_param_tiebreak_uses_actual_param` (WR-57) it compares the
+    /// mapped singular parameters in `s_ivl` instead.
+    ///
     /// # Errors
     ///
     /// The status of `Unitize` for a zero `dir`; `SM_ERR` when every sampled tangent
@@ -1151,9 +1194,14 @@ impl Surface {
             }
 
             // for nearly equal starting guesses - save the one nearest the input value
+            // (WR-57: pinned C++ compares the [0, 1] fraction directly against `ds`)
+            let (cand_s, near_best_s) = if k.fixes.degen_param_tiebreak_uses_actual_param {
+                (s_ivl.evaluate(this_param), s_ivl.evaluate(near_best_param))
+            } else {
+                (this_param, near_best_param)
+            };
             if this_f > near_best_f - f_tol
-                && (this_f > near_best_f + f_tol
-                    || (this_param - ds).abs() < (near_best_param - ds).abs())
+                && (this_f > near_best_f + f_tol || (cand_s - ds).abs() < (near_best_s - ds).abs())
             {
                 near_best_f = this_f;
                 near_best_param = this_param;
@@ -1430,7 +1478,10 @@ impl Surface {
         let curve_cache = match crate::curve::curve::p5::make_curve_cache::<O>(k, curve, handles[0])
         {
             Ok(c) => c,
-            Err(e) if e.is_unported() || matches!(e, SolidError::PreparationRequired { .. }) => {
+            Err(e)
+                if e.is_unported_or_cancelled()
+                    || matches!(e, SolidError::PreparationRequired { .. }) =>
+            {
                 return Err(e);
             }
             Err(_) => return Err(SolidError::null_pointer(OP_SOLVE)),
@@ -1877,7 +1928,7 @@ impl Surface {
         // check state - internal surface continuities are better than C0 (NER; the
         // continuity is only reported)
         let ner = |e: SolidError| {
-            if e.is_unported() {
+            if e.is_unported_or_cancelled() {
                 e
             } else {
                 SolidError::null_pointer(OP_PROJ)
@@ -2059,12 +2110,12 @@ fn solve_surface_cache<O: SolutionObject>(
 ) -> Result<SurfaceCache<O>> {
     let mut cache = match super::p1::get_surface_cache(k, surface, handle) {
         Ok(c) => c,
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => return Err(SolidError::null_pointer(OP_SOLVE)),
     };
     match cache.get_tree(k) {
         Ok(_) => Ok(cache),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Err(SolidError::null_pointer(OP_SOLVE)),
     }
 }
@@ -2080,14 +2131,22 @@ fn solve_surface_cache_with<O: SolutionObject>(
 ) -> Result<SurfaceCache<O>> {
     let mut cache = match context.build_surface_cache(k, surface, handle) {
         Ok(c) => c,
-        Err(e) if e.is_unported() || matches!(e, SolidError::PreparationRequired { .. }) => {
+        Err(e)
+            if e.is_unported_or_cancelled()
+                || matches!(e, SolidError::PreparationRequired { .. }) =>
+        {
             return Err(e);
         }
         Err(_) => return Err(SolidError::null_pointer(OP_SOLVE)),
     };
     match cache.get_tree(k) {
         Ok(_) => Ok(cache),
-        Err(e) if e.is_unported() || matches!(e, SolidError::PreparationRequired { .. }) => Err(e),
+        Err(e)
+            if e.is_unported_or_cancelled()
+                || matches!(e, SolidError::PreparationRequired { .. }) =>
+        {
+            Err(e)
+        }
         Err(_) => Err(SolidError::null_pointer(OP_SOLVE)),
     }
 }
@@ -2151,6 +2210,8 @@ pub fn approx_derivative_lengths<S: SurfaceEvaluate + ?Sized>(
     // none does (WR-663, tangency-labs/smlib 21dcf69)
     let only_evaluated = k.fixes.query_statuses_pass_on;
     let mut num_evaluated: u32 = 0;
+    // an average, a scale for tolerances: a procedural blend's net answers it (#2510)
+    let _net = NetScope::new(k);
 
     for &si in &samples {
         for &sj in &samples {
@@ -3156,7 +3217,6 @@ fn singular_param_solve(
         EFF_ZERO,
     );
     let mut ls = crate::geom::local_solve1d::LocalSolve1d::with_interval(*ivl, false);
-    ls.set_failed_guess_no_sign_change(k.fixes.oscillating_skips_failed_guesses);
     let r = ls.solve_it(&mut efo, start, tol)?;
     Ok((r.found, r.t))
 }
@@ -3632,5 +3692,371 @@ mod tests {
         assert!(good_drop_result(&k, &s, &domain, pt_to_drop, nearer_guess, &sol).unwrap());
         assert!(!good_drop_result(&k, &s, &domain, pt_to_drop, farther_guess, &sol).unwrap());
         assert!(good_drop_result(&k, &s, &domain, pt_to_drop, equal_guess, &sol).unwrap());
+    }
+
+    fn wr57_double_root_patch_u(u_min: f64, u_max: f64) -> Surface {
+        use crate::nurbs::math::{CPoint, NOW};
+
+        // S(u, v) = v * (1, 16 * (s - 0.25) * (s - 0.75), 0), s = (u - u_min) / (u_max - u_min):
+        // singular along v = 0, with exact +X non-singular tangents at s = 0.25 and s = 0.75
+        // and symmetric sample dot products at ii = 2 (2/9) and ii = 7 (7/9).
+        let net = vec![
+            vec![
+                CPoint::new(0.0, 0.0, 0.0, NOW),
+                CPoint::new(1.0, 3.0, 0.0, NOW),
+            ],
+            vec![
+                CPoint::new(0.0, 0.0, 0.0, NOW),
+                CPoint::new(1.0, -5.0, 0.0, NOW),
+            ],
+            vec![
+                CPoint::new(0.0, 0.0, 0.0, NOW),
+                CPoint::new(1.0, 3.0, 0.0, NOW),
+            ],
+        ];
+        let u_knots = [u_min, u_min, u_min, u_max, u_max, u_max];
+        let v_knots = [0.0, 0.0, 1.0, 1.0];
+        Surface::from(
+            BSplineSurface::from_data(2, 1, 2, 1, 5, 3, &net, &u_knots, &v_knots).unwrap(),
+        )
+    }
+
+    fn wr57_double_root_patch_v(v_min: f64, v_max: f64) -> Surface {
+        use crate::nurbs::math::{CPoint, NOW};
+
+        let net = vec![
+            vec![
+                CPoint::new(0.0, 0.0, 0.0, NOW),
+                CPoint::new(0.0, 0.0, 0.0, NOW),
+                CPoint::new(0.0, 0.0, 0.0, NOW),
+            ],
+            vec![
+                CPoint::new(1.0, 3.0, 0.0, NOW),
+                CPoint::new(1.0, -5.0, 0.0, NOW),
+                CPoint::new(1.0, 3.0, 0.0, NOW),
+            ],
+        ];
+        let u_knots = [0.0, 0.0, 1.0, 1.0];
+        let v_knots = [v_min, v_min, v_min, v_max, v_max, v_max];
+        Surface::from(
+            BSplineSurface::from_data(1, 2, 1, 2, 3, 5, &net, &u_knots, &v_knots).unwrap(),
+        )
+    }
+
+    /// WR-57 (#2209): `UpstreamFixes::degen_param_tiebreak_uses_actual_param` defaults to
+    /// `false`, is enabled by `UpstreamFixes::all()`, and can be toggled through
+    /// `UpstreamFixes::flag_mut`.
+    #[test]
+    fn wr57_flag_default_off_and_lookup_by_name() {
+        use crate::kernel::UpstreamFixes;
+
+        let mut k = Kernel::default();
+        assert!(!k.fixes.degen_param_tiebreak_uses_actual_param);
+        assert!(UpstreamFixes::all().degen_param_tiebreak_uses_actual_param);
+        assert!(UpstreamFixes::NAMES.contains(&"degen_param_tiebreak_uses_actual_param"));
+
+        let flag = k
+            .fixes
+            .flag_mut("degen_param_tiebreak_uses_actual_param")
+            .unwrap();
+        assert!(!*flag);
+        *flag = true;
+        assert!(k.fixes.degen_param_tiebreak_uses_actual_param);
+
+        *k.fixes
+            .flag_mut("degen_param_tiebreak_uses_actual_param")
+            .unwrap() = false;
+        assert!(!k.fixes.degen_param_tiebreak_uses_actual_param);
+    }
+
+    /// WR-57 (#2209): on a sphere reparameterized to `[0, 360]` or `[0, 2 * PI]` in `u`,
+    /// the south-pole seam tie-break (`ii = 0` vs `ii = 9` for `+X`) compares `[0, 1]`
+    /// fractions against `dS` by default (flipping `input_s = 5.0` to `360.0` and
+    /// `input_s = 0.8` to `2 * PI`), whereas the opt-in compares the mapped singular
+    /// parameters and keeps `u = 0.0`; on `[0, 1]` both modes agree identically.
+    #[test]
+    fn wr57_sphere_pole_seam_tiebreak_on_non_unit_and_unit_domains() {
+        use crate::geom::axis2_placement::Axis2Placement;
+        use crate::math::PI;
+        use crate::surface::sphere::Sphere;
+
+        let k_off = Kernel::default();
+        let mut k_on = Kernel::default();
+        k_on.fixes.degen_param_tiebreak_uses_actual_param = true;
+
+        let sphere = Sphere::create_canonical(&k_off, &Axis2Placement::default(), 1.0).unwrap();
+
+        // Native `[0, 1]` singular domain: default and opt-in behave identically.
+        let unit_surf = Surface::from(sphere.clone());
+        assert_eq!(
+            unit_surf
+                .natural_uv_domain_with_nurb(&k_off)
+                .unwrap()
+                .u_interval(),
+            Extent1d::from_min_max(0.0, 1.0)
+        );
+        for input_s in [-2.0, 0.0, 0.1, 0.49, 0.51, 0.9, 1.0, 5.0] {
+            let off = unit_surf
+                .find_degen_param_for_direction(
+                    &k_off,
+                    Point2::new(input_s, 0.0),
+                    Vec3::X,
+                    true,
+                    SurfParamType::U,
+                    1e-9,
+                )
+                .unwrap();
+            let on = unit_surf
+                .find_degen_param_for_direction(
+                    &k_on,
+                    Point2::new(input_s, 0.0),
+                    Vec3::X,
+                    true,
+                    SurfParamType::U,
+                    1e-9,
+                )
+                .unwrap();
+            assert_eq!(off, on);
+            assert!(off.converged);
+            let expected = if input_s < 0.5 { 0.0 } else { 1.0 };
+            assert!((off.uv.x - expected).abs() < 1e-9);
+        }
+
+        // `[0, 360]` angular domain with `input_s = 5.0`: `5.0` is `5.0` from `0.0` vs
+        // `355.0` from `360.0`, yet `|1.0 - 5.0| = 4.0 < |0.0 - 5.0| = 5.0`.
+        let mut sphere_deg = sphere.clone();
+        sphere_deg
+            .reparameterize(&k_off, &Extent2d::from_bounds(0.0, 0.0, 360.0, 1.0))
+            .unwrap();
+        let surf_deg = Surface::from(sphere_deg);
+        let off_deg = surf_deg
+            .find_degen_param_for_direction(
+                &k_off,
+                Point2::new(5.0, 0.0),
+                Vec3::X,
+                true,
+                SurfParamType::U,
+                1e-9,
+            )
+            .unwrap();
+        let on_deg = surf_deg
+            .find_degen_param_for_direction(
+                &k_on,
+                Point2::new(5.0, 0.0),
+                Vec3::X,
+                true,
+                SurfParamType::U,
+                1e-9,
+            )
+            .unwrap();
+        assert!(off_deg.converged);
+        assert!((off_deg.uv.x - 360.0).abs() < 1e-9);
+        assert!(on_deg.converged);
+        assert!(on_deg.uv.x.abs() < 1e-9);
+
+        // `[0, 2 * PI]` angular domain with `input_s = 0.8` rad (`0.8` from `0.0` vs
+        // `2 * PI - 0.8` from `2 * PI`, yet `|1.0 - 0.8| = 0.2 < |0.0 - 0.8| = 0.8`).
+        let mut sphere_rad = sphere;
+        sphere_rad
+            .reparameterize(&k_off, &Extent2d::from_bounds(0.0, 0.0, 2.0 * PI, 1.0))
+            .unwrap();
+        let surf_rad = Surface::from(sphere_rad);
+        let off_rad = surf_rad
+            .find_degen_param_for_direction(
+                &k_off,
+                Point2::new(0.8, 0.0),
+                Vec3::X,
+                true,
+                SurfParamType::U,
+                1e-9,
+            )
+            .unwrap();
+        let on_rad = surf_rad
+            .find_degen_param_for_direction(
+                &k_on,
+                Point2::new(0.8, 0.0),
+                Vec3::X,
+                true,
+                SurfParamType::U,
+                1e-9,
+            )
+            .unwrap();
+        assert!(off_rad.converged);
+        assert!((off_rad.uv.x - 2.0 * PI).abs() < 1e-9);
+        assert!(on_rad.converged);
+        assert!(on_rad.uv.x.abs() < 1e-9);
+    }
+
+    /// WR-57 (#2209): on B-spline degenerate patches with interior double solutions on
+    /// `[10, 20]` and `[-20, -10]` (for both `SurfParamType::U` and `SurfParamType::V`),
+    /// default mode chooses the sample fraction closer in `[0, 1]` while opt-in chooses
+    /// the mapped singular parameter closer to `dS`, and `[0, 1]` patches match bit for
+    /// bit across both modes.
+    #[test]
+    fn wr57_nurbs_degenerate_patch_shifted_domains_and_both_singular_directions() {
+        let k_off = Kernel::default();
+        let mut k_on = Kernel::default();
+        k_on.fixes.degen_param_tiebreak_uses_actual_param = true;
+
+        // Positive shifted `U` domain `[10, 20]`, interior roots at `12.5` and `17.5`.
+        let pos_u = wr57_double_root_patch_u(10.0, 20.0);
+        let off_pos = pos_u
+            .find_degen_param_for_direction(
+                &k_off,
+                Point2::new(12.0, 0.0),
+                Vec3::X,
+                true,
+                SurfParamType::U,
+                1e-9,
+            )
+            .unwrap();
+        let on_pos = pos_u
+            .find_degen_param_for_direction(
+                &k_on,
+                Point2::new(12.0, 0.0),
+                Vec3::X,
+                true,
+                SurfParamType::U,
+                1e-9,
+            )
+            .unwrap();
+        assert!(off_pos.converged);
+        assert!((off_pos.uv.x - 17.5).abs() < 1e-9);
+        assert!(on_pos.converged);
+        assert!((on_pos.uv.x - 12.5).abs() < 1e-9);
+
+        // Inbound direction (`dir_from_pole = false` with `-X`) exercises the negated
+        // direction branch with the same tie-break.
+        let off_in = pos_u
+            .find_degen_param_for_direction(
+                &k_off,
+                Point2::new(12.0, 0.0),
+                -Vec3::X,
+                false,
+                SurfParamType::U,
+                1e-9,
+            )
+            .unwrap();
+        let on_in = pos_u
+            .find_degen_param_for_direction(
+                &k_on,
+                Point2::new(12.0, 0.0),
+                -Vec3::X,
+                false,
+                SurfParamType::U,
+                1e-9,
+            )
+            .unwrap();
+        assert!((off_in.uv.x - 17.5).abs() < 1e-9);
+        assert!((on_in.uv.x - 12.5).abs() < 1e-9);
+
+        // When `input_s = 18.0` is genuinely near `17.5`, both modes pick `17.5`.
+        let off_upper = pos_u
+            .find_degen_param_for_direction(
+                &k_off,
+                Point2::new(18.0, 0.0),
+                Vec3::X,
+                true,
+                SurfParamType::U,
+                1e-9,
+            )
+            .unwrap();
+        let on_upper = pos_u
+            .find_degen_param_for_direction(
+                &k_on,
+                Point2::new(18.0, 0.0),
+                Vec3::X,
+                true,
+                SurfParamType::U,
+                1e-9,
+            )
+            .unwrap();
+        assert!((off_upper.uv.x - 17.5).abs() < 1e-9);
+        assert!((on_upper.uv.x - 17.5).abs() < 1e-9);
+
+        // Negative shifted `U` domain `[-20, -10]`, interior roots at `-17.5` and `-12.5`:
+        // at `input_s = -12.0`, default keeps `2/9` (`-17.5`) because `-12.0 < 0.5`,
+        // whereas opt-in switches to `7/9` (`-12.5`).
+        let neg_u = wr57_double_root_patch_u(-20.0, -10.0);
+        let off_neg = neg_u
+            .find_degen_param_for_direction(
+                &k_off,
+                Point2::new(-12.0, 0.0),
+                Vec3::X,
+                true,
+                SurfParamType::U,
+                1e-9,
+            )
+            .unwrap();
+        let on_neg = neg_u
+            .find_degen_param_for_direction(
+                &k_on,
+                Point2::new(-12.0, 0.0),
+                Vec3::X,
+                true,
+                SurfParamType::U,
+                1e-9,
+            )
+            .unwrap();
+        assert!(off_neg.converged);
+        assert!((off_neg.uv.x + 17.5).abs() < 1e-9);
+        assert!(on_neg.converged);
+        assert!((on_neg.uv.x + 12.5).abs() < 1e-9);
+
+        // `SurfParamType::V` on `[0, 1] x [10, 20]`, interior roots at `v = 12.5` and `17.5`.
+        let pos_v = wr57_double_root_patch_v(10.0, 20.0);
+        let off_v = pos_v
+            .find_degen_param_for_direction(
+                &k_off,
+                Point2::new(0.0, 12.0),
+                Vec3::X,
+                true,
+                SurfParamType::V,
+                1e-9,
+            )
+            .unwrap();
+        let on_v = pos_v
+            .find_degen_param_for_direction(
+                &k_on,
+                Point2::new(0.0, 12.0),
+                Vec3::X,
+                true,
+                SurfParamType::V,
+                1e-9,
+            )
+            .unwrap();
+        assert!(off_v.converged);
+        assert!((off_v.uv.y - 17.5).abs() < 1e-9);
+        assert!(on_v.converged);
+        assert!((on_v.uv.y - 12.5).abs() < 1e-9);
+
+        // `[0, 1]` singular `U` domain: bit-identical in both modes.
+        let unit_u = wr57_double_root_patch_u(0.0, 1.0);
+        for input_s in [-2.0, 0.0, 0.2, 0.49, 0.51, 0.8, 1.0, 5.0] {
+            let off = unit_u
+                .find_degen_param_for_direction(
+                    &k_off,
+                    Point2::new(input_s, 0.0),
+                    Vec3::X,
+                    true,
+                    SurfParamType::U,
+                    1e-9,
+                )
+                .unwrap();
+            let on = unit_u
+                .find_degen_param_for_direction(
+                    &k_on,
+                    Point2::new(input_s, 0.0),
+                    Vec3::X,
+                    true,
+                    SurfParamType::U,
+                    1e-9,
+                )
+                .unwrap();
+            assert_eq!(off, on);
+            assert!(off.converged);
+            let expected = if input_s < 0.5 { 0.25 } else { 0.75 };
+            assert!((off.uv.x - expected).abs() < 1e-9);
+        }
     }
 }

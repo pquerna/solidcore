@@ -436,6 +436,10 @@ fn b_spline_part(surface: &Surface) -> Option<&BSplineSurface> {
         SurfaceKind::Cone(c) => Some(c.rev().base()),
         SurfaceKind::Sphere(s) => Some(s.base().base()),
         SurfaceKind::Torus(t) => Some(t.base().base()),
+        // (the fork's SmProceduralBlend is an SmBSplineSurface: its net)
+        SurfaceKind::ProceduralBlend(pb) => Some(pb.net()),
+        // (the fork's SmBallPatch is an SmBSplineSurface too: its net)
+        SurfaceKind::BallPatch(pb) => Some(pb.net()),
         _ => None,
     }
 }
@@ -567,13 +571,13 @@ fn standalone_surface_cache(
 ) -> Result<Option<ListedCache>> {
     let mut cache = match surface_cache::<usize>(k, surface, Some(handle)) {
         Ok(cache) => cache,
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => return Ok(None),
     };
     // `AddSurfaceToGrid` lists the surface only once its tree has a top node
     let has_top = match cache.get_tree(k) {
         Ok(tree) => tree.top_node().is_some(),
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => false,
     };
     Ok(has_top.then_some(ListedCache::Lazy(cache)))
@@ -609,12 +613,12 @@ fn face_surface_cache(
     let mut mapped = match MappedCacheFace::new(BrepCacheFace { b: scene, f }, handle_of, entity_of)
     {
         Ok(mapped) => mapped,
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => return Ok(None),
     };
     let mut cache = match get_surface_cache_with_face(k, &surface, Some(handle), &mut mapped) {
         Ok(cache) => cache,
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => return Ok(None),
     };
     // AddSurfaceToGrid: GetTree() == NULL, GetTree()->GetTopNode(); ExpandHierarchy:
@@ -623,7 +627,7 @@ fn face_surface_cache(
         match cache.get_tree_with_face(k, &mut mapped) {
             Ok(tree) if check_top && tree.top_node().is_none() => return Ok(None),
             Ok(_) => {}
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             Err(_) => return Ok(None),
         }
     }
@@ -674,17 +678,17 @@ fn silhouette_cache(
     let mut mapped =
         match MappedCacheFace::new(BrepCacheFace { b: scene, f }, &handle_of, &entity_of) {
             Ok(mapped) => mapped,
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             Err(_) => return Ok(None),
         };
     let mut cache = match get_surface_cache_with_face(k, surface, Some(handle), &mut mapped) {
         Ok(cache) => cache,
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => return Ok(None),
     };
     match cache.get_tree_with_face(k, &mut mapped) {
         Ok(_) => {}
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => return Ok(None),
     }
     let mut cache = cache.into_base();
@@ -771,7 +775,7 @@ impl RayFaceClassifier for SceneFaceClassifier<'_> {
         );
         match classified {
             Ok(()) => {}
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             // signal an error and keep the point just in case
             Err(_) => return Ok((true, None)),
         }
@@ -801,7 +805,7 @@ struct RaySetup {
 }
 
 /// A hidden curve removal object (`SmHCR`).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Hcr {
     view_vector: Vec3,
     ray_offset_tolerance: f64,
@@ -827,6 +831,40 @@ pub struct Hcr {
 }
 
 impl Hcr {
+    /// A copy of this HCR object (the `SmHCR` copy constructor): its view, tolerances,
+    /// silhouettes, curves and ray state, and its scene copied standing for this one's
+    /// ([`Brep::clone_standing_for_self`]: the same ids, its geometry's owners kept, so
+    /// that the copy's scene still finds its faces' surfaces). Not `Clone`: a `Brep` is
+    /// not (#2715).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Brep::clone_standing_for_self`].
+    pub fn copy_standing_for_self(&self) -> Result<Self> {
+        Ok(Self {
+            view_vector: self.view_vector,
+            ray_offset_tolerance: self.ray_offset_tolerance,
+            scene: self.scene.clone_standing_for_self()?,
+            view_transform: self.view_transform,
+            inv_view_transform: self.inv_view_transform,
+            proj_bbox: self.proj_bbox,
+            sil_vertex_tree: self.sil_vertex_tree.clone(),
+            sil_edge_tree: self.sil_edge_tree.clone(),
+            sil_vertices: self.sil_vertices.clone(),
+            sil_edges: self.sil_edges.clone(),
+            sil_edge_order: self.sil_edge_order.clone(),
+            back_facing_edges: self.back_facing_edges.clone(),
+            visible_curves: self.visible_curves.clone(),
+            invisible_curves: self.invisible_curves.clone(),
+            approx_tol_3d: self.approx_tol_3d,
+            ang_tol_rad: self.ang_tol_rad,
+            for_silhouettes: self.for_silhouettes,
+            display_seams: self.display_seams,
+            display_smooth_edges: self.display_smooth_edges,
+            ray: self.ray.clone(),
+        })
+    }
+
     /// An HCR object looking along `view_vector` (`SmHCR(crContext, pBrep,
     /// crViewVector, ..)`).
     ///
@@ -1550,7 +1588,7 @@ impl Hcr {
                     }
                 }
                 // SER in a SmBoolean function: the status reads as TRUE
-                Err(err) if err.is_unported() => return Err(err),
+                Err(err) if err.is_unported_or_cancelled() => return Err(err),
                 Err(_) => return Ok(true),
             }
         }
@@ -1744,7 +1782,7 @@ impl Hcr {
 
         match tracer.fire_ray(k, ray_start, ray_vec, max_distance) {
             Ok(hit) => Ok(!hit.hits_something),
-            Err(err) if err.is_unported() => Err(err),
+            Err(err) if err.is_unported_or_cancelled() => Err(err),
             // signal an error and guess that the point is visible
             Err(_) => Ok(true),
         }
@@ -2077,7 +2115,7 @@ mod tests {
             Some(BrepId::from_index(0))
         );
         // another B-rep has no id here
-        let other = scene.clone();
+        let other = scene.clone_standing_for_self().unwrap();
         assert_eq!(geometry.brep_id(&other), None);
     }
 

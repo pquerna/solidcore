@@ -13,6 +13,8 @@
 //! rails on their faces (to the fork's 1e-9, see [`OFF_BALL`]), and the round face's area
 //! matches the canal surface's between the rails and the end disc's plane (Gauss-Legendre)
 //! to [`AREA_TOL`]. Without the flag, or with the arm traced, the fillet fails.
+//! The spine is constructed directly in Bernstein form: its offset identities and the
+//! round's canal identity certify a bound of 0, also through its definition's record.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -23,10 +25,15 @@
 use solidcore::blend::fillet_executive::api::fillet_edges;
 use solidcore::boolean::api_brep::boolean_union;
 use solidcore::geom::axis2_placement::Axis2Placement;
+use solidcore::geom::extent2d::Extent2d;
 use solidcore::geom::vector2d::Point2;
 use solidcore::math::{Point3, Vec3, PI};
 use solidcore::nurbs::b_spline_surface::SurfParamType;
 use solidcore::primitive::api_primitives::create_cylinder;
+use solidcore::surface::procedural_blend::convert::{exact_rebuild, exact_to_record};
+use solidcore::surface::procedural_blend::exact::ExactClass;
+use solidcore::surface::procedural_blend::record::SupportRecord;
+use solidcore::surface::procedural_blend::BlendNet;
 use solidcore::surface::surface::{Surface, SurfaceKind};
 use solidcore::topology::face::p2 as face;
 use solidcore::topology::{edge, EdgeId, FaceId};
@@ -39,11 +46,9 @@ const RHO: f64 = 1.0;
 /// Where the small pipe starts along x.
 const X0: f64 = 0.5;
 const FILLET: f64 = 0.5;
-/// How far the round may be from the ball: the fork's exact-round criterion (1e-9 mm,
-/// tangency-labs/smlib@95ce0c5). Its nodal-quartic formula in doubles loses about 1e-10
-/// on the spine toward the trace's last point (W cancels by about 1e4 there: the second
-/// point of a short line from the node); the round is 9e-10 off there, 1e-12 at the
-/// first point. The traced round fails outright.
+/// The existing ball/rail sample bar (1e-9 mm, tangency-labs/smlib@95ce0c5), unchanged.
+/// Exactness is proved separately by the offset and canal polynomial identities when
+/// the round retains its definition; the old power-basis spine could not pass them.
 const OFF_BALL: f64 = 1e-9;
 /// How far the round face's area may be from the canal surface's (relative): the face is
 /// trimmed at the end disc by fitted UV curves (the end edges' tolerances are 6e-5; their
@@ -71,8 +76,14 @@ fn off_b(x: Point3) -> f64 {
 
 /// The two pipes united and their concave edge rounded; the round faces.
 fn pipes(exact: bool) -> (Kernel, Brep, Result<()>, Vec<FaceId>) {
+    pipes_kept(exact, false)
+}
+
+/// [`pipes`] with `definition` (`fillet_round_as_definition`, #2485) set.
+fn pipes_kept(exact: bool, definition: bool) -> (Kernel, Brep, Result<()>, Vec<FaceId>) {
     let mut k = Kernel::default();
     k.fixes.fillet_exact_round_classes = exact;
+    k.fixes.fillet_round_as_definition = definition;
     let a = create_cylinder(&mut k, Point3::new(0.0, 0.0, -10.0), R, 20.0).unwrap();
     let mut small = create_cylinder(&mut k, Point3::new(0.0, 0.0, 0.0), RHO, 10.0 - X0).unwrap();
     // z to x: the small pipe from (X0, R - RHO, 0) along +x
@@ -287,4 +298,119 @@ fn pipes_touching_at_a_point_round_exactly_on_their_nodal_quartic() {
 fn upstream_traces_the_round_between_pipes_touching_at_a_point_and_fails() {
     let (_, _, res, _) = pipes(false);
     assert!(res.is_err(), "the traced round fails: {res:?}");
+}
+
+// ---- #2485: an exact round is a blend by its definition, its net the exact surface ----
+
+/// The exact rounds of `b`: each one re-certified at a bound of 0, its class, the bits of
+/// its points over a 9 x 9 grid, and its record through JSON and back (re-certified, the
+/// same record again, evaluating as the round).
+fn exact_round_checks(k: &Kernel, b: &Brep) -> Vec<(ExactClass, Vec<[u64; 3]>)> {
+    let mut out = Vec::new();
+    for f in b.faces().ids() {
+        let Some(s) = face::surface(b, f).unwrap() else {
+            continue;
+        };
+        let Some(blend) = s.procedural_blend() else {
+            continue;
+        };
+        let Some(round) = blend.exact() else {
+            continue;
+        };
+        assert!(matches!(blend.net(), BlendNet::Exact(_)));
+        assert_eq!(blend.bound(), 0.0);
+        assert_eq!(blend.recertify(k).unwrap(), 0.0);
+        let rec = exact_to_record(k, s).unwrap();
+        let json = serde_json::to_string(&rec).unwrap();
+        let back = exact_rebuild(k, &serde_json::from_str(&json).unwrap()).unwrap();
+        assert_eq!(exact_to_record(k, &back).unwrap(), rec);
+        let bits = surface_bits(k, s);
+        assert_eq!(
+            bits,
+            surface_bits(k, &back),
+            "the rebuilt net evaluates as the round"
+        );
+        out.push((round.class(), bits));
+    }
+    out
+}
+
+/// The points of `s` over a 9 x 9 grid of its natural domain, as bits.
+fn surface_bits(k: &Kernel, s: &Surface) -> Vec<[u64; 3]> {
+    let d = s.natural_uv_domain_with_nurb(k).unwrap();
+    let mut pts = Vec::new();
+    for i in 0..=8 {
+        for j in 0..=8 {
+            let u = d.min().x + (d.max().x - d.min().x) * f64::from(i) / 8.0;
+            let v = d.min().y + (d.max().y - d.min().y) * f64::from(j) / 8.0;
+            let p = s.evaluate_point(k, Point2::new(u, v)).unwrap();
+            pts.push([p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]);
+        }
+    }
+    pts
+}
+
+/// The points of every face of `b` as bits.
+fn body_bits(k: &Kernel, b: &Brep) -> Vec<Vec<[u64; 3]>> {
+    b.faces()
+        .ids()
+        .filter_map(|f| face::surface(b, f).unwrap())
+        .map(|s| surface_bits(k, s))
+        .collect()
+}
+
+/// The nodal definition survives record and parameter edits, while altered geometry refuses.
+#[test]
+fn the_nodal_quartic_round_keeps_its_exact_definition() {
+    // Both the offset identities and the canal-surface identity must certify at 0,
+    // including after its supports, leader and net pass through a JSON record.
+    let (k, b, res, _) = pipes_kept(true, true);
+    res.unwrap();
+    let exact = exact_round_checks(&k, &b);
+    assert_eq!(exact.len(), 1, "the nodal quartic keeps its definition");
+    assert_eq!(exact[0].0, ExactClass::NodalQuartic);
+    let (k0, b0, r0, _) = pipes_kept(true, false);
+    r0.unwrap();
+    assert_eq!(body_bits(&k, &b), body_bits(&k0, &b0));
+
+    let s = b
+        .faces()
+        .ids()
+        .filter_map(|f| face::surface(&b, f).unwrap())
+        .find(|s| {
+            s.procedural_blend()
+                .and_then(|blend| blend.exact())
+                .is_some()
+        })
+        .unwrap();
+    let mut edited = s.copy(&k).unwrap();
+    edited.reverse(&k, SurfParamType::U).unwrap();
+    edited.swap_uv(&k).unwrap();
+    edited
+        .reparameterize(&k, &Extent2d::from_bounds(-1.0, 2.0, 3.0, 7.0))
+        .unwrap();
+    edited.reverse(&k, SurfParamType::V).unwrap();
+    assert_eq!(
+        edited.procedural_blend().unwrap().recertify(&k).unwrap(),
+        0.0
+    );
+    let record = exact_to_record(&k, &edited).unwrap();
+    exact_rebuild(&k, &record).unwrap();
+
+    // A definition's identity must reject an independently moved support.
+    let mut off = record.clone();
+    let SupportRecord::Nurbs { form, .. } = &mut off.supports[0] else {
+        panic!("the analytic support is stored by its rational form");
+    };
+    for point in &mut form.points {
+        point[0] += 1e-3;
+    }
+    assert!(exact_rebuild(&k, &off).is_err());
+
+    // The spine's own identity is checked, rather than accepting a stored class label.
+    let mut off = record;
+    let leader = off.leader.as_mut().unwrap();
+    let middle = leader.points.len() / 2;
+    leader.points[middle][0] += 1e-3;
+    assert!(exact_rebuild(&k, &off).is_err());
 }

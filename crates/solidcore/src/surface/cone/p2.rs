@@ -172,7 +172,7 @@ fn iso_curve(
 ) -> Result<Option<BSplineCurve>> {
     match s.create_iso_parametric_curve(k, sweep, knot, IsoCurveOptions::default()) {
         Ok(iso) => Ok(Some(iso.curve)),
-        Err(e @ SolidError::Unported { .. }) => Err(e),
+        Err(e @ (SolidError::Unported { .. } | SolidError::Cancelled { .. })) => Err(e),
         Err(_) => Ok(None),
     }
 }
@@ -369,7 +369,7 @@ impl Cone {
 
     /// Rebuilds the polar converter with the cone's iso curves
     /// (`RebuildPolarConverter`, which calls the virtual `CreateIsoParametricCurve`).
-    fn rebuild_cone_polar_converter(&mut self, k: &Kernel) -> Result<()> {
+    pub(crate) fn rebuild_cone_polar_converter(&mut self, k: &Kernel) -> Result<()> {
         let inside_out = self.inside_out;
         self.rev.rebuild_polar_converter(k, &|s, k, p, t| {
             Ok(super::p1::cone_iso_curve(s, inside_out, k, p, t, None, false)?.curve)
@@ -643,6 +643,27 @@ impl Cone {
         test_surface: &BSplineSurface,
         tolerance_scale: f64,
     ) -> Result<Option<Self>> {
+        Self::is_nurb_surface_cone_on(k, test_surface, tolerance_scale, None)
+    }
+
+    /// [`Self::is_nurb_surface_cone`] of the `SmBSplineSurface` part of `this` (not upstream: the
+    /// fork's `SmProceduralBlend`): the corner points come from its virtual
+    /// `EvaluatePoint`, so a procedural blend's are its definition's. `None` evaluates
+    /// `test_surface` itself.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::is_nurb_surface_cone`].
+    pub(crate) fn is_nurb_surface_cone_on(
+        k: &Kernel,
+        test_surface: &BSplineSurface,
+        tolerance_scale: f64,
+        this: Option<&crate::surface::surface::Surface>,
+    ) -> Result<Option<Self>> {
+        let corner = |uv| match this {
+            Some(s) => s.evaluate_point(k, uv),
+            None => test_surface.evaluate_point(uv),
+        };
         // low work - not rational, not proper degree, not linear in one direction or other
         let deg_u = test_surface.degree(SurfParamType::U);
         let deg_v = test_surface.degree(SurfParamType::V);
@@ -669,8 +690,8 @@ impl Cone {
         }
 
         // evaluate Nurb min/max domain points (statuses ignored)
-        let min_pnt = ignored(test_surface.evaluate_point(uv_domain.min()))?.unwrap_or(Vec3::UNDEF);
-        let max_pnt = ignored(test_surface.evaluate_point(uv_domain.max()))?.unwrap_or(Vec3::UNDEF);
+        let min_pnt = ignored(corner(uv_domain.min()))?.unwrap_or(Vec3::UNDEF);
+        let max_pnt = ignored(corner(uv_domain.max()))?.unwrap_or(Vec3::UNDEF);
 
         // scale zero value and angle tolerance
         let ang_tol = tolerance_scale * EFF_ZERO_SQRT;
@@ -1182,7 +1203,7 @@ fn cone_inversion(
 ) -> Result<(LocationType, Point2)> {
     match cone.step_inversion(k, point, tol, None) {
         Ok(inv) => Ok((inv.location, inv.uv)),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         // rotated point not on the generator: upstream sets SM_LT_EXTERIOR
         Err(SolidError::Upstream {
             operation: OP_REV_STEP_INV,

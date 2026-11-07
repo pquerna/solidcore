@@ -163,17 +163,57 @@ pub fn find_fillet_tsect_pnt(
     trace_dir: Vec3,
     new_tsect: &mut TsectPnt,
 ) -> Result<()> {
+    find_fillet_tsect_pnt_in(
+        ops,
+        k,
+        brep,
+        surf1,
+        surf2,
+        pnt_to_drop,
+        trace_dir,
+        new_tsect,
+        None,
+        None,
+    )
+}
+
+/// [`find_fillet_tsect_pnt`] searching the base surfaces over `domain1` and `domain2`
+/// (`cpOptDomain1`, `cpOptDomain2`, from smlib#82, the fork's 47b5471: the trace's extended
+/// domains for a point past the faces), `None` their natural domains.
+///
+/// # Errors
+///
+/// As [`find_fillet_tsect_pnt`].
+#[allow(clippy::too_many_arguments)]
+pub fn find_fillet_tsect_pnt_in(
+    ops: &mut dyn FilletSolverOps,
+    k: &Kernel,
+    brep: Option<&mut Brep>,
+    surf1: &Surface,
+    surf2: &Surface,
+    pnt_to_drop: Point3,
+    trace_dir: Vec3,
+    new_tsect: &mut TsectPnt,
+    domain1: Option<&Extent2d>,
+    domain2: Option<&Extent2d>,
+) -> Result<()> {
     const OP_F: &str = "blend::fillet_solver::p3::find_fillet_tsect_pnt";
     // check state: SM_ASSERTs only
 
     // locals
     let this_approx_tol_3d = ops.solver().this_approx_tol_3d();
-    let domain1 = surf1.natural_uv_domain_with_nurb(k)?;
-    let domain2 = surf2.natural_uv_domain_with_nurb(k)?;
+    let domain1 = match domain1 {
+        Some(d) => *d,
+        None => surf1.natural_uv_domain_with_nurb(k)?,
+    };
+    let domain2 = match domain2 {
+        Some(d) => *d,
+        None => surf2.natural_uv_domain_with_nurb(k)?,
+    };
     for s in [surf1, surf2] {
         // smsurf_GetSurfaceCache + NER
         if let Err(e) = get_surface_cache(k, s, None::<NoObject>) {
-            return Err(if e.is_unported() {
+            return Err(if e.is_unported_or_cancelled() {
                 e
             } else {
                 SolidError::null_pointer(OP_F)
@@ -416,7 +456,6 @@ impl FilletSolver {
                 )?;
                 let interval = Extent1d::from_min_max(0.0, efo.target_distance * 10.0);
                 let mut ls = LocalSolve1d::with_interval(interval, false);
-                ls.set_failed_guess_no_sign_change(k.fixes.oscillating_skips_failed_guesses);
                 let mut radius_found = 0.0;
 
                 // NewtonRaphson iteration for the radius whose boundary crossing has
@@ -426,7 +465,7 @@ impl FilletSolver {
                         out.found_good_point = o.found;
                         radius_found = o.t;
                     }
-                    Err(e) if e.is_unported() => return Err(e),
+                    Err(e) if e.is_unported_or_cancelled() => return Err(e),
                     Err(_) => out.found_good_point = false,
                 }
                 // the EFO refines sUV[] through references
@@ -1323,7 +1362,7 @@ fn rail_edgeuse_param(
     match FilletSolver::rail_edgeuse_intersect(solver, k, target, rail_index, side_eu, guess, tsect)
     {
         Ok(Some(param)) => Ok(param),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         // the uninitialised dEUParamMin / dEUParamMax would be read next
         Ok(None) | Err(_) => Err(invalid(
             "RailEdgeuseIntersect found no crossing (uninitialised edge use parameter upstream)",

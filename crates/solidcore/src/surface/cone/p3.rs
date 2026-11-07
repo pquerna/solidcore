@@ -629,9 +629,10 @@ impl Cone {
         let box1 = bbox(k, self, domain)?;
         let mut box2 = bbox(k, other, other_domain)?;
         let size = box2.size();
-        let tol = approx_tol.map_or(EFF_ZERO_SQRT * (1.0 + size.length()), |t| {
-            approx_tol3d(k, t)
-        });
+        let tol = approx_tol.map_or_else(
+            || EFF_ZERO_SQRT * (1.0 + size.length()),
+            |t| approx_tol3d(k, t),
+        );
         box2.expand_absolute(tol);
         if box1.are_disjoint(&box2, 0.0) {
             return Ok(false);
@@ -927,7 +928,7 @@ fn intersection_inversion(
 fn nurbs_uv_status_ignored(cone: &Cone, k: &Kernel, step_uv: Point2) -> Result<Point2> {
     match cone.convert_uv_from_step_to_nurbs(k, step_uv) {
         Ok(uv) => Ok(uv),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(e) => {
             let circle = cone.rev().polar_curve().ok_or(e)?;
             let x = cone

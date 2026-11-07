@@ -51,6 +51,11 @@
 //!   plane and `SmSurface::LocalPointSolve` (`surface.surface_p5`) return
 //!   [`SolidError::Unported`], which always propagates (also where upstream ignores
 //!   the status).
+//! - **Short last span (solidcore-native).** (WR-697 addendum, end-rib flush merge)
+//!   `FlushCurve` merges a last span shorter
+//!   than a tenth of the one before only when the merged span passes the trace's span
+//!   test (`SurfaceIntersector::span_keeps_accuracy`); the fork (18e96f1) merges it
+//!   untested, as pinned SMLib does.
 //! - **Not ported here.** The `SM_DEBUG_CODE` blocks (graphics, dumps) and the
 //!   `SM_ASSERT`s (no-ops in release builds).
 
@@ -110,7 +115,7 @@ fn deg2rad(deg: f64) -> f64 {
 fn ignored<T>(r: Result<T>) -> Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Ok(None),
     }
 }
@@ -507,7 +512,7 @@ impl SurfaceIntersector<'_> {
             // load Surface eval matrix into the point
             let m = match self.surface(s).evaluate(k, uv, 2, 2, LEFT_UPPER) {
                 Ok(m) => m,
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(e) => {
                     // upstream evaluates into the point's matrix before the zero
                     // tangent replacement fails: those exact derivatives stay
@@ -632,7 +637,7 @@ impl SurfaceIntersector<'_> {
                             k.fixes.dupin_bottom_hyperbola_axis,
                         ) {
                             Ok(()) => {}
-                            Err(e) if e.is_unported() => return Err(e),
+                            Err(e) if e.is_unported_or_cancelled() => return Err(e),
                             Err(_) => return Err(SolidError::sm_err(OP_SING)),
                         }
                     } else {
@@ -758,8 +763,9 @@ impl SurfaceIntersector<'_> {
     /// point or unique ([`is_point_unique`] against the start points and the 3D
     /// curves' ends). A curve whose consecutive points are all within
     /// `this_approx_tol_3d` is dropped. A last span shorter than a tenth of the one
-    /// before is merged into it. A crossing curve with more than one span whose
-    /// normals stay within 5 degrees is near tangent.
+    /// before is merged into it (only when the merged
+    /// span passes `SurfaceIntersector::span_keeps_accuracy`). A crossing curve with
+    /// more than one span whose normals stay within 5 degrees is near tangent.
     ///
     /// # Errors
     ///
@@ -856,7 +862,11 @@ impl SurfaceIntersector<'_> {
                 let fin = at(i + 1)?;
                 let t_delta = curr.curve_parameter - prev.curve_parameter;
                 let t_delta_final = fin.curve_parameter - curr.curve_parameter;
-                if t_delta_final / t_delta < 0.1 {
+                // Not upstream (WR-697 addendum, solidcore-native): only when the merged
+                // span keeps the trace's accuracy. The trace tested the two spans it made,
+                // not the one the merge makes, which can leave the 3D curve and a UV curve
+                // further apart than the tolerance
+                if t_delta_final / t_delta < 0.1 && self.span_keeps_accuracy(k, prev, fin)? {
                     // skip next to last xsect point
                     i += 1;
                     curr = at(i)?;
@@ -1328,7 +1338,7 @@ impl SurfaceIntersector<'_> {
                 let pc_dot_bi_norm = pc.dot(bi_norm);
                 Ok(!self.domain(o).contains_point(p_uv, EFF_ZERO) || pc_dot_bi_norm < -EFF_ZERO)
             }
-            Err(e) if e.is_unported() => Err(e),
+            Err(e) if e.is_unported_or_cancelled() => Err(e),
             _ => Ok(true), // open for nonzero gaps
         }
     }
@@ -1509,6 +1519,8 @@ fn is_singularity(k: &Kernel, surface: &Surface, uv: Point2) -> Result<(bool, Su
         | SurfaceKind::Sphere(_)
         | SurfaceKind::Torus(_)
         | SurfaceKind::BSpline(_)
+        | SurfaceKind::ProceduralBlend(_)
+        | SurfaceKind::BallPatch(_)
         | SurfaceKind::CurveBounded(_)
         | SurfaceKind::SurfOfRevolution(_)
         | SurfaceKind::SurfOfExtrusion(_)
@@ -1703,7 +1715,7 @@ pub fn compute_law_point_values_with<'s, V: IntersectorVirtuals<'s> + ?Sized>(
         // `Unported` propagates)
         match v.compute_point_values_delta(k, uvs, uv_deltas, point, &mut delta_pnt) {
             Ok(()) => return Ok(()),
-            Err(e @ SolidError::Unported { .. }) => return Err(e),
+            Err(e @ (SolidError::Unported { .. } | SolidError::Cancelled { .. })) => return Err(e),
             Err(_) => {}
         }
 

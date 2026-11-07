@@ -59,7 +59,10 @@
 //! - `Evaluate` is `const` upstream and caches the B-spline extension through a cast
 //!   away from `const`; here [`FilletLaw::evaluate`] takes `&mut self` and stores it in
 //!   `FilletLawKind::BSpline::extended_law`. The context passed to
-//!   `CreateExtendedCurve` only allocates, so no `Kernel` is needed.
+//!   `CreateExtendedCurve` only allocates, so no `Kernel` is needed. Not upstream: inside
+//!   the law curve's domain the evaluation reads the curve, not a cached extension (which
+//!   reproduces it there only to rounding: a law that is 0 at its end read 3e-15 through it,
+//!   and the corner at that end took the round for one of positive width).
 //! - The "unable to extend non-B-spline laws" branch is unreachable (both the law curve
 //!   and its extension are B-splines) and not ported.
 //! - A G1-closed law curve is not extended: `CreateExtendedCurve` hands back an
@@ -200,7 +203,9 @@ impl FilletLaw {
     /// edge map onto the law curve; a parameter within `SM_EFF_ZERO * (1 + |min| +
     /// |max|)` outside the curve's domain snaps to the end, a parameter further out
     /// extends the curve (`C-infinity`, to twice the overshoot and at least a tenth of
-    /// the domain) and keeps the extension for later evaluations.
+    /// the domain) and keeps the extension for later evaluations. Inside the curve's domain
+    /// it evaluates the curve itself even once an extension exists (not upstream, which then
+    /// evaluates the extension everywhere, reproducing the curve only to rounding).
     ///
     /// # Errors
     ///
@@ -311,6 +316,27 @@ fn bspline_evaluate(
     // Map parameter back to interval of the curve.
     let mut law_t = edge_map.evaluate(t);
 
+    // Not upstream: within the law curve's own domain (its ends snapped within the parameter
+    // tolerance, as below) the law is its curve. An extension an earlier evaluation past the
+    // domain cached continues the curve there, but evaluated inside the domain it only
+    // reproduces the curve to rounding (3e-15 where the curve is 0), which upstream reads
+    // once the extension exists.
+    let curve_ivl = law_curve.natural_interval();
+    if extended_law.is_some() {
+        let curve_tol = EFF_ZERO * (1.0 + curve_ivl.min().abs() + curve_ivl.max().abs());
+        let mut on_curve = None;
+        if curve_ivl.contains_value(law_t, 0.0) {
+            on_curve = Some(law_t);
+        } else if law_t < curve_ivl.min() && law_t + curve_tol > curve_ivl.min() {
+            on_curve = Some(curve_ivl.min());
+        } else if law_t > curve_ivl.max() && law_t - curve_tol < curve_ivl.max() {
+            on_curve = Some(curve_ivl.max());
+        }
+        if let Some(at) = on_curve {
+            return law_values(law_curve, at, param_scale, reverse);
+        }
+    }
+
     // when parameter is beyond current range
     let mut new_extension = None;
     if !ivl.contains_value(law_t, 0.0) {
@@ -366,7 +392,13 @@ fn bspline_evaluate(
         }
     }
     let law = extended_law.as_ref().unwrap_or(law_curve);
+    law_values(law, law_t, param_scale, reverse)
+}
 
+/// The radius and its first two derivatives by the edge parameter, from `law` at `law_t`
+/// (`param_scale`: the edge interval's length over the edge map's; `reverse`: the law runs
+/// from the interval's end).
+fn law_values(law: &BSplineCurve, law_t: f64, param_scale: f64, reverse: bool) -> Result<[f64; 3]> {
     let pv = law.evaluate(law_t, 2, true, true)?;
     let x = |i: usize| {
         pv.get(i)
@@ -706,6 +738,11 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
             overflow_edges: Vec::new(),
             mitred_edges: Vec::new(),
             fan_split_points: Vec::new(),
+            earlier_pass_faces: Vec::new(),
+            fit_radius: -1.0,
+            fit_edge: None,
+            fit_kind: super::p3::FitKind::Radius,
+            fit_setback: -1.0,
         }
     }
 
@@ -856,6 +893,18 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
     /// `CreateFilletBrep`.
     pub fn set_overflow_first(&mut self, value: bool) {
         self.overflow_first = value;
+    }
+
+    /// `AddEarlierPassFace` (the fork's, tangency-labs/smlib@9822462, smlib#130): a face
+    /// an earlier pass of the same blend made (the rounds that overflow go first).
+    pub fn add_earlier_pass_face(&mut self, face: O) {
+        self.earlier_pass_faces.push(face);
+    }
+
+    /// `IsEarlierPassFace` (the fork's, tangency-labs/smlib@9822462): whether `face` is
+    /// one an earlier pass of the same blend made ([`Self::add_earlier_pass_face`]).
+    pub fn is_earlier_pass_face(&self, face: &O) -> bool {
+        self.earlier_pass_faces.contains(face)
     }
 
     /// `SetClassifyOnly` (the fork's, WR-634, tangency-labs/smlib@241f7ba): before
@@ -1068,7 +1117,7 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
 /// `SmFilletCorner::Create` returns a corner pointer or null; the null case is split
 /// here so an owner that can resolve the vertex's point can feed the opt-in vertex
 /// error note without changing the existing factory signature.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum CornerCreation<O> {
     /// The factory created a corner of this identity.
     Created(O),
@@ -1077,6 +1126,24 @@ pub enum CornerCreation<O> {
     Unsupported {
         /// The vertex's point when the owner resolved it.
         location: Option<Point3>,
+    },
+    /// The fork's (WR-697, tangency-labs/smlib e647dac): a corner the blend corner
+    /// refuses with its reason (`SmBlendCorner::Classify`: a Swept turn the ball cannot
+    /// pass, or one not built yet). The executive notes it at the vertex, keeps it over
+    /// any later "Corner case not implemented", and fails once every corner is made.
+    Refused {
+        /// The vertex's point when the owner resolved it.
+        location: Option<Point3>,
+        /// The refusal's `SmFilletErrorType`.
+        error: FilletErrorType,
+        /// Its reason.
+        comment: String,
+        /// The blended edge no size builds (the fork's `NoteFitRadius(0.0, edge)`), noted
+        /// before the refusal.
+        fit_edge: Option<O>,
+        /// The size of `fit_edge`'s blend that builds and what it sizes, where one does
+        /// (the chamfer event's, WR-716); `None` notes 0, no size.
+        fit: Option<(f64, crate::blend::fillet_executive::FitKind)>,
     },
 }
 
@@ -1128,9 +1195,14 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
     /// `"Corner case not implemented"` (the fork's note) and still keeps the pending
     /// entry: retaining the note does not change the operation's result or topology.
     ///
+    /// A [`CornerCreation::Refused`] corner (the fork's) is noted at its vertex with its own error and
+    /// reason, no later unsupported corner's note replaces it, and the operation fails
+    /// (`SM_ERR`) after the loop, once the error info is assigned (the fork's
+    /// `bRefused` and `bMissingCorner`).
+    ///
     /// # Errors
     ///
-    /// Those of [`Self::create_fillet_corners`].
+    /// Those of [`Self::create_fillet_corners`]; `SM_ERR` after a refused corner.
     pub fn create_fillet_corners_recording_vertex_errors(
         &mut self,
         k: &Kernel,
@@ -1140,6 +1212,7 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
         use crate::blend::fillet_executive::p3::VertexEntry;
 
         const OP: &str = "blend::fillet_executive::p1::FilletExecutive::create_fillet_corners";
+        let mut refused = false;
         for &vertex in &self.filleted_vertices {
             let pending = match self.vertex_corner_map.get(&vertex) {
                 Some(VertexEntry::SolverEdgeuses(edgeuses)) => edgeuses,
@@ -1154,8 +1227,32 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
                     self.vertex_corner_map
                         .insert(vertex, VertexEntry::Corner(corner));
                 }
+                CornerCreation::Refused {
+                    location,
+                    error,
+                    comment,
+                    fit_edge,
+                    fit,
+                } => {
+                    // NoteFitRadius(0.0, edge), or the size that builds where one does
+                    if let Some(edge) = fit_edge {
+                        let (size, kind) =
+                            fit.unwrap_or((0.0, crate::blend::fillet_executive::FitKind::Radius));
+                        self.fit_radius = size;
+                        self.fit_edge = Some(edge);
+                        self.fit_kind = kind;
+                    }
+                    self.error.note_vertex_error(
+                        vertex,
+                        location,
+                        FilStatus::Failure,
+                        error,
+                        Some(&comment),
+                    );
+                    refused = true;
+                }
                 CornerCreation::Unsupported { location } => {
-                    if k.fixes.fillet_vertex_error_diagnostics {
+                    if k.fixes.fillet_vertex_error_diagnostics && !refused {
                         self.error.note_vertex_error(
                             vertex,
                             location,
@@ -1169,6 +1266,9 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
         }
         if let Some(info) = error_info {
             info.assign(&self.error);
+        }
+        if refused {
+            return Err(SolidError::sm_err(OP));
         }
         Ok(())
     }
@@ -1263,6 +1363,7 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
                     ..crate::kernel::KernelOptions::default()
                 });
                 tk.rng = k.rng.clone();
+                tk.cancel.clone_from(&k.cancel);
                 let mut trim_ivl = edge_ivl;
                 let crv = target
                     .edge_mut(edge_id)?
@@ -1353,7 +1454,7 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
             pass_on,
         )? {
             Ok(c) => c,
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             Err(_) => return Err(SolidError::null_pointer(OP)),
         };
 
@@ -1388,7 +1489,7 @@ fn eval_first_deriv_ignored(
 ) -> Result<crate::math::Vec3> {
     match crate::error::passed_on(crv.evaluate(k, param, 1, false, true), pass_on)? {
         Ok(vals) => Ok(vals.get(1).copied().unwrap_or(crate::math::Vec3::UNDEF)),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Ok(crate::math::Vec3::UNDEF),
     }
 }
@@ -1635,6 +1736,7 @@ pub(crate) fn remove_topo_edges_with_notifications(
                     let editing = b.editing_enabled();
                     if let Err(
                         e @ (SolidError::Unported { .. }
+                        | SolidError::Cancelled { .. }
                         | SolidError::InvalidInput { .. }
                         | SolidError::PortInvariant { .. }
                         | SolidError::NotFound { .. }),

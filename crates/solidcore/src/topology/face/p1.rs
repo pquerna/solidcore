@@ -27,6 +27,11 @@
 //! | [`FixSeamPlanType`]                          | `SmFixSeamPlanType` (`SmTypes.h`)            |
 //!
 //! Deviations:
+//! - **Opt-in shrink fixes (the fork's, not upstream).** `shrink_geometry` keeps the
+//!   face's trim curves where its surface's trim keeps the surface's parameterization
+//!   (WR-700, `Kernel::fixes.face_trim_curves_kept_where_exact`), and takes a bound
+//!   within 64 ulp of a B-spline knot as that knot (WR-702,
+//!   `Kernel::fixes.face_shrink_bound_on_knot`).
 //! - **Object model.** A face is a record in the [`Brep`]'s arenas; the methods are free
 //!   functions taking the B-rep and the face's id. Out-parameters are return values,
 //!   with an additional UV-domain `_into` entry point for partial outputs on error.
@@ -144,6 +149,10 @@
 //! - **Not upstream: [`shrink_geometry_with`]** (tangency-labs/solidcore#472) passes
 //!   [`TrimOptions`] to the surface trim; [`shrink_geometry`] uses the defaults
 //!   (upstream). See `nurbs::b_spline_surface_n_lib::p2`'s Deviations.
+//! - **Not upstream (WR-729, opt-in `Kernel::fixes.face_swap_uv_transposes_trims`):**
+//!   [`swap_uv`] swaps its UV trims' control point coordinates exactly
+//!   ([`BSplineCurve::create_transposed_curve`]) instead of mirroring them through
+//!   upstream's rounded `u = v` mirror matrix.
 
 use core::cmp::Ordering;
 
@@ -168,6 +177,7 @@ use crate::intersect::point_class::{ClassGeometry, PointClassType};
 use crate::kernel::Kernel;
 use crate::math::{Point3, Vec3, BIG_DOUBLE, EFF_ZERO, EFF_ZERO_PARAM};
 use crate::nurbs::b_spline_curve::p2::BoundingBoxRequest;
+use crate::nurbs::b_spline_curve::BSplineCurve;
 use crate::nurbs::b_spline_curve_n_lib::TrimMode;
 use crate::nurbs::b_spline_surface::p1::SurfParamType;
 use crate::nurbs::b_spline_surface_n_lib::p2::{OrientType, TrimOptions};
@@ -361,7 +371,7 @@ fn has_near_misses<O: LoopObject>(
     match c.has_near_misses(k, geometry, false) {
         Ok(v) => Ok(v),
         Err(e)
-            if e.is_unported()
+            if e.is_unported_or_cancelled()
                 || matches!(
                     e,
                     SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }
@@ -623,7 +633,7 @@ pub fn calculate_uv_domain_from_uv_trim_curves_into(
     // place a UVTrimCurve on each Face->Edgeuse
     match create_uv_trim_curves(k, b, f) {
         Ok(()) => {}
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         // Return the default from above.
         Err(_) => return Ok(()),
     }
@@ -1073,7 +1083,7 @@ pub fn find_if_rectangular_trim(
 
     let boundary = match create_oriented_trim_boundary(k, b, f, true, true, None, key_of) {
         Ok(r) => r,
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => return Err(SolidError::sm_err(OP)),
     };
 
@@ -1481,6 +1491,18 @@ fn swap_uv_notifying(
     // Mirror the UV trims and swap the surface (the steps that can fail) before changing
     // the face, so that a failure leaves the face unchanged.
 
+    // (WR-729, opt-in: the mirror about u = v is the swap of each control point's u and
+    // v, made exactly; the rounded mirror matrix moves every coordinate by an ulp and a
+    // trim's end on a domain bound past it)
+    let transpose = k.fixes.face_swap_uv_transposes_trims;
+    let mirror_curve = |c: &BSplineCurve| {
+        if transpose {
+            c.create_transposed_curve()
+        } else {
+            c.create_mirror_curve(&mirror)
+        }
+    };
+
     let upward = upward_loopuses(b, f)?;
 
     let mut to_set: Vec<(EdgeuseId, Curve)> = Vec::new();
@@ -1491,12 +1513,12 @@ fn swap_uv_notifying(
                 // (upstream dereferences the mate only for an edge use with a curve)
                 let eu_mate = eu1::mate(b, eu)?.ok_or_else(|| null("edge use without mate"))?;
                 let mirrored = match uv.kind() {
-                    CurveKind::BSpline(c) => c.create_mirror_curve(&mirror)?,
+                    CurveKind::BSpline(c) => mirror_curve(c)?,
                     // (MakeNurb's status is ignored upstream: mirror the base as it is)
                     CurveKind::Line(c) => match c.base_with_nurb() {
-                        Ok(base) => base.create_mirror_curve(&mirror)?,
-                        Err(e) if e.is_unported() => return Err(e),
-                        Err(_) => c.base().create_mirror_curve(&mirror)?,
+                        Ok(base) => mirror_curve(&base)?,
+                        Err(e) if e.is_unported_or_cancelled() => return Err(e),
+                        Err(_) => mirror_curve(c.base())?,
                     },
                     // the conics: MakeNurb (their override) when missing, then the
                     // SmBSplineCurve mirror of that NURB (statuses ignored as upstream)
@@ -1505,21 +1527,21 @@ fn swap_uv_notifying(
                         if c.base().gw_nurb().is_none() {
                             ignore_status(c.make_nurb(k))?;
                         }
-                        c.base().create_mirror_curve(&mirror)?
+                        mirror_curve(c.base())?
                     }
                     CurveKind::Parabola(c) => {
                         let mut c = c.clone();
                         if c.base().gw_nurb().is_none() {
                             ignore_status(c.make_nurb(None))?;
                         }
-                        c.base().create_mirror_curve(&mirror)?
+                        mirror_curve(c.base())?
                     }
                     CurveKind::Hyperbola(c) => {
                         let mut c = c.clone();
                         if c.base().gw_nurb().is_none() {
                             ignore_status(c.make_nurb(None))?;
                         }
-                        c.base().create_mirror_curve(&mirror)?
+                        mirror_curve(c.base())?
                     }
                     // A UV trim curve is an SmBSplineCurve*: upstream's only subclasses are
                     // SmLine, SmEllipse, SmHyperbola and SmParabola (the arms above);
@@ -1678,9 +1700,46 @@ fn shrink_geometry_notifying(
         max.y = surf_domain.max().y;
     }
 
+    // Not upstream (WR-702, the fork's tangency-labs/smlib@d80ea93): a bound within
+    // rounding of one of the surface's knots (64 ulp of the knot's magnitude) is that
+    // knot. A computed end parameter lands a rounding step either side of the knot it
+    // stands for, and TrimWithDomain would space a bound just past a knot off it by its
+    // snapping tolerance and keep a sliver span past the knot.
+    if k.fixes.face_shrink_bound_on_knot {
+        let surface = fp2::surface(b, f)?.ok_or_else(|| null("face without surface"))?;
+        if surface.is_kind_of(B_SPLINE_SURFACE_TYPE)? {
+            for dir in [SurfParamType::U, SurfParamType::V] {
+                let (knots, _) = surface.knots_with_nurb(k, dir, None)?;
+                let (lo, hi) = if dir == SurfParamType::U {
+                    (&mut min.x, &mut max.x)
+                } else {
+                    (&mut min.y, &mut max.y)
+                };
+                for &knot in &knots {
+                    let round = 64.0 * f64::EPSILON * knot.abs();
+                    if (*lo - knot).abs() <= round {
+                        *lo = knot;
+                    }
+                    if (*hi - knot).abs() <= round {
+                        *hi = knot;
+                    }
+                }
+            }
+        }
+    }
+
     // set the (revised) face domain
     let mut new_domain = Extent2d::from_points(min, max);
     fp2::set_uv_domain(b, f, &new_domain)?;
+
+    // Not upstream (WR-700, the fork's tangency-labs/smlib@6f811b8): whether the trim
+    // keeps the surface's parameterization, by its kind's construction
+    // (`TrimKeepsParameterization`), asked before it is trimmed
+    let same_map = k.fixes.face_trim_curves_kept_where_exact
+        && match fp2::surface(b, f)? {
+            Some(s) => s.trim_keeps_parameterization(k, &new_domain)?,
+            None => false,
+        };
 
     // Trim the surface (status ignored)
     if let Some(s) = b.face_mut(f)?.surface.as_mut() {
@@ -1688,8 +1747,12 @@ fn shrink_geometry_notifying(
     }
 
     // remove all associated UVTrimCurves (status ignored; passed on with the opt-in fix,
-    // tangency-labs/smlib 6997962, which keeps the curve trims below ignored)
-    ignore_status(pass(k, remove_uv_trim_curves_notifying(b, f, notify))?)?;
+    // tangency-labs/smlib 6997962, which keeps the curve trims below ignored); with
+    // WR-700, not where the trim kept the surface's parameterization: they lie on it as
+    // they did and are kept
+    if !same_map {
+        ignore_status(pass(k, remove_uv_trim_curves_notifying(b, f, notify))?)?;
+    }
 
     // Now Trim all Curves to the face edges
     for e in face_edges(b, f)? {
@@ -2226,15 +2289,22 @@ pub fn move_seam_notified<O: LoopObject>(
             && (!periodic.is_full_period() || opts.ok_to_move_to_center || opts.ok_to_split)
         {
             let (left, right) = surface.split_at(k, new_param, surf_param).map_err(|e| {
-                if e.is_unported() {
+                if e.is_unported_or_cancelled() {
                     e
                 } else {
                     SolidError::sm_err(OP)
                 }
             })?;
-            let (SurfaceKind::BSpline(left), SurfaceKind::BSpline(right)) =
-                (left.into_kind(), right.into_kind())
-            else {
+            // ((SmBSplineSurface*) casts, unchecked in release: the fork's
+            // SmProceduralBlend halves are joined as their nets, and the joined surface
+            // is a plain B-spline)
+            let net = |half: Surface| match half.into_kind() {
+                SurfaceKind::BSpline(b) => Some(b),
+                SurfaceKind::ProceduralBlend(pb) => Some(pb.net),
+                SurfaceKind::BallPatch(bp) => Some(bp.net),
+                _ => None,
+            };
+            let (Some(left), Some(right)) = (net(left), net(right)) else {
                 return Err(null("MoveSeam: split halves are not SmBSplineSurfaces"));
             };
             let (mut left, mut right) = (left, right);

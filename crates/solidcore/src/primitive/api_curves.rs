@@ -358,7 +358,7 @@ pub fn create_helix(params: &HelixParams) -> Result<BSplineCurve> {
     for i in 0..=num_samples {
         let u = param_min + param_span * (i as f64 / num_samples as f64);
         let on_curve = helix.evaluate_point(u).map_err(|e| {
-            if e.is_unported() {
+            if e.is_unported_or_cancelled() {
                 e
             } else {
                 SolidError::sm_err(OP_HELIX)
@@ -452,7 +452,7 @@ fn segments(points: &[Point3], operation: &'static str) -> Result<Vec<Line>> {
             .ok_or_else(|| SolidError::sm_err(operation))?;
         match Line::create_line_segment(3, p0, p1, None) {
             Ok(seg) => result.push(seg),
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             // Drop the segments this call already made.
             Err(_) => return Err(SolidError::sm_err(operation)),
         }
@@ -525,7 +525,7 @@ pub fn create_regular_polygon(center: Point3, num_sides: u64, radius: f64) -> Re
 
         match Line::create_line_segment(3, pt0, pt1, None) {
             Ok(seg) => result.push(seg),
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             // Drop the segments this call already made.
             Err(_) => return Err(SolidError::sm_err(OP_POLYGON)),
         }
@@ -868,5 +868,26 @@ mod tests {
         // (beyond the 47-bit address space, so no test machine can grant it)
         assert!(create_regular_polygon(c, 1 << 47, 5.0).is_err());
         assert!(create_regular_polygon(c, u64::MAX, 5.0).is_err());
+    }
+
+    #[test]
+    fn create_curve_and_segments_degenerate_inputs_do_not_panic() {
+        assert!(matches!(
+            create_curve(&[]),
+            Err(SolidError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            create_curve(&[p(0.0, 0.0, 0.0)]),
+            Err(SolidError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            create_curve(&[p(0.0, 0.0, 0.0), p(1.0, 0.0, 0.0), p(2.0, 0.0, 0.0)]),
+            Err(SolidError::InvalidInput { .. })
+        ));
+
+        assert_eq!(segments(&[], "test_op").unwrap().len(), 0);
+
+        assert!(create_rectangle(p(0.0, 0.0, 0.0), 0.0, 10.0).is_err());
+        assert!(create_rectangle(p(0.0, 0.0, 0.0), f64::NAN, 10.0).is_err());
     }
 }

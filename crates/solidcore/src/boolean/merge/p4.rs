@@ -375,7 +375,7 @@ fn required<T>(value: Option<T>) -> Result<T> {
 fn ignored<T>(result: Result<T>) -> Result<Option<T>> {
     match result {
         Ok(value) => Ok(Some(value)),
-        Err(error) if error.is_unported() => Err(error),
+        Err(error) if error.is_unported_or_cancelled() => Err(error),
         Err(_) => Ok(None),
     }
 }
@@ -1545,6 +1545,7 @@ pub fn manifold_boolean(
     operation: BooleanOperation,
     caller_lock: Option<&mut MarkLock>,
 ) -> Result<bool> {
+    crate::profile::profile_scope!(kernels.primary, "boolean::manifold_boolean");
     manifold_boolean_transformed(
         kernels,
         primary,
@@ -1574,6 +1575,10 @@ fn manifold_boolean_transformed(
 ) -> Result<bool> {
     let a = required(primary.as_mut())?;
     let b = required(other.as_mut())?;
+    kernels.primary.check_cancelled(OP)?;
+    if let Some(other_kernel) = kernels.other.as_deref() {
+        other_kernel.check_cancelled(OP)?;
+    }
     let transform = p1::temporary_brep_transform(kernels.primary, kernels.other(), a, b)?.apply(
         a,
         b,
@@ -1623,6 +1628,10 @@ fn manifold_boolean_translated(
 ) -> Result<bool> {
     let a = required(primary.as_mut())?;
     let b = required(other.as_mut())?;
+    kernels.primary.check_cancelled(OP)?;
+    if let Some(other_kernel) = kernels.other.as_deref() {
+        other_kernel.check_cancelled(OP)?;
+    }
     if operation == BooleanOperation::Slice {
         if !is_sheet(kernels, b)? {
             return Err(SolidError::sm_err(OP));
@@ -1826,35 +1835,39 @@ mod tests {
 
     #[test]
     fn paired_mark_contexts_survive_a_failing_action() {
-        let mut first = Kernel::default();
-        let mut second = Kernel::default();
-        first.context.set_doing_boolean(true);
-        let mut kernels = BooleanKernels {
-            primary: &mut first,
-            other: Some(&mut second),
-        };
-        let mut lock = kernels
-            .mark_action(|contexts| MarkLock::new_pair(contexts, 0, 1))
-            .unwrap();
-        let marks = (lock.mark_type1(), lock.mark_type2());
-        let before = (
-            kernels.primary.context.current_mark(marks.0),
-            kernels.other().context.current_mark(marks.1),
-        );
-        let result: Result<()> = kernels.mark_action(|contexts| {
-            lock.new_mark(contexts)?;
-            Err(SolidError::sm_err("test"))
-        });
-        assert!(result.is_err());
-        assert!(kernels.primary.context.doing_boolean());
-        assert!(!kernels.other().context.doing_boolean());
-        assert_ne!(kernels.primary.context.current_mark(marks.0), before.0);
-        assert_ne!(kernels.other().context.current_mark(marks.1), before.1);
-        kernels
-            .mark_action(|contexts| lock.release(contexts))
-            .unwrap();
-        assert!(!kernels.primary.context.is_mark_locked(marks.0));
-        assert!(!kernels.other().context.is_mark_locked(marks.1));
+        for opt_in in [false, true] {
+            let mut first = Kernel::default();
+            let mut second = Kernel::default();
+            first.fixes.mark_lock_pair_advances_and_locks_second_context = opt_in;
+            first.context.set_doing_boolean(true);
+            let mut kernels = BooleanKernels {
+                primary: &mut first,
+                other: Some(&mut second),
+            };
+            let fixes = kernels.primary.fixes;
+            let mut lock = kernels
+                .mark_action(|contexts| MarkLock::new_pair_with_fixes(contexts, 0, 1, &fixes))
+                .unwrap();
+            let marks = (lock.mark_type1(), lock.mark_type2());
+            let before = (
+                kernels.primary.context.current_mark(marks.0),
+                kernels.other().context.current_mark(marks.1),
+            );
+            let result: Result<()> = kernels.mark_action(|contexts| {
+                lock.new_mark(contexts)?;
+                Err(SolidError::sm_err("test"))
+            });
+            assert!(result.is_err());
+            assert!(kernels.primary.context.doing_boolean());
+            assert!(!kernels.other().context.doing_boolean());
+            assert_ne!(kernels.primary.context.current_mark(marks.0), before.0);
+            assert_ne!(kernels.other().context.current_mark(marks.1), before.1);
+            kernels
+                .mark_action(|contexts| lock.release(contexts))
+                .unwrap();
+            assert!(!kernels.primary.context.is_mark_locked(marks.0));
+            assert!(!kernels.other().context.is_mark_locked(marks.1));
+        }
     }
 
     #[test]

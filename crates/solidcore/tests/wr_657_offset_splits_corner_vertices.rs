@@ -22,7 +22,7 @@ mod offset_fixture;
 
 use offset_fixture::{offset_full, planar_faces_at, report, shell, Notifications};
 use solidcore::blend::fillet_executive::api::fillet_edges;
-use solidcore::error::{SolidError, SM_ERR};
+use solidcore::error::SM_ERR;
 use solidcore::offset::offset_executive::p2::{api_offset_brep_full, OffsetOptions};
 use solidcore::primitive::api_primitives::{create_box, create_sphere};
 use solidcore::topology::brep::p1 as bp1;
@@ -101,7 +101,7 @@ fn chamfer_9(k: &Kernel, b: &Brep) -> FaceId {
 
 /// No loop of `b` has a gap between consecutive edges (`check_brep`).
 fn no_loop_gaps(k: &mut Kernel, b: &Brep) -> bool {
-    let mut b = b.clone();
+    let mut b = b.clone_standing_for_self().unwrap();
     let check = check_brep(k, &mut b, CheckLevel::Level2).unwrap();
     !check.lines().iter().any(|l| l.contains("Gap"))
 }
@@ -199,11 +199,12 @@ fn wr_657_three_chamfers_offsets() {
             REL
         ));
     }
-    // upstream: Ok with loop gaps and volume 0 at +1, refused (1001) at -1
+    // upstream: Ok with loop gaps and volume 0 at +1, refused (1001) at -1. With each plane's
+    // extension on the plane itself the default reaches the closed form at +1 too.
     let mut k = kernel(false);
     let mut b = chamfered(&mut k, Some(&[0, 9, 8]));
     let result = offset_full(&mut k, &mut b, 1.0);
-    assert!(!report(
+    assert!(report(
         &k,
         "wr_657 three chamfers offset +1 default",
         result,
@@ -304,9 +305,33 @@ fn wr_657_fully_chamfered_box_inset_open_at_a_chamfer_is_refused() {
     let b = chamfered(&mut k, None);
     let open = face_at(&k, &b, [29.0, 10.0, 9.0]);
     match shell(&mut k, b, -1.0, &[open]) {
-        Err(SolidError::Upstream { code, .. }) => assert_eq!(code, SM_ERR),
+        Err(e) => assert_eq!(e.sm_status(), Some(SM_ERR)),
         other => panic!("SM_ERR expected: {other:?}"),
     }
+}
+
+/// An offset asked not to merge leaves its overlapping faces (`OffsetBrep`, `bDoSelfInt`), so a
+/// result that is no closed solid is what was asked for: a 10 mm cube inset 1, convex edges
+/// not extended, comes back as with the flags off, as it does from the fork at d01d7b0.
+#[test]
+fn wr_657_unmerged_offset_is_not_refused() {
+    let faces = |fixed: bool| {
+        let mut k = kernel(fixed);
+        let mut b = create_box(&mut k, Point3::new(0.0, 0.0, 0.0), 10.0, 10.0, 10.0).unwrap();
+        let mut n = Notifications::new(&mut b);
+        let options = OffsetOptions {
+            distance: -1.0,
+            extend_convex_edges: false,
+            merge_results: false,
+        };
+        api_offset_brep_full(&mut k, Some(&mut b), options, &mut n.context())
+            .unwrap_or_else(|e| panic!("fixed {fixed}: {e:?}"))
+            .face_list()
+            .len()
+    };
+    let with_flags = faces(true);
+    assert!(with_flags > 0);
+    assert_eq!(with_flags, faces(false));
 }
 
 /// #2092: a sphere of radius 10 offset by -10 (convex edges not extended) leaves nothing.

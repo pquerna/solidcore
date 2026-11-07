@@ -124,7 +124,6 @@ use crate::geom::context::{
 };
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent3d::Extent3d;
-use crate::geom::geom_utility::p2::ContinuityType;
 use crate::geom::object::{self, NotifyOperation, ObjectRef};
 use crate::geom::tol::{self, SmallTopoType};
 use crate::kernel::Kernel;
@@ -182,6 +181,7 @@ fn ignore_soft<T>(r: Result<T>) -> Result<()> {
     match r {
         Err(
             e @ (SolidError::Unported { .. }
+            | SolidError::Cancelled { .. }
             | SolidError::InvalidInput { .. }
             | SolidError::PortInvariant { .. }
             | SolidError::NotFound { .. }),
@@ -714,7 +714,7 @@ pub fn copy_brep(
             reverse_map,
             add_analytics,
         ) {
-            if e.is_unported() {
+            if e.is_unported_or_cancelled() {
                 return Err(e);
             }
         }
@@ -779,21 +779,10 @@ fn reseed_records(
         keys.sort_unstable();
     }
     keys.dedup();
-    // (both ascending: `retain` visits the records in key order)
-    let mut next = 0;
-    records.retain(|key, record| {
-        while keys.get(next).is_some_and(|k| k < key) {
-            next += 1;
-        }
-        let keep = keys.get(next) == Some(key);
-        *record = topo::Topology::default();
-        keep
-    });
-    if records.len() != keys.len() {
-        for key in keys {
-            records.or_default(key);
-        }
-    }
+    // (not upstream) only the records the last edits changed are reset and only the
+    // difference in keys is removed or added, so a stitch's many edits do not each
+    // rebuild the whole map
+    records.reset_to_keys(&keys);
 }
 
 /// The kinds of topology keys with their class type codes (`GetType`), by kind number:
@@ -1506,6 +1495,17 @@ pub fn api_brep_copy(
     brep: Option<&Brep>,
     source_key: &dyn Fn(EntityRef) -> ObjectRef,
 ) -> Result<Brep> {
+    api_brep_copy_mapped(k, env, brep, source_key, None)
+}
+
+/// [`api_brep_copy`], filling `reverse_map` (when given) with each source entity's copy.
+fn api_brep_copy_mapped(
+    k: &mut Kernel,
+    env: &mut NotifyEnv<'_>,
+    brep: Option<&Brep>,
+    source_key: &dyn Fn(EntityRef) -> ObjectRef,
+    reverse_map: Option<&mut CopyBrepMap<EntityRef>>,
+) -> Result<Brep> {
     let Some(brep) = brep else {
         return Err(SolidError::Upstream {
             operation: OP,
@@ -1564,7 +1564,7 @@ pub fn api_brep_copy(
             )
         })
         .collect();
-    let copy = copy_brep(k, env, brep, source, None, None, true, false);
+    let copy = copy_brep(k, env, brep, source, None, reverse_map, true, false);
     for (key, handles) in lent {
         for h in handles {
             env.attributes.remove_attribute(key, h, false)?;
@@ -1610,12 +1610,33 @@ pub fn api_brep_copy(
 /// Those of [`api_brep_copy`] (the two namings are the B-rep's own and never share an
 /// attribute key).
 pub fn brep_copy(k: &mut Kernel, brep: &Brep) -> Result<Brep> {
+    brep_copy_into(k, brep, None)
+}
+
+/// [`brep_copy`] and the copy of each of `brep`'s entities: the copy's ids are its own
+/// (numbered as it is built, not `brep`'s), so a caller holding `brep`'s ids maps them through
+/// this, never by id or by place in a list.
+///
+/// # Errors
+///
+/// Those of [`brep_copy`].
+pub fn brep_copy_mapped(k: &mut Kernel, brep: &Brep) -> Result<(Brep, CopyBrepMap<EntityRef>)> {
+    let mut map = CopyBrepMap::default();
+    let copy = brep_copy_into(k, brep, Some(&mut map))?;
+    Ok((copy, map))
+}
+
+fn brep_copy_into(
+    k: &mut Kernel,
+    brep: &Brep,
+    reverse_map: Option<&mut CopyBrepMap<EntityRef>>,
+) -> Result<Brep> {
     use crate::topology::loopuse::notify_ref;
     let mut state = p2::ArenaNotifyState::default();
     let mut env = state.env(None);
     // both B-reps under their own naming: `api_brep_copy` names the source in a
     // private domain for the copy, so the source's attribute lists stay its own
-    let mut copy = api_brep_copy(k, &mut env, Some(brep), &notify_ref)?;
+    let mut copy = api_brep_copy_mapped(k, &mut env, Some(brep), &notify_ref, reverse_map)?;
     // (not upstream) `copy_brep` records every geometry owner under `env.key_of`,
     // which is the Notify scheme's own identity: the copy is named as a fresh body
     copy.set_naming(crate::topology::NamingScheme::Notify);
@@ -4081,6 +4102,10 @@ pub(crate) fn with_nurb<'a>(k: &Kernel, s: &'a Surface) -> Result<Option<Cow<'a,
     }
     Ok(match s.kind() {
         SurfaceKind::BSpline(x) => Some(Cow::Borrowed(x)),
+        // (the fork's SmProceduralBlend: `new SmBSplineSurface(*pBSS)` slices it to its net)
+        SurfaceKind::ProceduralBlend(x) => Some(Cow::Borrowed(x.net())),
+        // (the fork's SmBallPatch is an SmBSplineSurface too: its net)
+        SurfaceKind::BallPatch(x) => Some(Cow::Borrowed(x.net())),
         SurfaceKind::Plane(x) => Some(x.base_for_query()),
         SurfaceKind::SurfOfExtrusion(x) => {
             if x.base().gw_nurb().is_some() {
@@ -4088,7 +4113,7 @@ pub(crate) fn with_nurb<'a>(k: &Kernel, s: &'a Surface) -> Result<Option<Cow<'a,
             } else {
                 let mut tmp = x.as_ref().clone();
                 match tmp.make_nurb(k) {
-                    Err(e) if e.is_unported() => return Err(e),
+                    Err(e) if e.is_unported_or_cancelled() => return Err(e),
                     Ok(()) | Err(_) => {}
                 }
                 Some(Cow::Owned(tmp.base().clone()))
@@ -4107,6 +4132,9 @@ fn as_bspline_surface(s: &Surface) -> Option<&BSplineSurface> {
         SurfaceKind::Cone(x) => Some(x.rev().base()),
         SurfaceKind::Torus(x) => Some(x.base().base()),
         SurfaceKind::Sphere(x) => Some(x.base().base()),
+        SurfaceKind::ProceduralBlend(x) => Some(x.net()),
+        // (the fork's SmBallPatch is an SmBSplineSurface too: its net)
+        SurfaceKind::BallPatch(x) => Some(x.net()),
         _ => None,
     }
 }
@@ -4209,7 +4237,7 @@ fn turn_to_nurbs_in(
                 OffsetParamType::ChordLength,
             ) {
                 Ok(x) => x,
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 // SE(SM_ERR_INVALID_INPUT); continue
                 Err(_) => continue,
             };
@@ -4225,7 +4253,7 @@ fn turn_to_nurbs_in(
             let srf_bbox =
                 match new_surface.calculate_bounding_box(k, &domain, [true, false, false], true) {
                     Ok(boxes) => boxes.normal_box.unwrap_or_else(Extent3d::new),
-                    Err(e) if e.is_unported() => return Err(e),
+                    Err(e) if e.is_unported_or_cancelled() => return Err(e),
                     // (fork 60a8a51 passes this status on: `SER`)
                     Err(e) if k.fixes.brep_edit_statuses_pass_on => return Err(e),
                     Err(_) => Extent3d::new(),
@@ -4235,21 +4263,16 @@ fn turn_to_nurbs_in(
                 size = 1.0;
             }
             let extend_distance = 0.02 * size;
-            let SurfaceKind::BSpline(new_bss) = new_surface.kind() else {
-                return Err(ner());
-            };
-            let ext = new_bss.create_extended_surface(k, extend_distance, ContinuityType::G1)?;
+            let ext = new_surface
+                .extended_sides(
+                    k,
+                    &crate::surface::side::BoxSide::ALL,
+                    crate::surface::extend::Continuity::Tangent,
+                    extend_distance,
+                )?
+                .surface;
             let face_ref = (env.key_of)(EntityRef::Face(f));
-            p2::replace_surface(
-                k,
-                b,
-                env,
-                f,
-                Surface::from(ext),
-                face_ref,
-                OldSurface::Delete,
-                true,
-            )?;
+            p2::replace_surface(k, b, env, f, ext, face_ref, OldSurface::Delete, true)?;
             continue;
         };
         if surface.type_code() == BSplineSurface::TYPE {
@@ -4297,7 +4320,7 @@ fn turn_to_nurbs_in(
                 false,
             ) {
                 Ok(l) => bsc = Some(l.curve),
-                Err(err) if err.is_unported() => return Err(err),
+                Err(err) if err.is_unported_or_cancelled() => return Err(err),
                 Err(_) => {}
             }
         }
@@ -4306,13 +4329,13 @@ fn turn_to_nurbs_in(
         if bsc.is_none() {
             let (knots, _) = match curve.knots(k, None) {
                 Ok(x) => x,
-                Err(err) if err.is_unported() => return Err(err),
+                Err(err) if err.is_unported_or_cancelled() => return Err(err),
                 Err(_) => (Vec::new(), Vec::new()),
             };
             let opts = crate::curve::curve::p1::ApproximateCurveOptions::default();
             match curve.approximate_curve(k, &knots, approx_tol, &opts) {
                 Ok(a) => bsc = Some(a.curve),
-                Err(err) if err.is_unported() => return Err(err),
+                Err(err) if err.is_unported_or_cancelled() => return Err(err),
                 Err(_) => {}
             }
         }
@@ -5235,7 +5258,7 @@ mod tests {
         let (mut ctx, _seen) = recording_context();
         let mut k = Kernel::default();
         let (mut b1, [a, _, _], [e0, _]) = test_support::wire_chain(true);
-        let mut b2 = b1.clone();
+        let mut b2 = b1.clone_standing_for_self().unwrap();
         let serial = notify_serial(&mut ctx, &mut b1).unwrap();
         // b2 claims b1's kernel identities, for itself and for its objects
         b2.set_key(topology_ref(serial, brep_entity()).key);
@@ -5271,8 +5294,8 @@ mod tests {
             squeeze_edge(&mut k, &mut b2, &mut env, e0, a),
             Err(RESERVED_KEY)
         );
-        // clones are other objects: no serial, no curve key
-        assert_eq!(b1.clone().notify_serial(), None);
+        // copies are other objects: no serial, no curve key
+        assert_eq!(b1.clone_standing_for_self().unwrap().notify_serial(), None);
         let curve = b1.edge(e0).unwrap().curve.clone().unwrap();
         assert_eq!(curve.notify_key(), None);
     }
@@ -5935,7 +5958,7 @@ mod tests {
         };
         let mut records = topo::NotifyRecords::new();
         let mut full = topo::NotifyRecords::new();
-        let mut copy = b.clone();
+        let mut copy = b.clone_standing_for_self().unwrap();
         b.remove_vertex_record(vs[0]).unwrap();
         b.remove_vertex_record(vs[1]).unwrap();
         edit_once(&mut b, &key_of, &mut records, &mut full).unwrap();

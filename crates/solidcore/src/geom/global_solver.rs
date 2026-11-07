@@ -453,6 +453,8 @@ pub fn resolve_object_zone_tol_3d<O>(
 pub struct GlobalSolver<'t, O> {
     /// Opt-in upstream corrections, copied from the operation's kernel.
     pub fixes: crate::kernel::UpstreamFixes,
+    /// Cooperative cancellation token copied from the operation's kernel.
+    pub cancel: Option<crate::kernel::CancelToken>,
     /// `m_eSolverOperation`: behaviour of the local solves.
     pub operation: SolverOperation,
     /// `m_eOperationCategory`: summary of [`GlobalSolver::operation`], set by
@@ -567,6 +569,7 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
     pub fn new() -> Self {
         Self {
             fixes: crate::kernel::UpstreamFixes::default(),
+            cancel: None,
             operation: SolverOperation::Intersect,
             category: OperationCategory::Other,
             projected_operation: false,
@@ -610,23 +613,28 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
         s
     }
 
-    /// [`GlobalSolver::new`] with [`GlobalSolver::fixes`] copied from `k`.
+    /// [`GlobalSolver::new`] with [`GlobalSolver::fixes`] and [`GlobalSolver::cancel`]
+    /// copied from `k`.
     #[must_use]
     pub fn new_with_kernel(k: &Kernel) -> Self {
         let mut s = Self::new();
         s.fixes = k.fixes;
+        s.cancel.clone_from(&k.cancel);
         s
     }
 
-    /// [`GlobalSolver::with_tree`] with [`GlobalSolver::fixes`] copied from `k`.
+    /// [`GlobalSolver::with_tree`] with [`GlobalSolver::fixes`] and
+    /// [`GlobalSolver::cancel`] copied from `k`.
     #[must_use]
     pub fn with_tree_and_kernel(k: &Kernel, tree: &'t Tree<O>, num_variables: usize) -> Self {
         let mut s = Self::with_tree(tree, num_variables);
         s.fixes = k.fixes;
+        s.cancel.clone_from(&k.cancel);
         s
     }
 
-    /// [`GlobalSolver::with_trees`] with [`GlobalSolver::fixes`] copied from `k`.
+    /// [`GlobalSolver::with_trees`] with [`GlobalSolver::fixes`] and
+    /// [`GlobalSolver::cancel`] copied from `k`.
     #[must_use]
     pub fn with_trees_and_kernel(
         k: &Kernel,
@@ -636,6 +644,7 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
     ) -> Self {
         let mut s = Self::with_trees(tree1, tree2, num_variables);
         s.fixes = k.fixes;
+        s.cancel.clone_from(&k.cancel);
         s
     }
 
@@ -752,7 +761,7 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
             .get(index)
             .copied()
             .flatten()
-            .ok_or(null_node("geom::global_solver::GlobalSolver::tree"))
+            .ok_or_else(|| null_node("geom::global_solver::GlobalSolver::tree"))
     }
 
     /// The node of `branch` in tree `index` (`apBranch[index]`).
@@ -763,7 +772,11 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
     /// tree does not hold.
     pub fn branch_node(&self, branch: &Branch, index: usize) -> Result<&'t TreeNode<O>> {
         const OP: &str = "geom::global_solver::GlobalSolver::branch_node";
-        let id = branch.get(index).copied().flatten().ok_or(null_node(OP))?;
+        let id = branch
+            .get(index)
+            .copied()
+            .flatten()
+            .ok_or_else(|| null_node(OP))?;
         self.tree(index)?.node(id)
     }
 
@@ -778,7 +791,7 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
         const OP: &str = "geom::global_solver::GlobalSolver::child";
         let node = self.branch_node(branch, index)?;
         let id = if second { node.child2 } else { node.child1 };
-        self.tree(index)?.node(id.ok_or(null_node(OP))?)
+        self.tree(index)?.node(id.ok_or_else(|| null_node(OP))?)
     }
 
     /// `SmGlobalSolver::BranchMayContainAnswers`: false when the node boxes of
@@ -1195,7 +1208,11 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
         // along the normal by both the min and max distances,
         // then we will catch any case that could 'intersect'.
         // But we have to sample the surface curve.
-        let node2 = branch.get(1).copied().flatten().ok_or(null_node(OP))?;
+        let node2 = branch
+            .get(1)
+            .copied()
+            .flatten()
+            .ok_or_else(|| null_node(OP))?;
         if self.tree(1)?.node_owner_object(node2)?.is_none() {
             return Ok(false);
         }
@@ -1233,12 +1250,12 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
             let t = ivl2.evaluate(frac);
             match cos.evaluate_point(k, t) {
                 Ok(p) => srf_pt = Some(p),
-                Err(e) if e.is_unported() || srf_pt.is_none() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() || srf_pt.is_none() => return Err(e),
                 Err(_) => {}
             }
             match cos.evaluate_surface_normal(k, t, false) {
                 Ok(eval) => norm = Some(eval.normal),
-                Err(e) if e.is_unported() || norm.is_none() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() || norm.is_none() => return Err(e),
                 Err(_) => {}
             }
             let (Some(pt), Some(n)) = (srf_pt, norm.as_mut()) else {
@@ -1755,6 +1772,11 @@ where
     // (not upstream) bound the work: see MAX_SOLVE_BRANCHES
     let s = solver.solver_mut();
     s.branches_visited += 1;
+    if (s.branches_visited & 31) == 1 {
+        if let Some(token) = &s.cancel {
+            token.check("geom::global_solver::solve_branch")?;
+        }
+    }
     if s.branches_visited > MAX_SOLVE_BRANCHES {
         return Err(SolidError::invalid_input(
             "geom::global_solver::solve_branch",
@@ -1932,7 +1954,7 @@ pub trait GlobalSolve<'t, O: SolutionObject + 't> {
         s.check_num_trees(OP)?;
         let mut start_branch: Branch = [None; MAX_SOLVER_TREES];
         for (i, slot) in start_branch.iter_mut().enumerate().take(s.num_trees) {
-            *slot = Some(s.tree(i)?.top_node().ok_or(null_node(OP))?);
+            *slot = Some(s.tree(i)?.top_node().ok_or_else(|| null_node(OP))?);
         }
 
         // bound the SolveBranch recursion (not upstream: see MAX_SOLVE_DEPTH)

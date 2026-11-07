@@ -25,6 +25,8 @@
 //! | [`NoSurfaceHandle`]                                      | (none: the handle type of an intersector without caches) |
 //!
 //! Deviations:
+//! - **Singular directions (#2695).** `sm_AddSingDir` merges only directions that are the same
+//!   one, not upstream's `0.9`, which took branches closer than 25.8 degrees for one.
 //! - **Dupin bottom axis (WR-69).** `Kernel::fixes.dupin_bottom_hyperbola_axis`
 //!   uses `1/sqrt(abs(k1))` for the bottom hyperbola's second axis, matching its
 //!   conjugate top branch. Off by default for pinned C++ parity.
@@ -243,11 +245,21 @@ pub struct AdvSurfaceIntersector<'s, 't, O> {
     pub(crate) tangent_curve_seeds: Vec<[Point2; 2]>,
 }
 
-/// `sm_AddSingDir`: appends `sing_vec` to `dirs[..count]` unless a stored direction
-/// is within `acos(0.9)` of it.
+/// Above this dot product two unit singular directions are one: a double root of the
+/// indicatrices' intersection, a tangent curve's direction, reported twice. Rounding splits a
+/// double root by atan(sqrt(e / l)) each way, for the difference of the curvatures' error `e`
+/// and its other eigenvalue `l`, so this 0.08 degrees reads `e / l` under 5e-7 as one direction.
+const SAME_SING_DIR_DOT: f64 = 1.0 - 1.0e-6;
+
+/// `sm_AddSingDir`: appends `sing_vec` to `dirs[..count]` unless a stored direction is
+/// the same one ([`SAME_SING_DIR_DOT`]). Upstream's `0.9` took two branches closer than
+/// 25.8 degrees for one, and so a branch point for a tangent curve (#2695).
 fn add_sing_dir(sing_vec: Vec3, count: &mut usize, dirs: &mut [Vec3; MAX_SING_DIRS]) -> Result<()> {
     // see if crSingVec is already in aSingDirections array
-    let found = dirs.iter().take(*count).any(|d| d.dot(sing_vec) > 0.9);
+    let found = dirs
+        .iter()
+        .take(*count)
+        .any(|d| d.dot(sing_vec) > SAME_SING_DIR_DOT);
 
     // when crSingVec is not in aSingDirections - add it
     if !found {
@@ -341,7 +353,7 @@ impl<'s, 't, O: SolutionObject + 't> AdvSurfaceIntersector<'s, 't, O> {
         base.advanced = true;
 
         // global solver members, as SmSurfaceIntersector's constructor sets them
-        let mut solver = GlobalSolver::new();
+        let mut solver = GlobalSolver::new_with_kernel(k);
         solver.operation = SolverOperation::Intersect;
         solver.projected_operation = false;
         solver.solution_requested = SolutionRequested::Nodes;
@@ -391,7 +403,7 @@ impl<'s, 't, O: SolutionObject + 't> AdvSurfaceIntersector<'s, 't, O> {
                 .get_mut(i)
                 .ok_or(SolidError::null_pointer(OP_SET_CACHES))?;
             c.get_tree(k).map_err(|e| {
-                if e.is_unported() {
+                if e.is_unported_or_cancelled() {
                     e
                 } else {
                     SolidError::null_pointer(OP_SET_CACHES)
@@ -734,7 +746,7 @@ impl<'s, 't, O: SolutionObject + 't> AdvSurfaceIntersector<'s, 't, O> {
             let start_tsp = self.base.alloc_point(TsectPnt::zeroed());
             self.base.curve_trace_direction = 1.0;
             match compute_point_values(k, &mut self.base, uv_pts, start_tsp) {
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => continue,
                 Ok(()) => {}
             }
@@ -932,6 +944,12 @@ impl<'s, 't, O: SolutionObject + 't> AdvSurfaceIntersector<'s, 't, O> {
 
     /// The body of [`GlobalSolve::solve_branch`] (`SolveBranch`).
     fn solve_branch_at_depth(&mut self, k: &Kernel, branch: &Branch) -> Result<()> {
+        if self.solver.operation == SolverOperation::Intersect {
+            self.solver.branches_visited += 1;
+            if (self.solver.branches_visited & 31) == 1 {
+                k.check_cancelled(OP_SOLVE)?;
+            }
+        }
         self.separate_gauss_maps = true;
 
         if !self.branch_may_contain_answers(branch)? {
@@ -2186,5 +2204,17 @@ mod tests {
         }
         assert_eq!(n, 8);
         assert!(add_sing_dir(Vec3::new(0.0, 0.0, 1.0), &mut n, &mut dirs).is_err());
+    }
+
+    /// Two rounds of radius 2 touching at a knife edge's top (#2695) cross in branches
+    /// 2 atan(1 / sqrt(21)) = 24.6 degrees apart: two directions, not one.
+    #[test]
+    fn add_sing_dir_keeps_close_branches() {
+        let mut dirs = [Vec3::UNDEF; MAX_SING_DIRS];
+        let mut n = 0;
+        let a = (1.0_f64 / 21.0_f64.sqrt()).atan();
+        add_sing_dir(Vec3::new(a.cos(), a.sin(), 0.0), &mut n, &mut dirs).unwrap();
+        add_sing_dir(Vec3::new(a.cos(), -a.sin(), 0.0), &mut n, &mut dirs).unwrap();
+        assert_eq!(n, 2);
     }
 }

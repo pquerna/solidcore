@@ -38,9 +38,12 @@
 //! | [`Plane::is_kind_of`], [`Plane::TYPE`], [`Plane::type_string`], [`Plane::class_string`] | `IsKindOf`, `GetType`, `GetTypeString`, `GetClassString` (`SM_COMMON`) |
 //! | [`Plane::base`], [`Plane::base_with_nurb`], [`Plane::natural_uv_domain`] | the `SmBSplineSurface` part, `GetOrCreateGwNurbPointer`, `GetNaturalUVDomain` (inherited) |
 //! | [`Plane::max_analytic_domain`], [`Plane::is_parallel_to_vector`], [`Plane::is_parallel_to_vector_opt_in`], [`Plane::is_parallel_to_vector_with_kernel`], [`Plane::reverse`], [`Plane::swap_uv`] | `SmBSplineSurface::GetMaxAnalyticDomain`, `IsParallelToVector`, `Reverse`, `SwapUV` (inherited, re-dispatched) |
-//! | [`Plane::create_extended_surface`], [`Plane::create_extended_surface_dir`] | `SmBSplineSurface::CreateExtendedSurface` (both overloads; inherited, re-dispatched to the `IsSingularity` / `IsClosed` overrides) |
 //!
 //! Deviations:
+//! - **`SwapUV` keeps the plane's definition (WR-701, opt-in).** With
+//!   `Kernel::fixes.swap_uv_keeps_analytic_definition` the swap keeps the axes, domain
+//!   and scales [`Plane::toggle_swap_uv_bit`] swapped (`SmPlane::SwapUVDefinition`, the
+//!   fork's tangency-labs/smlib@0c00de7) instead of rebuilding them from the net.
 //! - **Derived class.** `SmPlane` derives from `SmBSplineSurface`; a [`Plane`] holds
 //!   its B-spline part ([`Plane::base`]) next to the analytic data, and is the
 //!   [`SurfaceKind::Plane`] kind of [`Surface`]. Inherited methods whose upstream
@@ -223,6 +226,24 @@ impl Plane {
             base: BSplineSurface::new(),
             position,
             anal_uv_domain: *uv_domain,
+            uv_scale,
+        }
+    }
+
+    /// The plane of a placement, scales and domain as stored, on the NURB `form` (not
+    /// made from them): a plane read back from data it was written to, its form checked
+    /// against it by the caller ([`crate::surface::implicit::AnalyticSupport::build`]).
+    #[must_use]
+    pub(crate) fn from_stored(
+        position: Axis2Placement,
+        uv_scale: Vec2,
+        uv_domain: Extent2d,
+        form: BSplineSurface,
+    ) -> Self {
+        Self {
+            base: form,
+            position,
+            anal_uv_domain: uv_domain,
             uv_scale,
         }
     }
@@ -524,46 +545,6 @@ impl Plane {
     #[must_use]
     pub const fn is_singularity_with_poles(&self) -> (bool, SurfParamType) {
         (false, SurfParamType::Neither)
-    }
-
-    /// `SmBSplineSurface::CreateExtendedSurface(dDist, ..)` (inherited): the plane's
-    /// NURB extended by `dist` across each side, through the `SmPlane` overrides of
-    /// `IsSingularity` and `IsClosed` (none, never closed).
-    ///
-    /// # Errors
-    ///
-    /// Those of [`Plane::create_extended_surface_dir`].
-    pub fn create_extended_surface(
-        &self,
-        dist: f64,
-        extension_continuity: ContinuityType,
-    ) -> Result<BSplineSurface> {
-        // pass the call along
-        self.create_extended_surface_dir(SurfParamType::Both, dist, extension_continuity)
-    }
-
-    /// `SmBSplineSurface::CreateExtendedSurface(eExtDirection, dDist, ..)` (inherited):
-    /// [`BSplineSurface::create_extended_surface_dir`] of the plane's NURB, with the
-    /// virtual `IsSingularity` and `IsClosed` dispatched to the `SmPlane` overrides
-    /// ([`Plane::is_singularity`], [`Plane::is_closed`]) as upstream.
-    ///
-    /// # Errors
-    ///
-    /// `SM_ERR` when no NURB can be made (upstream copies a `NULL` NURB) and the
-    /// errors of the extension.
-    pub fn create_extended_surface_dir(
-        &self,
-        ext_direction: SurfParamType,
-        dist: f64,
-        extension_continuity: ContinuityType,
-    ) -> Result<BSplineSurface> {
-        self.base_for_query().create_extended_surface_dispatched(
-            ext_direction,
-            dist,
-            extension_continuity,
-            &|_| Ok(self.is_singularity()),
-            &|_, _| Ok(self.is_closed().0),
-        )
     }
 
     /// `SmBSplineSurface::GetMaxAnalyticDomain` (inherited): planar, so the natural
@@ -1014,6 +995,22 @@ impl Plane {
         &mut self,
         notify: &mut crate::nurbs::b_spline_surface::p2::EditNotify<'_>,
     ) -> Result<()> {
+        self.swap_uv_notifying_keeping(notify, false)
+    }
+
+    /// [`Plane::swap_uv_notifying`]; with `keep_definition` (not upstream, WR-701, the
+    /// fork's tangency-labs/smlib@0c00de7, `SmPlane::SwapUVDefinition`) the definition
+    /// [`Plane::toggle_swap_uv_bit`] has swapped (axes, domain, scales) is kept, not
+    /// rebuilt from the transposed net.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Plane::swap_uv`].
+    pub(crate) fn swap_uv_notifying_keeping(
+        &mut self,
+        notify: &mut crate::nurbs::b_spline_surface::p2::EditNotify<'_>,
+        keep_definition: bool,
+    ) -> Result<()> {
         // get current surface description
         self.ensure_nurb();
         let c = self.base.canonical()?;
@@ -1048,6 +1045,9 @@ impl Plane {
         if let Err(e) = status {
             self.toggle_swap_uv_bit();
             return Err(e);
+        }
+        if keep_definition {
+            return Ok(());
         }
         self.rebuild_step_from_nurb_parameters()
     }
@@ -1334,7 +1334,7 @@ impl Plane {
                 // the interval is [tStart - 1, tEnd + 1], or the caller's interval
                 let sub_interval = line_interval
                     .copied()
-                    .unwrap_or(Extent1d::from_min_max(t_start - 1.0, t_end + 1.0));
+                    .unwrap_or_else(|| Extent1d::from_min_max(t_start - 1.0, t_end + 1.0));
                 // try global surface/curve solver (SmSurface::GlobalLineIntersect: the
                 // solutions name `surface`)
                 return base(&sub_interval);
@@ -2255,7 +2255,7 @@ impl Plane {
                     &CurveIntersectOptions::<NoObject>::default(),
                 ) {
                     Ok(s) => s,
-                    Err(e) if e.is_unported() => return Err(e),
+                    Err(e) if e.is_unported_or_cancelled() => return Err(e),
                     Err(_) => continue,
                 };
                 if sols.is_empty() {
@@ -2722,25 +2722,6 @@ mod tests {
         assert!(p
             .evaluate(uv, MAX_DERIVATIVE, MAX_DERIVATIVE, false)
             .is_ok());
-    }
-
-    #[test]
-    fn extension_uses_plane_overrides() {
-        // the B-spline IsSingularity / IsClosed are unported; the plane's are not
-        let p = Plane::new(
-            Point3::ZERO,
-            Vec3::new(1.0, 0.0, 0.0),
-            Vec3::new(0.0, 1.0, 0.0),
-            Vec2::new(1.0, 1.0),
-            &Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
-        );
-        let e = p.create_extended_surface(0.5, ContinuityType::G1).unwrap();
-        let d = e.natural_uv_domain();
-        assert!(d.max().x - d.min().x > 1.0);
-        let e = p
-            .create_extended_surface_dir(SurfParamType::UMax, 0.5, ContinuityType::G1)
-            .unwrap();
-        assert!(e.gw_nurb().is_some());
     }
 
     #[test]

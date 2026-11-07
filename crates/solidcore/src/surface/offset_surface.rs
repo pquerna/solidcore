@@ -10,7 +10,6 @@
 //! | [`OffsetSurface`], [`OffsetSurface::new`]             | `SmOffsetSurface`, `SmOffsetSurface(d, rSurface, bOwnsSurface, lSingularities)`, `~SmOffsetSurface` (`Drop`) |
 //! | [`OffsetSurface::copy`]                               | `Copy`                                           |
 //! | [`OffsetSurface::approx_eq`]                          | `operator==`                                     |
-//! | [`OffsetSurface::create_extended_surface`], [`OffsetSurface::create_extended_surface_dir`] | `CreateExtendedSurface` (both) |
 //! | [`OffsetSurface::calculate_bounding_box`]             | `CalculateBoundingBox`                           |
 //! | `extend_surface` (private)                            | `sm_ExtendSurface` (static)                      |
 //! | `extend_as_itself` (private)                          | the fork's `sm_ExtendAsItself` (static; WR-633, WR-650) |
@@ -56,7 +55,7 @@
 //! - **Context.** Every surface has a context here, so the clamp-instead-of-extend
 //!   branch for `GetContext() == NULL` is never taken; `SetContext` has nothing to set.
 //!   The constructor and every member that constructs an offset ([`OffsetSurface::copy`],
-//!   [`OffsetSurface::split_at`], [`OffsetSurface::create_extended_surface_dir`],
+//!   [`OffsetSurface::split_at`],
 //!   [`OffsetSurface::create_offset_surface`], [`OffsetSurface::read_from_db`]) take the
 //!   kernel for the base's `GetSingularities`.
 //! - **Extension cache.** Upstream's `const` evaluators (`EvaluatePoint`, `Evaluate`,
@@ -118,7 +117,6 @@ use crate::geom::axis2_placement::Axis2Placement;
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::{Extent2d, SS_UMAX, SS_UMIN, SS_VMAX, SS_VMIN};
 use crate::geom::extent3d::Extent3d;
-use crate::geom::geom_utility::p2::ContinuityType;
 use crate::geom::object::ObjectRef;
 use crate::geom::polar_box::{PolarBox, PolarBoxState};
 use crate::geom::pseudo_box::PseudoBox;
@@ -367,6 +365,8 @@ fn is_b_spline_kind(surface: &Surface) -> bool {
             | SurfaceKind::Cone(_)
             | SurfaceKind::Sphere(_)
             | SurfaceKind::Torus(_)
+            | SurfaceKind::ProceduralBlend(_)
+            | SurfaceKind::BallPatch(_)
     )
 }
 
@@ -773,52 +773,6 @@ impl OffsetSurface {
     }
 
     // ---- new surfaces ---------------------------------------------------------------------
-
-    /// An offset of the base surface extended by `dist` on every side
-    /// (`CreateExtendedSurface(ctx, dist, continuity, ..)`: the directional overload
-    /// with `SM_SP_BOTH`).
-    ///
-    /// # Errors
-    ///
-    /// Those of [`OffsetSurface::create_extended_surface_dir`].
-    pub fn create_extended_surface(
-        &self,
-        k: &Kernel,
-        dist: f64,
-        extension_continuity: ContinuityType,
-    ) -> Result<Surface> {
-        // pass the call along
-        self.create_extended_surface_dir(k, SurfParamType::Both, dist, extension_continuity)
-    }
-
-    /// An offset (same distance, owning, default singularities) of the base surface
-    /// extended by `dist` in `ext_direction` (`CreateExtendedSurface` with a direction).
-    ///
-    /// # Errors
-    ///
-    /// Those of the base surface's [`Surface::create_extended_surface_dir`] and of
-    /// [`OffsetSurface::new`].
-    pub fn create_extended_surface_dir(
-        &self,
-        k: &Kernel,
-        ext_direction: SurfParamType,
-        dist: f64,
-        extension_continuity: ContinuityType,
-    ) -> Result<Surface> {
-        let surface = self.surface.create_extended_surface_dir(
-            k,
-            ext_direction,
-            dist,
-            extension_continuity,
-        )?;
-        Ok(Surface::from(Self::new(
-            k,
-            self.offset_distance.get(),
-            surface,
-            true,
-            SS_UNKNOWN,
-        )?))
-    }
 
     /// The fork's `SmOffsetSurface::ContinuesAsItself` (tangency-labs/smlib@db4a655):
     /// whether `surface` continues as itself past its domain ([`Self::continue_as_itself`]):
@@ -1873,7 +1827,7 @@ impl OffsetSurface {
         let mut result = base;
         let retry = match &result {
             Ok((_, location)) => *location == LocationType::Exterior,
-            Err(e) if e.is_unported() => return result,
+            Err(e) if e.is_unported_or_cancelled() => return result,
             Err(_) => true,
         };
         if retry {
@@ -2238,6 +2192,10 @@ fn nurb_of(k: &Kernel, surface: &Surface) -> Result<crate::nurbs::srf_basic::Sur
         SurfaceKind::Cone(s) => s.rev().base().gw_nurb().cloned().ok_or_else(missing),
         SurfaceKind::Sphere(s) => s.base().base().gw_nurb().cloned().ok_or_else(missing),
         SurfaceKind::Torus(s) => s.base().base().gw_nurb().cloned().ok_or_else(missing),
+        // (the fork's SmProceduralBlend: its net's NURB)
+        SurfaceKind::ProceduralBlend(pb) => pb.net().gw_nurb().cloned().ok_or_else(missing),
+        // (the fork's SmBallPatch is an SmBSplineSurface too: its net)
+        SurfaceKind::BallPatch(pb) => pb.net().gw_nurb().cloned().ok_or_else(missing),
         _ => Err(missing()),
     }
 }
@@ -2247,7 +2205,7 @@ fn extend_toward(k: &Kernel, surface: &Surface, uv: Point2) -> Result<Surface> {
     let sur = nurb_of(k, surface)?;
     let mut esur: Option<UnboundedExtension> = None;
     match eval_pt_derivs_unbounded(&sur, uv.x, uv.y, 0, ExtendContinuity::G1R, &mut esur) {
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => return Err(SolidError::sm_err(OP_EXTEND)),
         Ok(_) => {}
     }
@@ -2402,7 +2360,7 @@ fn revolution_of<'a>(
 /// Whether `sm_ExtendSurface` extends `surface` as itself (`extend_as_itself`, its
 /// `bAsItself`): a cylinder, cone, sphere or torus, or (the fork's tangency-labs/smlib@43fd6b6) a surface of revolution whose
 /// generator is an arc of one circle. A NURB that cannot be made is not one.
-fn extends_as_itself(k: &Kernel, surface: &Surface) -> bool {
+pub(crate) fn extends_as_itself(k: &Kernel, surface: &Surface) -> bool {
     match surface.kind() {
         SurfaceKind::Cone(_) | SurfaceKind::Sphere(_) | SurfaceKind::Torus(_) => true,
         SurfaceKind::SurfOfRevolution(_) => match surface.kind_with_nurb(k) {
@@ -3182,13 +3140,13 @@ fn extend_surface(
     let mut esur: Option<UnboundedExtension> = None;
     let first = eval_pt_derivs_unbounded(&sur, s_uv.x, s_uv.y, 0, ExtendContinuity::G1R, &mut esur);
     if let Err(e) = first {
-        if e.is_unported() {
+        if e.is_unported_or_cancelled() {
             return Err(e);
         }
         let second =
             eval_pt_derivs_unbounded(&sur, uv.x, uv.y, 0, ExtendContinuity::G1R, &mut esur);
         match second {
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             Err(_) => return Err(SolidError::sm_err(OP_EXTEND)),
             Ok(_) => {}
         }

@@ -43,8 +43,13 @@
 //!   [`SolidError::Unported`] is always passed on. Ignored evaluations leave
 //!   default-constructed `SmVector3d`s ([`Vec3::UNDEF`]), as upstream.
 //!   With the opt-in `Kernel::fixes.query_statuses_pass_on` (WR-663) `TrimGap` returns
-//!   `false` (gap not fixed) at the first of those that fails, as the fork
-//!   (tangency-labs/smlib 8843967).
+//!   `false` (gap not fixed) at the first of those that fails, `HasInternalPole` returns
+//!   `false` when its knots cannot be read, and `AssertValid` fails tests 5/6 when a
+//!   derivative at an interior knot of multiplicity `p` cannot be evaluated (`value`
+//!   `SM_UNDEF_DOUBLE`), fails tests 11/12 or 13/14 (`value` `SM_UNDEF_DOUBLE`) when the
+//!   bounding box or `GlobalPropertyAnalysis` fails, and fails tests 11/12 (`value`
+//!   `SM_UNDEF_DOUBLE`) when a derivative at a first-derivative solution cannot be
+//!   evaluated, as the fork (tangency-labs/smlib 8843967).
 //! - **Crashes.** Where upstream dereferences a `NULL` (a curve without NURB in
 //!   `GetControlPoint` / `IsSegmentLine`, an extension `TrimGap` did not make, an
 //!   unclamped knot vector indexing before the control points in `HasInternalPole`)
@@ -60,7 +65,8 @@
 //!   a report that was added, and report equality ignores those fields). `WARN`
 //!   messages are not ported.
 //!   Opt-in (WR-668, `Kernel::fixes.curve_check_zero_speed_tangent_end`, the fork's
-//!   tangency-labs/smlib ecf1963): at a zero-speed tangent end of an edge's curve or
+//!   tangency-labs/smlib ecf1963, replayed patch for patch as 6ca3405 in
+//!   tangency-labs/smlib#76): at a zero-speed tangent end of an edge's curve or
 //!   trim, test 3 passes over the coincident first control points and tests 13/14
 //!   pass over a radius below the tolerance within the end's growth stretch. The fork
 //!   reads the curve's edge (`GetEdge`, `GetEdgeuse()->GetEdge()`); a Rust curve has
@@ -87,7 +93,7 @@
 //!   base `FALSE` / `TRUE`.
 
 use crate::curve::curve::p2::{Curve, CurvePropertyType};
-use crate::curve::curve::p7::PropertyAnalysisOptions;
+use crate::curve::curve::p7::{PropertyAnalysis, PropertyAnalysisOptions};
 use crate::curve::curve::p8::CurveIntersectOptions;
 use crate::error::{ignore_or_pass_on, ignored, Result, SolidError};
 use crate::geom::assert_array::{labels, AssertArray, AssertReport, ObjectKey, ReportSpec};
@@ -107,6 +113,7 @@ use crate::geom::vector2d::Point2;
 use crate::geom::vector3d::{Point3, Vec3};
 use crate::kernel::Kernel;
 use crate::math::{max2, max3, min2, BIG_DOUBLE, EFF_ZERO, EFF_ZERO_SQRT, PI, UNDEF_DOUBLE};
+use crate::nurbs::b_spline_curve::analysis::{analysis_key, curve_bounds, BOUND_MARGIN};
 use crate::nurbs::b_spline_curve::p1::BSplineCurve;
 use crate::nurbs::b_spline_curve::p2::{BoundingBoxRequest, ControlPointForm};
 use crate::nurbs::b_spline_curve_n_lib::TrimMode;
@@ -249,26 +256,89 @@ impl SolutionObject for SelfCurve {
 }
 
 /// `SmCurve::GlobalPropertyAnalysis` of `curve` over `domain` (no extra arguments) with
-/// minimum separation `min_sep`: the solutions' start ends. The status is ignored
-/// upstream: a failed analysis gives no solutions here (upstream keeps those found
-/// before the failure); [`SolidError::Unported`] is passed on.
+/// minimum separation `min_sep`: whether the call returned `SM_SUCCESS` and the
+/// solutions' start ends (including any partial solutions found before a failure, as
+/// upstream's `rSolutionArray`); [`SolidError::Unported`] and
+/// [`SolidError::Cancelled`] are passed on.
+///
+/// Not upstream (#2568): with `Kernel::memoize_curve_caches`, the result is kept in the
+/// kernel's [`AnalysisMemo`](crate::nurbs::b_spline_curve::analysis::AnalysisMemo) by the
+/// exact content of its inputs (the curve, the interval, the property, the separation,
+/// the kernel's tolerances and fixes), and a curve analysed before gets its result again.
 fn global_property_analysis(
     k: &Kernel,
     curve: &BSplineCurve,
     domain: &Extent1d,
     property: CurveProperty,
     min_sep: f64,
-) -> Result<Vec<SolutionEnd>> {
+) -> Result<(bool, Vec<SolutionEnd>)> {
+    let key = if k.memoize_curve_caches {
+        analysis_key(
+            curve,
+            domain.min(),
+            domain.max(),
+            property as u64,
+            min_sep,
+            &analysis_settings(k),
+        )
+    } else {
+        None
+    };
+    if let Some(key) = &key {
+        if let Some(hit) = k
+            .caches
+            .curve_analysis
+            .try_borrow()
+            .ok()
+            .and_then(|memo| memo.get(key))
+        {
+            return Ok(hit);
+        }
+    }
+    let result = global_property_analysis_run(k, curve, domain, property, min_sep)?;
+    if let (Some(key), Ok(mut memo)) = (key, k.caches.curve_analysis.try_borrow_mut()) {
+        memo.insert(key, result.clone());
+    }
+    Ok(result)
+}
+
+/// The kernel settings an analysis depends on, for [`analysis_key`]: its tolerances (by
+/// their debug text, which writes each double so that it reads back exactly) and its
+/// fixes.
+fn analysis_settings(k: &Kernel) -> Vec<u64> {
+    let mut settings: Vec<u64> = format!("{:?}", k.tolerances)
+        .bytes()
+        .map(u64::from)
+        .collect();
+    settings.push(u64::MAX);
+    settings.extend(k.fixes.flags().map(|(_, on)| u64::from(on)));
+    settings
+}
+
+/// [`global_property_analysis`] without the memo.
+fn global_property_analysis_run(
+    k: &Kernel,
+    curve: &BSplineCurve,
+    domain: &Extent1d,
+    property: CurveProperty,
+    min_sep: f64,
+) -> Result<(bool, Vec<SolutionEnd>)> {
     let property = match property {
         CurveProperty::MinimizeFirstDerivative => CurvePropertyType::MinimizeFirstDerivative,
         CurveProperty::MinimizeRadiusOfCurvature => CurvePropertyType::MinimizeRadiusOfCurvature,
     };
     let crv = Curve::from(curve.clone());
     let opts: PropertyAnalysisOptions<'_, SelfCurve> = PropertyAnalysisOptions::default();
-    let found = ignored(crv.global_property_analysis(k, domain, property, min_sep, &opts))?;
-    Ok(found.map_or_else(Vec::new, |r| {
-        r.solutions.as_slice().iter().map(|s| s.start).collect()
-    }))
+    let mut out = PropertyAnalysis {
+        solutions: crate::geom::solution_array::SolutionArray::new(),
+        comb_points: Vec::new(),
+        comb_vecs: Vec::new(),
+    };
+    let ok =
+        ignored(crv.global_property_analysis_into(k, domain, property, min_sep, &opts, &mut out))?
+            .is_some();
+    let sols = out.solutions.as_slice().iter().map(|s| s.start).collect();
+    Ok((ok, sols))
 }
 
 /// `SmCurve::AssertValid(pAList, eTestLevel, SM_NO_WALK, pTestRequests)` of `curve`
@@ -367,15 +437,18 @@ fn is_zero_speed_tangent_end(
         return Ok(false);
     }
 
-    // the second derivative there
+    // the second derivative there (`sPV[2].Length() <= dScaledZero` refuses the end, so
+    // a NaN length does not)
     let ivl = curve.natural_interval();
     let param = if end == 0 { ivl.min() } else { ivl.max() };
     match curve.evaluate(param, 2, end == 0, false) {
-        Ok(pv) => match pv.get(2) {
-            Some(d2) if d2.length() > scaled_zero => {}
-            _ => return Ok(false),
+        Ok(pv) => match pv.get(2).map(|d2| d2.length().partial_cmp(&scaled_zero)) {
+            Some(Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)) | None => {
+                return Ok(false)
+            }
+            Some(_) => {}
         },
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => return Ok(false),
     }
 
@@ -420,7 +493,7 @@ fn zero_speed_radius_stretch(
     let param = if end == 0 { ivl.min() } else { ivl.max() };
     let pv = match curve.evaluate(param, 3, end == 0, false) {
         Ok(pv) => pv,
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => return Ok(None),
     };
     let (Some(&d2), Some(&d3)) = (pv.get(2), pv.get(3)) else {
@@ -443,7 +516,7 @@ fn zero_speed_radius_stretch(
     };
     let at = match curve.evaluate(at_param, 2, true, false) {
         Ok(at) => at,
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => return Ok(None),
     };
     let (Some(&a1), Some(&a2)) = (at.get(1), at.get(2)) else {
@@ -473,7 +546,7 @@ fn first_fundamental_form(
 ) -> Result<Option<[f64; 3]>> {
     match surface.evaluate_1st_derivatives(k, uv, u_from_left, v_from_left) {
         Ok((_, du, dv)) => Ok(Some([du.dot(du), du.dot(dv), dv.dot(dv)])),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Ok(None),
     }
 }
@@ -510,13 +583,13 @@ fn trim_metric(
     };
     let mut form = match trim.evaluate_point(domain.evaluate(0.5)) {
         Ok(mid) => form_at(Point2::new(mid.x, mid.y))?,
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => None,
     };
     if form.is_none() {
         let centre = match surface.natural_uv_domain_with_nurb(k) {
             Ok(d) => Some(d.evaluate(0.5, 0.5)),
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             Err(_) => None,
         };
         if let Some(centre) = centre {
@@ -701,7 +774,14 @@ impl BSplineCurve {
         }
 
         let degree = cur.degree();
-        let (unique_knots, mults) = self.knots(None)?;
+        let (unique_knots, mults) = if k.fixes.query_statuses_pass_on {
+            let Some(km) = ignored(self.knots(None))? else {
+                return Ok(false);
+            };
+            km
+        } else {
+            self.knots(None)?
+        };
         let mut knot_count = 0usize;
 
         // pick tolerance
@@ -1041,7 +1121,7 @@ impl BSplineCurve {
         *other = other_back;
         let composite = match composite {
             Ok(c) => c,
-            Err(e @ SolidError::Unported { .. }) => return Err(e),
+            Err(e @ (SolidError::Unported { .. } | SolidError::Cancelled { .. })) => return Err(e),
             Err(_) => return Err(SolidError::sm_err(OP_JOIN)),
         };
         self.set_from_gw_nurb(composite.gw_nurb())
@@ -1523,7 +1603,6 @@ impl BSplineCurve {
         // for debug - data at failing tests
         let mut min_radius = BIG_DOUBLE;
         let dim = self.dim;
-        let undef2 = || vec![Vec3::UNDEF; 2];
         if !degenerate && !analytic {
             // for non degenerate curves
             let mut idx = 1usize;
@@ -1536,12 +1615,19 @@ impl BSplineCurve {
                     continue;
                 }
 
-                // Lower interval evaluation (status ignored)
+                // Lower interval evaluation (status ignored upstream; fails test 5/6
+                // with `query_statuses_pass_on`, tangency-labs/smlib 8843967)
                 let param = knots.get(i).copied().unwrap_or(UNDEF_DOUBLE);
-                let v1 = ignored(self.evaluate(param, 1, false, false))?.unwrap_or_else(undef2);
-                let v1_dir = v1.get(1).copied().unwrap_or(Vec3::UNDEF);
-                let unit1 = v1_dir.unitize();
-                let Ok(u1) = unit1 else {
+                let eval1 = ignored(self.evaluate(param, 1, false, false))?;
+                let (v1_len, unit1) = match eval1 {
+                    Some(v) => {
+                        let dir = v.get(1).copied().unwrap_or(Vec3::UNDEF);
+                        (dir.length(), dir.unitize().ok())
+                    }
+                    None if k.fixes.query_statuses_pass_on => (UNDEF_DOUBLE, None),
+                    None => (Vec3::UNDEF.length(), Vec3::UNDEF.unitize().ok()),
+                };
+                let Some(u1) = unit1 else {
                     let test = if dim == 2 {
                         Some(5)
                     } else if dim == 3 {
@@ -1552,7 +1638,7 @@ impl BSplineCurve {
                     if let Some(t) = test {
                         rtn &= report(&mut list, key, t, false, EFF_ZERO, UNDEF_DOUBLE, |r| {
                             r.set_owner_param(Point2::new(param, 0.0));
-                            r.set_value(v1_dir.length());
+                            r.set_value(v1_len);
                         })?;
                     }
                     // skip further checks - only need to report the 1st problem
@@ -1560,9 +1646,16 @@ impl BSplineCurve {
                 };
 
                 // upper interval eval
-                let v2 = ignored(self.evaluate(param, 1, true, false))?.unwrap_or_else(undef2);
-                let v2_dir = v2.get(1).copied().unwrap_or(Vec3::UNDEF);
-                let Ok(u2) = v2_dir.unitize() else {
+                let eval2 = ignored(self.evaluate(param, 1, true, false))?;
+                let (v2_len, unit2) = match eval2 {
+                    Some(v) => {
+                        let dir = v.get(1).copied().unwrap_or(Vec3::UNDEF);
+                        (dir.length(), dir.unitize().ok())
+                    }
+                    None if k.fixes.query_statuses_pass_on => (UNDEF_DOUBLE, None),
+                    None => (Vec3::UNDEF.length(), Vec3::UNDEF.unitize().ok()),
+                };
+                let Some(u2) = unit2 else {
                     let test = if dim == 2 {
                         Some(5)
                     } else if dim == 3 {
@@ -1573,7 +1666,7 @@ impl BSplineCurve {
                     if let Some(t) = test {
                         report(&mut list, key, t, false, EFF_ZERO, UNDEF_DOUBLE, |r| {
                             r.set_owner_param(Point2::new(param, 0.0));
-                            r.set_value(v2_dir.length());
+                            r.set_value(v2_len);
                         })?;
                     }
                     rtn = false;
@@ -1609,9 +1702,11 @@ impl BSplineCurve {
             // Check for nonregular curve: vanishing first derivative. Allow zero 1st
             // derivatives at the NaturalParameter ends of the curve.
 
-            // Get a representive size (status ignored)
+            // Get a representive size (status ignored upstream; with
+            // `query_statuses_pass_on`, an unsized curve fails test 11/12 and skips
+            // the derivative and radius analyses, tangency-labs/smlib 8843967)
             let domain = self.natural_interval();
-            let bbox = ignored(self.calculate_bounding_box(
+            let bbox_opt = ignored(self.calculate_bounding_box(
                 &domain,
                 BoundingBoxRequest {
                     normal: true,
@@ -1619,9 +1714,22 @@ impl BSplineCurve {
                     polar: false,
                 },
             ))?
-            .and_then(|b| b.normal)
-            .unwrap_or_default();
-            let size_xyz = bbox.size().length();
+            .and_then(|b| b.normal);
+            let (sized, size_xyz) = if k.fixes.query_statuses_pass_on {
+                let ok = bbox_opt.is_some();
+                rtn &= report(
+                    &mut list,
+                    key,
+                    if dim == 2 { 11 } else { 12 },
+                    ok,
+                    UNDEF_DOUBLE,
+                    UNDEF_DOUBLE,
+                    |_| {},
+                )?;
+                (ok, bbox_opt.map_or(0.0, |b| b.size().length()))
+            } else {
+                (true, bbox_opt.unwrap_or_default().size().length())
+            };
             let size_t = domain.length();
 
             // finite curves: proportional to the average curve speed; else absolute
@@ -1637,13 +1745,38 @@ impl BSplineCurve {
                 5.0
             };
 
-            let solutions = global_property_analysis(
-                k,
-                self,
-                &domain,
-                CurveProperty::MinimizeFirstDerivative,
-                min_sep,
-            )?;
+            // Not upstream (#2568): where the curve's speed is bounded above the tolerance
+            // the search cannot report, and is not run (`analysis`; off without
+            // `Kernel::memoize_curve_caches`, and with `query_statuses_pass_on`, which
+            // reports the search's own status)
+            let shortcut = k.memoize_curve_caches && !k.fixes.query_statuses_pass_on;
+            let bounds = if shortcut { curve_bounds(cur) } else { None };
+            let speed_clear = bounds.is_some_and(|b| b.speed >= tol * BOUND_MARGIN);
+            let solutions = if sized && speed_clear {
+                Vec::new()
+            } else if sized {
+                let (first_derivs_ok, sols) = global_property_analysis(
+                    k,
+                    self,
+                    &domain,
+                    CurveProperty::MinimizeFirstDerivative,
+                    min_sep,
+                )?;
+                if k.fixes.query_statuses_pass_on {
+                    rtn &= report(
+                        &mut list,
+                        key,
+                        if dim == 2 { 11 } else { 12 },
+                        first_derivs_ok,
+                        tol,
+                        UNDEF_DOUBLE,
+                        |_| {},
+                    )?;
+                }
+                sols
+            } else {
+                Vec::new()
+            };
 
             // The solution value is not necessarily the length of the first
             // derivative, so evaluate it at the solution parameter.
@@ -1660,11 +1793,16 @@ impl BSplineCurve {
                 }
 
                 // 1stDeriv magnitude
-                let pt_der = ignored(self.evaluate(param, 1, false, false))?.unwrap_or_else(undef2);
-                let deriv_length = pt_der.get(1).copied().unwrap_or(Vec3::UNDEF).length();
+                let eval = ignored(self.evaluate(param, 1, false, false))?;
+                let (evaluated, deriv_length) = match eval {
+                    Some(pt_der) => (true, pt_der.get(1).copied().unwrap_or(Vec3::UNDEF).length()),
+                    None if k.fixes.query_statuses_pass_on => (false, UNDEF_DOUBLE),
+                    None => (true, Vec3::UNDEF.length()),
+                };
 
-                // check 1stDeriv > tolerance
-                if deriv_length < tol {
+                // check 1stDeriv > tolerance; with `query_statuses_pass_on` a derivative
+                // that cannot be evaluated fails too
+                if !evaluated || deriv_length < tol {
                     let min_1st_deriv_param = param;
                     let test = if dim == 2 {
                         Some(11)
@@ -1674,7 +1812,7 @@ impl BSplineCurve {
                         None
                     };
                     if let Some(t) = test {
-                        let ok = deriv_length >= tol;
+                        let ok = evaluated && deriv_length >= tol;
                         rtn &= report(&mut list, key, t, ok, tol, deriv_length, |r| {
                             r.set_owner_param(Point2::new(min_1st_deriv_param, 0.0));
                             r.set_value(deriv_length);
@@ -1691,8 +1829,8 @@ impl BSplineCurve {
             // at its middle, with the mapped trim's tolerance and solution spacing; a
             // mapped trim that cannot be sized fails test 13 and is not analysed.
             let mut mapped: Option<BSplineCurve> = None;
-            let (mut radius_sized, mut radius_tol, mut radius_sep) = (true, tol, min_sep);
-            if k.fixes.uv_trim_checks_on_surface {
+            let (mut radius_sized, mut radius_tol, mut radius_sep) = (sized, tol, min_sep);
+            if sized && k.fixes.uv_trim_checks_on_surface {
                 if let Some(l) = trim_metric(k, self, bounded, ovr.trim_surface, &domain)? {
                     mapped = mapped_trim(self, l);
                     let mapped_box = match mapped.as_ref() {
@@ -1719,14 +1857,50 @@ impl BSplineCurve {
             let copy_curve = mapped.as_ref().unwrap_or(self);
 
             // Another type of kink check: vanishing radius of curvature.
-            let solutions = if radius_sized {
-                global_property_analysis(
+            let mut radii = false;
+            // Not upstream (#2568): the search's solutions only reach a report through
+            // `bspline_check_min_radius` (below); without it, or where the radius is
+            // bounded above the tolerance and the search's objective evaluates everywhere
+            // (a failed evaluation is returned as a radius of 0), it cannot report and is
+            // not run
+            let radius_clear = shortcut
+                && (!k.fixes.bspline_check_min_radius
+                    || match mapped.as_ref() {
+                        None => bounds,
+                        Some(m) => m.nurb.as_ref().and_then(curve_bounds),
+                    }
+                    .is_some_and(|b| b.radius_clears(radius_tol)));
+            let solutions = if radius_sized && radius_clear {
+                radii = true;
+                Vec::new()
+            } else if radius_sized {
+                let (radii_ok, sols) = global_property_analysis(
                     k,
                     copy_curve,
                     &domain,
                     CurveProperty::MinimizeRadiusOfCurvature,
                     radius_sep,
-                )?
+                )?;
+                if k.fixes.query_statuses_pass_on {
+                    radii = radii_ok;
+                    rtn &= report(
+                        &mut list,
+                        key,
+                        if dim == 2 { 13 } else { 14 },
+                        radii,
+                        radius_tol,
+                        UNDEF_DOUBLE,
+                        |_| {},
+                    )?;
+                    if radii {
+                        sols
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    radii = true;
+                    sols
+                }
             } else {
                 Vec::new()
             };
@@ -1740,7 +1914,7 @@ impl BSplineCurve {
             // the tolerance within the stretch where that growth puts it below is that
             // growth and is passed over; the first other solution is read instead.
             let mut stretch = [-1.0, -1.0];
-            if k.fixes.curve_check_zero_speed_tangent_end && radius_sized {
+            if k.fixes.curve_check_zero_speed_tangent_end && radii {
                 for (end, slot) in stretch.iter_mut().enumerate() {
                     let i = if end == 0 { 0 } else { cur.n() };
                     let end_cpt = cpt(i)?.to_euclid();
@@ -2430,7 +2604,9 @@ mod tests {
         let mut k = Kernel::default();
         // main: test 3 (coincident first control points)
         assert_eq!(edge_failed_tests(&k, &c, Some(&tangent)), vec![3]);
-        // main with the minimum radius read: also test 14 (radius 0 at t = 0)
+        // with the minimum radius read: also test 14. Before tangency-labs/solidcore#2574
+        // the 0 it compared came from the objective failing at the zero-speed end; it is
+        // now the radius where the search stopped, still below the tolerance (#2669).
         k.fixes.bspline_check_min_radius = true;
         assert_eq!(edge_failed_tests(&k, &c, Some(&tangent)), vec![3, 14]);
 
@@ -2487,6 +2663,186 @@ mod tests {
                 edge_failed_tests(&k, &c, Some(&tangent)),
                 edge_failed_tests(&k, &c, None)
             );
+        }
+    }
+
+    /// [`zero_speed_end_curve`] run backwards, of dimension `dim`: its zero-speed end
+    /// is the curve's end (`t = 1`).
+    fn zero_speed_at_end_curve(dim: u64) -> BSplineCurve {
+        let fwd = zero_speed_end_curve();
+        let cur = fwd.nurb.as_ref().unwrap();
+        let pts: Vec<[f64; 3]> = cur.cpts().iter().rev().map(|p| [p.x, p.y, p.z]).collect();
+        let knots: Vec<f64> = cur.knots().iter().rev().map(|u| 1.0 - u).collect();
+        let mut c = curve(3, &pts, &knots);
+        c.dim = dim;
+        c
+    }
+
+    /// A zero-speed tangent end at the curve's end (the fork's `lEnd` 1), as an edge's
+    /// 3D curve (test 14) and as a UV trim (test 13): the stretch is measured back from
+    /// the domain's max and the radius below the tolerance there is passed over. Test 3
+    /// reads only the first pair, and test 4 reports the first pair's values, so with
+    /// the minimum radius read only the radius test fails before the fix.
+    #[test]
+    fn wr_668_zero_speed_tangent_end_at_the_curve_end() {
+        let tol = 1e-4;
+        let tangent = ends((0.0, 1.0), true);
+        for (dim, radius_test) in [(3, 14), (2, 13)] {
+            let c = zero_speed_at_end_curve(dim);
+            let s = zero_speed_radius_stretch(&c, 1, tol).unwrap().unwrap();
+            assert!((s - tol * 0.75).abs() <= 1e-9 * s, "{s}");
+            assert_eq!(zero_speed_radius_stretch(&c, 0, tol).unwrap(), None);
+            assert!(is_zero_speed_tangent_end(&c, 1, 1e-15, Some(&tangent)).unwrap());
+            assert!(!is_zero_speed_tangent_end(&c, 0, 1e-15, Some(&tangent)).unwrap());
+
+            let mut k = Kernel::default();
+            assert!(edge_failed_tests(&k, &c, Some(&tangent)).is_empty());
+            k.fixes.bspline_check_min_radius = true;
+            assert_eq!(edge_failed_tests(&k, &c, Some(&tangent)), vec![radius_test]);
+            k.fixes.curve_check_zero_speed_tangent_end = true;
+            assert!(edge_failed_tests(&k, &c, Some(&tangent)).is_empty());
+            // on no edge, or on an edge that ends past the curve's end, it still fails
+            assert_eq!(edge_failed_tests(&k, &c, None), vec![radius_test]);
+            let longer = ends((0.0, 1.25), true);
+            assert_eq!(edge_failed_tests(&k, &c, Some(&longer)), vec![radius_test]);
+        }
+    }
+
+    /// Coincident end control points that are no zero-speed end stay a fault with the
+    /// fix, at a vertex where the edge's faces touch: the quartic Bezier `(0,0) (0,0)
+    /// (0,0) (1,0) (1,1)` has its second derivative vanish at `t = 0` as well
+    /// (`sm_IsZeroSpeedTangentEnd` refuses `|C''| <= dScaledZero`), so tests 3 and 14
+    /// report what they report without it.
+    #[test]
+    fn wr_668_coincident_points_without_curvature_stay_a_fault() {
+        let c = curve(
+            4,
+            &[
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+            ],
+            &[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        );
+        let tangent = ends((0.0, 1.0), true);
+        assert!(!is_zero_speed_tangent_end(&c, 0, EFF_ZERO, Some(&tangent)).unwrap());
+        for min_radius in [false, true] {
+            let mut k = Kernel::default();
+            k.fixes.bspline_check_min_radius = min_radius;
+            let before = edge_failed_tests(&k, &c, Some(&tangent));
+            assert!(before.contains(&3), "{before:?}");
+            k.fixes.curve_check_zero_speed_tangent_end = true;
+            assert_eq!(edge_failed_tests(&k, &c, Some(&tangent)), before);
+        }
+    }
+
+    #[test]
+    fn issue_2009_assert_valid_unevaluable_interior_knot_derivs_fail_tests_5_6() {
+        // tangency-labs/smlib 8843967 (SmBSplineCurve::AssertValid, tests 5/6, WR-663):
+        // two knots 1e-30 apart on a borrowed NURB (not spread by `sm_FixupKnotVector`)
+        // count as one double knot in `GetKnots` (tolerance 1e-12), while `sm_BasisDerivs`
+        // rejects a span <= 1e-24. Without `query_statuses_pass_on` the failed evaluation
+        // leaves `Vec3::UNDEF` (`length = sqrt(3) * SM_UNDEF_DOUBLE`), reporting that
+        // length as the fault value; with the flag, test 5 (2D) / 6 (3D) fails with
+        // value `SM_UNDEF_DOUBLE`.
+        let mut on = Kernel::default();
+        on.fixes.query_statuses_pass_on = true;
+        let off = Kernel::default();
+
+        let borrowed = |dim: u64, p: usize, pts: &[[f64; 3]], knots: &[f64]| {
+            let n = pts.len() - 1;
+            let mut cur = allocate_nurb_curve(n, p, knots.len() - 1).unwrap();
+            for (d, s) in cur.cpts_mut().iter_mut().zip(pts) {
+                *d = CPoint::new(s[0], s[1], s[2], NOW);
+            }
+            cur.knots_mut().copy_from_slice(knots);
+            BSplineCurve::from_nurb(cur, dim, true)
+        };
+
+        // Upper interval (`from_left = true`) fails on `[0.0, 1e-30]`.
+        let upper_knots = [-1.0, -1.0, -1.0, 0.0, 1e-30, 1.0, 1.0, 1.0];
+
+        // Lower interval (`from_left = false`) fails at the second interior knot:
+        // `-1e-12` and `-1e-26` merge into knot 1 (spans ~1.0 and ~1e-12 both evaluate),
+        // while `1e-26` x2 forms knot 2 (`|-1e-12 - 1e-26| > 1e-12`) whose lower span
+        // `[-1e-26, 1e-26]` has width `2e-26 <= 1e-24`.
+        let lower_knots = [
+            -1.0, -1.0, -1.0, -1e-12, -1e-26, 1e-26, 1e-26, 1.0, 1.0, 1.0,
+        ];
+
+        for (knots, expected_param) in [(&upper_knots[..], 0.0), (&lower_knots[..], 1e-26)] {
+            let n_cpts = knots.len() - 3;
+            let pts: Vec<[f64; 3]> = (0..n_cpts).map(|i| [i as f64, 0.0, 0.0]).collect();
+
+            for (dim, expected_test) in [(2_u64, 5_u64), (3, 6)] {
+                let c = borrowed(dim, 2, &pts, knots);
+                let mut list_off = AssertArray::new();
+                assert!(!c
+                    .assert_valid(&off, Some(&mut list_off), true, ObjectKey(1))
+                    .unwrap());
+                assert_eq!(list_off.len(), 1, "{list_off:?}");
+                let r_off = list_off.get(0).unwrap();
+                assert_eq!(r_off.test_index, expected_test);
+                assert_eq!(r_off.value, Vec3::UNDEF.length());
+                assert_ne!(r_off.value, UNDEF_DOUBLE);
+
+                let mut list_on = AssertArray::new();
+                assert!(!c
+                    .assert_valid(&on, Some(&mut list_on), true, ObjectKey(1))
+                    .unwrap());
+                assert_eq!(list_on.len(), 1, "{list_on:?}");
+                let r_on = list_on.get(0).unwrap();
+                assert_eq!(r_on.test_index, expected_test);
+                assert_eq!(r_on.value, UNDEF_DOUBLE);
+                assert_eq!(r_on.owner_param, Point2::new(expected_param, 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn issue_2009_assert_valid_failed_property_analyses_fail_tests_11_to_14() {
+        // tangency-labs/smlib 8843967 (SmBSplineCurve::AssertValid, tests 11-14, WR-663):
+        // a single-span Bezier of degree `GW_MAX_DEGREE` (32) passes the knot, endpoint
+        // and pole checks and sizes from its control polygon, then fails both
+        // `GlobalPropertyAnalysis` calls in `sm_CreateBezSegments` (`NL_DEG_ERR`). Without
+        // `query_statuses_pass_on` both failed analyses are ignored as empty solution sets
+        // and the curve passes; with the flag, tests 11 & 13 (2D) or 12 & 14 (3D) fail
+        // with value `SM_UNDEF_DOUBLE`.
+        let mut on = Kernel::default();
+        on.fixes.query_statuses_pass_on = true;
+        let off = Kernel::default();
+
+        let deg = crate::nurbs::nurbs_crv::MAX_DEGREE;
+        let mut knots = vec![0.0; deg + 1];
+        knots.extend(core::iter::repeat_n(1.0, deg + 1));
+        let pts: Vec<[f64; 3]> = (0..=deg).map(|i| [i as f64, 0.0, 0.0]).collect();
+
+        for (dim, expected) in [(2_u64, [11_u64, 13]), (3, [12_u64, 14])] {
+            let mut cur = allocate_nurb_curve(deg, deg, knots.len() - 1).unwrap();
+            for (d, s) in cur.cpts_mut().iter_mut().zip(&pts) {
+                *d = CPoint::new(s[0], s[1], s[2], NOW);
+            }
+            cur.knots_mut().copy_from_slice(&knots);
+            let c = BSplineCurve::from_nurb(cur, dim, true);
+
+            let mut list_off = AssertArray::new();
+            assert!(c
+                .assert_valid(&off, Some(&mut list_off), true, ObjectKey(9))
+                .unwrap());
+            assert!(list_off.is_empty(), "{list_off:?}");
+
+            let mut list_on = AssertArray::new();
+            assert!(!c
+                .assert_valid(&on, Some(&mut list_on), true, ObjectKey(9))
+                .unwrap());
+            let indices: Vec<u64> = list_on.reports().iter().map(|r| r.test_index).collect();
+            assert_eq!(indices, expected, "{list_on:?}");
+            for r in list_on.reports() {
+                assert_eq!(r.value, UNDEF_DOUBLE, "{r:?}");
+                assert!(r.tol3d > 0.0, "{r:?}");
+            }
         }
     }
 }

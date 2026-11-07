@@ -5,6 +5,7 @@
 //! Upstream: `source/SMLib/inc/SmFilletExecutive.h`, `source/SMLib/src/SmFilletExecutive.cpp`.
 
 pub mod api;
+mod law_radii;
 pub mod p1;
 pub mod p2;
 pub mod p3;
@@ -13,4 +14,4 @@ pub mod topology_changes;
 
 // Supported public paths; numbered modules are implementation partitions.
 pub use p1::{FilletLaw, FilletLawKind};
-pub use p3::NoRoomReason;
+pub use p3::{FitKind, FitSize, NoRoomReason};

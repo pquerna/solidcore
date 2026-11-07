@@ -28,6 +28,8 @@
 //! upstream); member null is native 1006, API null/invalid selection is native 1007.
 //! Offset/member inputs are mutable so existing queries can populate lazy UV trim
 //! geometry in the same arena; this adds no constructive capability or topology copy.
+//! With the opt-in `offset_updates_result_tolerances` (WR-705, not upstream or the
+//! fork) the two API entry points run the tolerance update on their result.
 //! `sm_OrderEdgeusesByBrep` (void upstream) propagates a dangling-id error from its
 //! face and edge-use queries; only a corrupt B-rep reaches it.
 //! Source faces use the native owning-list order. Temporary allocation uses the real
@@ -48,6 +50,13 @@
 //! Every entry point carries the source B-rep's own attributes ([`Brep::add_attribute`])
 //! through the caller's stores to the returned B-rep (`attributes`).
 //! There is no new recursion; all owned loops are bounded by existing arena/relation lengths.
+//! Not upstream: the static offset, solid offset and extended offset refuse, before
+//! anything is built, an offset distance below the input's B-rep tolerance
+//! (`check_resolvable`; HANG-53), and a nonzero approximation tolerance (for the static
+//! offset and the API offsets, the source's B-rep tolerance) at or below `SM_EFF_ZERO`,
+//! which upstream sets as the offset B-rep's tolerance (WR-749, UB-291, #2393).
+//!
+//! Cancellation: the solid, extended and shell paths poll the kernel's cancel token (#2136, #2372) per face, edge use, vertex and stitch pass; the static offset's status collapse passes `Cancelled` through, and the shell and offset APIs return `Cancelled`, not `Ok`, under a fired token.
 
 use std::collections::BTreeSet;
 
@@ -57,7 +66,8 @@ use crate::boolean::merge::p4::{
     BooleanKernels, KernelManifoldIntersector, ManifoldKernelAdapter, ManifoldNotificationKeys,
     ManifoldState,
 };
-use crate::error::{EntityRef, Result, SolidError};
+use crate::error::offset::OffsetFailure;
+use crate::error::{EntityRef, Failure, Result, SolidError};
 use crate::geom::a_object::BooleanOperation;
 use crate::geom::attribute::AttributeStore;
 use crate::geom::context::{with_mark_lock, MarkType, ALL_MARKS};
@@ -226,6 +236,88 @@ fn make_shell_edges_exact(
     make_edges_on_analytics_exact(kernel, shell, &mut stores)
 }
 
+/// Not upstream (#2350): refuses the offset surface `offset` of `face` with
+/// [`OffsetFailure::Collapses`] where it is proved to collapse
+/// ([`crate::offset::construction::sheets::proved_singular`] over the face's parameter box,
+/// at the original B-rep's tolerance): the distance reaches a radius of curvature of the face
+/// (a round offset by its radius), so the offset is a line there, neither a face nor inside
+/// out, and building on lifts the faces beside it across it and grows their tolerances into
+/// an unsound body. An offset that folds (the distance passes the radius) is not refused
+/// here: its face comes out inside out, and the executive takes it away as upstream does
+/// (the lamina edge test). A base that is no NURB has nothing to prove.
+fn refuse_singular_offset(
+    kernel: &Kernel,
+    original: &Brep,
+    face: FaceId,
+    offset: &crate::surface::offset_surface::OffsetSurface,
+    operation: &'static str,
+) -> Result<()> {
+    use crate::offset::construction::sheets::proved_singular;
+    let Some(nurb) = crate::topology::brep::p3::with_nurb(kernel, offset.base_surface())? else {
+        return Ok(());
+    };
+    let Some(base) = nurb.gw_nurb() else {
+        return Ok(());
+    };
+    let domain = crate::topology::face::p2::uv_domain(original, face)?;
+    let uv_box = [domain.min.x, domain.max.x, domain.min.y, domain.max.y];
+    let distance = offset.offset_distance();
+    match proved_singular(base, distance, Some(uv_box), original.tolerance())? {
+        Some(singular) if singular.collapses => Err(Failure::new(
+            operation,
+            OffsetFailure::Collapses {
+                face,
+                distance,
+                radius: singular.radius,
+            },
+        )
+        .into_error()),
+        _ => Ok(()),
+    }
+}
+
+/// Opt-in (WR-718, #2350 S1): refuses the offset of `face` (whose implicit offset
+/// surface is `offset`) when it folds on the face's parameter box
+/// ([`crate::offset::construction::sheets::certify_regular`]), naming the largest wall
+/// that works.
+fn refuse_folding_offset(
+    kernel: &Kernel,
+    original: &Brep,
+    face: FaceId,
+    offset: &crate::surface::offset_surface::OffsetSurface,
+    operation: &'static str,
+) -> Result<()> {
+    use crate::offset::construction::sheets::{certify_regular, Regularity};
+    let Some(nurb) = crate::topology::brep::p3::with_nurb(kernel, offset.base_surface())? else {
+        return Ok(());
+    };
+    let Some(base) = nurb.gw_nurb() else {
+        return Ok(());
+    };
+    let domain = crate::topology::face::p2::uv_domain(original, face)?;
+    let uv_box = [domain.min.x, domain.max.x, domain.min.y, domain.max.y];
+    match certify_regular(kernel, base, offset.offset_distance(), Some(uv_box))? {
+        Regularity::Regular => Ok(()),
+        Regularity::Folds { largest } => Err(Failure::new(
+            operation,
+            OffsetFailure::Folds {
+                face,
+                distance: offset.offset_distance(),
+                largest,
+            },
+        )
+        .into_error()),
+        Regularity::NotCertified => Err(Failure::new(
+            operation,
+            OffsetFailure::NotCertified {
+                face,
+                distance: offset.offset_distance(),
+            },
+        )
+        .into_error()),
+    }
+}
+
 /// Static offset entry point, with a non-null original and an owned result.
 ///
 /// Only ordinary inner failures collapse to native `SM_ERR` (1001).
@@ -237,6 +329,9 @@ pub fn offset_brep(
     options: OffsetOptions,
     notifications: &mut OffsetNotifications<'_>,
 ) -> Result<Brep> {
+    let mut executive = configured_executive(original, options);
+    // before `collapse_offset_status`, which would make the refusal a generic failure
+    executive.check_resolvable(OP_OFFSET, original)?;
     // (not upstream) the source's own attributes go to the caller's stores, as
     // upstream's live on the objects the offset copies
     attributes::seed_attributes(
@@ -247,11 +342,13 @@ pub fn offset_brep(
     let original_key = original.key();
     // Opt-in (WR-657): as the shell does with WR-578's opt-in, an offset of a solid that
     // is no closed manifold solid is refused rather than returned (upstream hands back,
-    // e.g., the loop gaps of a box with three chamfers meeting at a corner, volume 0)
+    // e.g., the loop gaps of a box with three chamfers meeting at a corner, volume 0).
+    // Only a merged offset is held to that: without the merge the overlapping offsets
+    // stay as they are, which is what the caller asked for (`OffsetBrep`'s `bDoSelfInt`).
     let refuse_broken = kernel.fixes.offset_closes_loop_gaps
         && kernel.fixes.offset_splits_corner_vertices
+        && options.merge_results
         && brep_is_manifold_solid(original)?;
-    let mut executive = configured_executive(original, options);
     executive.use_creator_tangency_tol(kernel);
     let mut result = collapse_offset_status(executive.do_solid_offset(
         kernel,
@@ -401,6 +498,7 @@ impl OffsetExecutive {
                 let mut stitch_tol_3d = tolerance / 10.0;
                 let mut ii = 0;
                 while ii < 4 && lamina > 0 {
+                    kernel.check_cancelled(OP_SHELL)?;
                     // pBrepShell->StitchFaces(dStitchTol3d): the glues notify the shell's
                     // own objects, whose attributes the MergeBrep above left in the
                     // caller's stores, so the stitch runs on those (#1973)
@@ -521,6 +619,7 @@ impl OffsetExecutive {
             return self.do_extended_offset(kernel, original, notifications);
         }
         let original = required(original, OP_SOLID)?;
+        self.check_resolvable(OP_SOLID, original)?;
         with_doing_boolean(kernel, |kernel| {
             self.allocate_offset_brep(kernel, notifications)?;
             // `sLoopPoints` keeps the last copied shell face's vertex-loop points
@@ -528,6 +627,7 @@ impl OffsetExecutive {
             let mut loop_points = Vec::new();
             let faces = bp1::faces(original, None)?;
             for id in faces {
+                kernel.check_cancelled(OP_SOLID)?;
                 if self.shell_faces().contains(&id) {
                     loop_points =
                         self.copy_shell_face_prefix(kernel, original, id, false, notifications)?;
@@ -559,6 +659,7 @@ impl OffsetExecutive {
             with_mark_lock(kernel, ALL_MARKS, |kernel, mark_type| {
                 let mut marked = BTreeSet::new();
                 for &edgeuse in &offset_edgeuses {
+                    kernel.check_cancelled(OP_SOLID)?;
                     marked.insert(edgeuse);
                     let mut radial = required(eu::radial(original, edgeuse)?, OP_SOLID)?;
                     if marked.contains(&radial) {
@@ -591,6 +692,7 @@ impl OffsetExecutive {
             // cpp:745–753: ruled side walls for lamina edges (SE).
             if self.create_offset_solid() {
                 for &edgeuse in &offset_edgeuses {
+                    kernel.check_cancelled(OP_SOLID)?;
                     let edge = required(eu::edge(original, edgeuse)?, OP_SOLID)?;
                     if eu::edge_is_lamina(original, edge)? {
                         let mut stores = NotificationStores {
@@ -610,6 +712,7 @@ impl OffsetExecutive {
 
             // cpp:776–846: vertex caps, in GetVertices order (SER).
             for vertex in bp1::vertices(original, None)? {
+                kernel.check_cancelled(OP_SOLID)?;
                 let cap = self.build_offset_of_vertex(kernel, original, Some(vertex))?;
                 let Some(surface) = cap.surface else {
                     continue;
@@ -673,9 +776,11 @@ impl OffsetExecutive {
         notifications: &mut OffsetNotifications<'_>,
     ) -> Result<Brep> {
         let original = required(original, OP_EXTENDED)?;
+        self.check_resolvable(OP_EXTENDED, original)?;
         self.allocate_offset_brep(kernel, notifications)?;
         let faces = bp1::faces(original, None)?;
         for id in faces {
+            kernel.check_cancelled(OP_EXTENDED)?;
             if self.shell_faces().contains(&id) {
                 // DoExtendedOffset builds no vertex caps from these loop points.
                 let _ = self.copy_shell_face_prefix(kernel, original, id, true, notifications)?;
@@ -695,6 +800,7 @@ impl OffsetExecutive {
             let mut unbridged = 0_usize;
             if !self.collapsed_faces.is_empty() {
                 for &edgeuse in &mapped {
+                    kernel.check_cancelled(OP_EXTENDED)?;
                     let Some(radial) = eu::radial(original, edgeuse)? else {
                         continue;
                     };
@@ -751,6 +857,7 @@ impl OffsetExecutive {
             }
             if self.extend_convex_edges() {
                 for &edgeuse in &mapped {
+                    kernel.check_cancelled(OP_EXTENDED)?;
                     let radial = required(eu::radial(original, edgeuse)?, OP_EXTENDED)?;
                     // (WR-346: mated across it above)
                     if self.radial_face_collapsed(original, radial)? {
@@ -788,6 +895,7 @@ impl OffsetExecutive {
             }
 
             for &edgeuse in &mapped {
+                kernel.check_cancelled(OP_EXTENDED)?;
                 let mut radial = required(eu::radial(original, edgeuse)?, OP_EXTENDED)?;
                 // (WR-346: mated across it above)
                 if self.radial_face_collapsed(original, radial)? {
@@ -821,6 +929,7 @@ impl OffsetExecutive {
             // refuse it rather than build a body with holes.
             if !self.collapsed_faces.is_empty() {
                 for &edgeuse in &mapped {
+                    kernel.check_cancelled(OP_EXTENDED)?;
                     let Some(radial) = eu::radial(original, edgeuse)? else {
                         continue;
                     };
@@ -871,6 +980,7 @@ impl OffsetExecutive {
             // surface the merge joins to the offset face along the circle.
             if kernel.fixes.offset_point_vertex_caps {
                 for vertex in bp1::vertices(original, None)? {
+                    kernel.check_cancelled(OP_EXTENDED)?;
                     if crate::topology::vertex::edges(original, vertex, None)?.len() != 1 {
                         continue;
                     }
@@ -915,6 +1025,7 @@ impl OffsetExecutive {
 
             if self.create_offset_solid() {
                 for &edgeuse in &mapped {
+                    kernel.check_cancelled(OP_EXTENDED)?;
                     let edge = required(eu::edge(original, edgeuse)?, OP_EXTENDED)?;
                     if eu::edge_is_lamina(original, edge)? {
                         // SE, not SER, upstream: propagate Unported, ignore other errors.
@@ -1119,6 +1230,49 @@ impl OffsetExecutive {
         Ok(true)
     }
 
+    /// (not upstream) Refuses, before anything is built, an offset distance the model
+    /// cannot resolve: one that is not a finite length of at least `original`'s B-rep
+    /// tolerance, the distance below which the model does not tell two points apart (an
+    /// offset that close lies within tolerance of the face it comes from). HANG-53:
+    /// upstream spends tens of seconds subdividing its offset surfaces toward a distance
+    /// of `1e-300`.
+    ///
+    /// Then refuses a tolerance no B-rep can hold for the offset B-rep: the approximation
+    /// tolerance's magnitude (`allocate_offset_brep` sets it, as upstream's
+    /// `SetTolerance(GetThisApproxTol3d())`) when nonzero but at or below `SM_EFF_ZERO`.
+    /// `ValidatePointers` test 0 needs a tolerance above it, and double arithmetic leaves
+    /// edges and vertices farther than that from their faces. Upstream builds on it
+    /// (WR-749): an invalid body, or SIGSEGV when the face build then fails (UB-291,
+    /// #2393). An exact zero still takes the automatic tolerance.
+    ///
+    /// # Errors
+    ///
+    /// [`OffsetFailure::DistanceUnresolved`] naming the distance and the tolerance, or
+    /// [`OffsetFailure::ToleranceUnresolved`] naming the approximation tolerance, both of
+    /// kind [`crate::error::ErrorKind::InvalidInput`].
+    fn check_resolvable(&self, operation: &'static str, original: &Brep) -> Result<()> {
+        let distance = self.offset_distance();
+        let resolution = original.tolerance();
+        if !(distance.is_finite() && distance >= resolution) {
+            return Err(Failure::new(
+                operation,
+                OffsetFailure::DistanceUnresolved {
+                    distance,
+                    resolution,
+                },
+            )
+            .into_error());
+        }
+        let tolerance = self.approximation_tol_3d();
+        if tolerance != 0.0 && tolerance.abs() <= crate::math::EFF_ZERO {
+            return Err(
+                Failure::new(operation, OffsetFailure::ToleranceUnresolved { tolerance })
+                    .into_error(),
+            );
+        }
+        Ok(())
+    }
+
     fn allocate_offset_brep(
         &mut self,
         kernel: &Kernel,
@@ -1266,6 +1420,9 @@ impl OffsetExecutive {
     ) -> Result<()> {
         let operation = if extended { OP_EXTENDED } else { OP_SOLID };
         let faceuse = select_offset_faceuse(original, id, extended, self.inset(), operation)?;
+        // Not upstream: the margin this face's surface is extended by, from its edges'
+        // sector angles and the offset (upstream extends by five offsets).
+        self.record_extension_reach(kernel, original, id, faceuse)?;
         let (mut surface, ssi) = if self.local_faces.is_empty() {
             let creator = crate::offset::offset_geometry_creation::OffsetGeometryCreation::new(
                 self.offset_distance(),
@@ -1277,6 +1434,27 @@ impl OffsetExecutive {
             // creator object decides upstream (virtual call), not `m_eOffsetOperation`.
             super::face::build_local(original, &self.local_faces, &self.local_surfaces, faceuse)?
         };
+        // Not upstream (#2350): a face whose offset provably collapses (a round offset by
+        // its radius) is refused, never built into an unsound body
+        if self.local_faces.is_empty() && self.operation() != OffsetOperation::LocalOperation {
+            if let Some(crate::surface::surface::SurfaceKind::OffsetSurface(offset)) =
+                surface.as_ref().map(crate::surface::surface::Surface::kind)
+            {
+                refuse_singular_offset(kernel, original, id, offset, operation)?;
+            }
+        }
+        // Not upstream (WR-718, #2350 S1), opt-in `Kernel::fixes.shell_one_construction`:
+        // a face whose offset folds is refused, naming the largest wall that works
+        if kernel.fixes.shell_one_construction
+            && self.local_faces.is_empty()
+            && self.operation() != OffsetOperation::LocalOperation
+        {
+            if let Some(crate::surface::surface::SurfaceKind::OffsetSurface(offset)) =
+                surface.as_ref().map(crate::surface::surface::Surface::kind)
+            {
+                refuse_folding_offset(kernel, original, id, offset, operation)?;
+            }
+        }
         // Not upstream (WR-346, tangency-labs/solidcore#397), opt-in
         // `Kernel::fixes.offset_collapsed_rounds_mated`: an inset face whose offset collapses (a
         // convex round thinner than the wall) gets no offset face; the faces beside it are
@@ -1372,6 +1550,7 @@ impl OffsetExecutive {
         let status = (|| {
             let faces = bp1::faces(&temporary, None)?;
             for id in faces {
+                kernel.check_cancelled(OP_EXTENDED)?;
                 let key = (notifications.result_key_of)(EntityRef::Face(id));
                 let record = notifications.records.or_default(key.key);
                 if record.is_marked(&kernel.context, mark_type) {
@@ -1384,8 +1563,9 @@ impl OffsetExecutive {
                 let surface = required(temporary.face(id)?.surface.as_ref(), OP_EXTENDED)?;
                 let original_domain = surface.natural_uv_domain_with_nurb(kernel)?;
                 // Face-owned surfaces use the caller's result-arena identities.
+                let margin = self.offset_extension_margin(id);
                 let extension = self
-                    .get_create_extended_surface(kernel, key.key.0, surface)?
+                    .get_create_extended_surface(kernel, key.key.0, surface, margin)?
                     .clone();
                 let extension_domain = extension.natural_uv_domain_with_nurb(kernel)?;
                 // cpp:1639: UNSURE retains the original; FALSE suppresses UV trim
@@ -1462,7 +1642,7 @@ impl OffsetExecutive {
     }
 }
 
-fn select_offset_faceuse(
+pub(super) fn select_offset_faceuse(
     original: &Brep,
     face: FaceId,
     extended: bool,
@@ -1536,6 +1716,7 @@ pub fn api_shell_brep_full(
     copy: &ShellCopyIdentities<'_>,
     notifications: &mut OffsetNotifications<'_>,
 ) -> Result<Brep> {
+    crate::profile::profile_scope!(kernel, "offset::shell");
     let original = original.ok_or_else(|| invalid_input(OP_API_SHELL))?;
     validate_shell_faces(original, faces)?;
 
@@ -1613,6 +1794,10 @@ pub fn api_shell_brep_full(
     let mut result = outcome.result?;
     // (not upstream: the port's cached topology, true again for the caller)
     result.refresh_cached_topology();
+    update_result_tolerances(kernel, &mut result)?;
+    // (not upstream, #2136 / #2372: a cancel a status-ignoring helper absorbed still
+    // ends the shell as `Cancelled`, never `Ok`)
+    kernel.check_cancelled(OP_API_SHELL)?;
     Ok(result)
 }
 
@@ -1625,11 +1810,34 @@ pub fn api_offset_brep_full(
     options: OffsetOptions,
     notifications: &mut OffsetNotifications<'_>,
 ) -> Result<Brep> {
+    crate::profile::profile_scope!(kernel, "offset::offset");
     let original = original.ok_or_else(|| invalid_input(OP_API_OFFSET))?;
     let mut result = offset_brep(kernel, original, options, notifications)?;
     // (not upstream: the port's cached topology, true again for the caller)
     result.refresh_cached_topology();
+    update_result_tolerances(kernel, &mut result)?;
+    // (not upstream, #2136 / #2372: a cancel a status-ignoring helper absorbed still
+    // ends the offset as `Cancelled`, never `Ok`)
+    kernel.check_cancelled(OP_API_OFFSET)?;
     Ok(result)
+}
+
+/// (Not upstream, WR-705, `Kernel::fixes.offset_updates_result_tolerances`.) The
+/// tolerance update `SmBrep::ValidateAndUpdateTolerances(FALSE)` on an API offset's or
+/// shell's result, with no report list, at level 0: each vertex and edge grows to cover
+/// the gaps it bounds, as the update grows them. Nothing is done with the flag off.
+///
+/// # Errors
+///
+/// Those of [`validate_and_update_tolerances`](crate::topology::brep::validation::validate_and_update_tolerances)
+/// (broken topology links of the result).
+fn update_result_tolerances(kernel: &mut Kernel, result: &mut Brep) -> Result<()> {
+    if kernel.fixes.offset_updates_result_tolerances {
+        crate::topology::brep::validation::validate_and_update_tolerances(
+            kernel, result, false, None, 0,
+        )?;
+    }
+    Ok(())
 }
 
 /// (not upstream) [`api_offset_brep_full`] with notification identities of its own:
@@ -1722,7 +1930,7 @@ pub fn shell_brep_simple(
     faces: &[FaceId],
 ) -> Result<Brep> {
     let source_id = BrepId::from_index(0);
-    let mut source = original.clone();
+    let mut source = original.clone_standing_for_self()?;
     source.set_key(attributes::original_key(EntityRef::Brep(source_id)).key);
     let mut records = attributes::simple_records(&source);
     let mut store = AttributeStore::default();
@@ -1934,12 +2142,15 @@ fn shell_difference_with(
     }
 }
 
+/// `OffsetBrep`'s `SER(SM_ERR)` after a failed `DoSolidOffset`: the status is `SM_ERR`,
+/// and the offset's own error is kept as its cause (#2615, #2511).
 fn collapse_offset_status<T>(result: Result<T>) -> Result<T> {
     result.map_err(|error| {
-        if error.is_unported() {
+        // a cancel (#2136, #2372) is no offset failure: it is returned as it is
+        if error.is_unported_or_cancelled() {
             error
         } else {
-            SolidError::sm_err(OP_OFFSET)
+            SolidError::failed_after(OP_OFFSET, "the offset could not be built", error)
         }
     })
 }
@@ -2600,9 +2811,7 @@ mod tests {
     }
 
     fn assert_status<T: core::fmt::Debug>(result: Result<T>, code: i32) {
-        assert!(
-            matches!(result.unwrap_err(), SolidError::Upstream { code: actual, .. } if actual == code)
-        );
+        assert_eq!(result.unwrap_err().sm_status(), Some(code));
     }
 
     /// The B-rep box (`query.brep`) these paths used to stop at is ported: on the
@@ -3123,7 +3332,14 @@ mod tests {
                 run_shell_offset(
                     &mut kernel,
                     &mut original,
-                    ShellOptions::default(),
+                    // a thickness the input resolves, so the call reaches the shell helper
+                    ShellOptions {
+                        offset: OffsetOptions {
+                            distance: 0.25,
+                            ..OffsetOptions::default()
+                        },
+                        ..ShellOptions::default()
+                    },
                     &[],
                     &mut notifications.context(),
                 )
@@ -3136,7 +3352,11 @@ mod tests {
                 offset_brep(
                     &mut kernel,
                     &mut original,
-                    OffsetOptions::default(),
+                    // a distance the input resolves, so the call reaches the status collapse
+                    OffsetOptions {
+                        distance: 0.25,
+                        ..OffsetOptions::default()
+                    },
                     &mut notifications.context(),
                 )
             },
@@ -4216,7 +4436,11 @@ mod tests {
                 offset_brep(
                     &mut kernel,
                     &mut original,
-                    OffsetOptions::default(),
+                    // a distance the input resolves, so the call reaches the status collapse
+                    OffsetOptions {
+                        distance: 0.25,
+                        ..OffsetOptions::default()
+                    },
                     &mut notifications.context(),
                 )
             },
@@ -4921,14 +5145,13 @@ mod tests {
     /// a rim of two arcs (270 and 90 degrees) of one circle. Shelled 2 inward open at the
     /// flat face, the offset of that circle is trimmed to the interval between two points
     /// for both arcs, so the flat face gets the long arc twice and the cavity is no solid.
-    /// With the opt-in each arc takes the part of the circle it runs along: a solid of
-    /// volume 2/3 pi (10^3 - 8^3).
+    /// Each arc takes the part of the circle it runs along: a solid of volume
+    /// 2/3 pi (10^3 - 8^3).
     #[test]
     fn issue_403_hemisphere_rim_arcs_keep_their_own_trim() {
         use crate::primitive::api_primitives::{create_box, create_sphere};
-        let shell = |fixed: bool| -> Result<(bool, f64)> {
+        let shell = || -> Result<(bool, f64)> {
             let mut kernel = Kernel::default();
-            kernel.fixes.offset_closed_curve_trim_arc = fixed;
             let ball = create_sphere(&mut kernel, Vec3::new(0.0, 0.0, 0.0), 10.0).unwrap();
             let upper =
                 create_box(&mut kernel, Vec3::new(-20.0, -20.0, 0.0), 40.0, 40.0, 20.0).unwrap();
@@ -4971,10 +5194,7 @@ mod tests {
                 (brep_is_manifold_solid(&shell).unwrap(), volume)
             })
         };
-        // upstream: the cavity is no solid and encloses no volume
-        let (solid, volume) = shell(false).unwrap();
-        assert!(!solid && volume.abs() < 1e-9, "{solid} {volume}");
-        let (solid, volume) = shell(true).unwrap();
+        let (solid, volume) = shell().unwrap();
         let expected = 2.0 / 3.0 * PI * (1000.0 - 512.0);
         assert!(
             solid && (volume - expected).abs() < 1e-6 * expected,

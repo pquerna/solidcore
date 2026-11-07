@@ -223,6 +223,14 @@ pub(super) fn bspline_of(surface: &Surface) -> Option<&BSplineSurface> {
 fn bspline_of_kind(kind: &SurfaceKind) -> Option<&BSplineSurface> {
     match kind {
         SurfaceKind::BSpline(b) => Some(b),
+        SurfaceKind::ProceduralBlend(pb) => {
+            let b = pb.net();
+            Some(b)
+        }
+        SurfaceKind::BallPatch(bp) => {
+            let b = bp.net();
+            Some(b)
+        }
         SurfaceKind::Plane(p) => Some(p.base()),
         SurfaceKind::Cone(s) => Some(s.rev().base()),
         SurfaceKind::Sphere(s) => Some(s.base().base()),
@@ -321,6 +329,14 @@ pub(super) fn calculate_bounding_box(
 ) -> Result<BoundingBoxes> {
     match surface.kind_with_nurb(k)? {
         SurfaceKind::BSpline(b) => b.calculate_bounding_box(k, domain, req),
+        // SmProceduralBlend::CalculateBoundingBox (the virtual one the cache calls on its
+        // surface): the net's boxes grown by the bound
+        SurfaceKind::ProceduralBlend(pb) => pb.calculate_bounding_box(k, domain, req, surface),
+        // (the fork's SmBallPatch inherits SmBSplineSurface's, run for the patch)
+        SurfaceKind::BallPatch(bp) => {
+            bp.net()
+                .calculate_bounding_box_of(k, domain, req, Some(surface))
+        }
         // inherited from SmBSplineSurface, run for the derived surface (its IsKindOf
         // and virtual EvaluateNormal)
         SurfaceKind::Cone(s) => {
@@ -457,6 +473,8 @@ fn is_singularity(
         | SurfaceKind::Sphere(_)
         | SurfaceKind::Torus(_)
         | SurfaceKind::BSpline(_)
+        | SurfaceKind::ProceduralBlend(_)
+        | SurfaceKind::BallPatch(_)
         | SurfaceKind::CurveBounded(_)
         | SurfaceKind::SurfOfRevolution(_)
         | SurfaceKind::SurfOfExtrusion(_)
@@ -793,7 +811,7 @@ impl PatchBoundaryBoundingPlanes {
             SurfaceKind::Plane(p) => p.base_for_query(),
             SurfaceKind::SurfOfExtrusion(_) => match surface.extrusion_base_with_nurb(k) {
                 Ok(base) => base,
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => std::borrow::Cow::Borrowed(
                     bspline_of(surface).ok_or(SolidError::null_pointer(OP_PLANES))?,
                 ),
@@ -2466,7 +2484,7 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
     pub fn polar_box(&mut self, k: &Kernel, node: NodeId) -> Result<PolarBox> {
         if self.aux(node)?.polar_box.state() == PolarBoxState::Uninitialized {
             match self.build_polar_box(k, node) {
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) | Ok(()) => {}
             }
         }
@@ -2544,7 +2562,7 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
     pub fn polar_box_unstored(&self, k: &Kernel, node: NodeId) -> Result<PolarBox> {
         if self.aux(node)?.polar_box.state() == PolarBoxState::Uninitialized {
             match self.build_polar_box_unstored(k, node) {
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => {}
                 Ok(b) => return Ok(b),
             }
@@ -2904,6 +2922,7 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
 
         // while unMarked Nodes remain with classification SM_NC_UNKNOWN
         while let Some(curr_node) = curr {
+            k.check_cancelled(OP_MARK)?;
             let curr_fields = self
                 .surface_fields(curr_node, OP_MARK)?
                 .ok_or_else(|| invalid(OP_MARK, "node has no surface data"))?;
@@ -3278,6 +3297,8 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
         bezier: Option<&NurbSurface>,
         patch_domain: &Extent2d,
     ) -> Result<Corners> {
+        // the cache is built on blends' nets (the fork's 729f893; `SmBlendNetScope`)
+        let _net = crate::surface::procedural_blend::NetScope::new(k);
         if let Some(sur) = bezier {
             let (n, m) = (sur.n(), sur.m());
             let u = sur.u_knots();

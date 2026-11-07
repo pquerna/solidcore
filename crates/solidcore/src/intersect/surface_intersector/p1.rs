@@ -64,9 +64,10 @@
 //!   law as `&mut FilletLaw`: upstream's `const SmFilletLaw&` caches a B-spline law's
 //!   extension through a `const` cast.
 //!   An out-param upstream leaves unset is `None` ([`SpanAccuracy::deviation_found`]).
-//! - **Boolean methods.** `IsPointOnCurve` and `sm_IsPointOnCurve` return a
+//! - **Boolean methods.** `IsPointOnCurve` and `sm_IsPointOnCurve` return an
 //!   `SmBoolean` but use `SER`: a failing call returns its (non-zero) status, which
-//!   the caller reads as `TRUE`. The port returns `Ok(true)` there.
+//!   the caller reads as `TRUE`. By default the port returns `Ok(true)` there
+//!   ([`SolidError::Unported`] still propagates); see the `WR-52` opt-in fix below.
 //! - **`AddStartPoint`** keeps upstream's "replace a bounded start point by the exact
 //!   one" branch, which only reassigns a local pointer: the exact candidate is
 //!   dropped and the bounded point stays.
@@ -82,6 +83,13 @@
 //!   `IsPointOnStartPoint` compares a squared distance with the squared tolerance (a
 //!   real distance of `this_approx_tol_3d`) instead of the tolerance itself; off by
 //!   default (pinned C++).
+//! - **Opt-in fix (WR-52).** With
+//!   [`UpstreamFixes::is_point_on_curve_propagates_eval_failure`](crate::kernel::UpstreamFixes::is_point_on_curve_propagates_eval_failure)
+//!   [`SurfaceIntersector::is_point_on_curve`] (`SmSurfaceIntersector.cpp:7376`,
+//!   `:7391`) and [`is_point_on_tsect_curve`] (`SmSurfaceIntersector.cpp:4195`)
+//!   propagate a failing `EvaluatePoint`, `DropPoint`, or Hermite `LocalPointSolve`
+//!   call as `Err(...)` instead of mapping non-`Unported` errors to `Ok(true)`; off
+//!   by default (pinned C++).
 //! - **Surface calls.** `SmSurface::IsClosed`, `SmSurface::EvaluateNormal` and
 //!   `SmSurface::Evaluate1stDerivatives` go through `surface::surface::p7` (the
 //!   last co-ported there from unit `surface.surface_p1`).
@@ -253,8 +261,9 @@ pub struct TsectPnt {
     /// `m_adUserDoubles`: per-algorithm scratch values.
     pub user_doubles: [f64; MAX_USER_DOUBLES],
     /// `m_apUserPointer[0..2]` (`None`: `NULL`). SMLib's only writer
-    /// (`SmFilletGeom::MakeRailEdgeuse`) stores surfaces in them and its only reader
-    /// (`SmFilletNx2Corner::AdjustTangentCorner`) reads them back as surfaces.
+    /// (`SmFilletGeom::MakeRailEdgeuse`) stores surfaces in them; their only reader,
+    /// `SmFilletNx2Corner::AdjustTangentCorner`, went with the fork's smlib#113 (34288e5,
+    /// #2400).
     pub user_pointer: [Option<UserSurface>; 2],
 }
 
@@ -611,6 +620,28 @@ pub struct SurfaceIntersector<'s> {
     pub extension_distance: f64,
     /// `m_bDoingExtensionClipping`.
     pub doing_extension_clipping: bool,
+    /// Not upstream (#2500): an extension of the trace (past its end without an end
+    /// point, or back from its start) stops where it comes back onto the curve already
+    /// traced, compared in 3D only ([`is_point_on_tsect_span_3d`]): where a surface is
+    /// extended round past the closure of its turn, a closed intersection does not
+    /// repeat its UV, and the end-point and loop checks, which compare UV too, do not
+    /// see it close. Off by default.
+    pub extension_stops_on_closure: bool,
+    /// Not upstream (#2500): while an extension runs with
+    /// [`Self::extension_stops_on_closure`], the traced curve's point it must not pass:
+    /// the start for the extension after the end, the end for the one back from the
+    /// start.
+    pub extension_closes_at: Option<Point3>,
+    /// Not upstream (#2500): whether that extension has left
+    /// [`Self::extension_closes_at`] (by ten times the tolerance) since it was set: only
+    /// then does coming back onto it close the curve.
+    pub extension_left_closure: bool,
+    /// Not upstream (#2500): that extension came back onto
+    /// [`Self::extension_closes_at`]: the curve is closed, and the extension keeps half of
+    /// the gap it ran over (the other half is the other end's), as the extension of a
+    /// surface of revolution round its axis keeps half the gap of its turn either end
+    /// (WR-650).
+    pub extension_closed: bool,
     /// `m_bCurveIsClosed`.
     pub curve_is_closed: bool,
     /// Not upstream: the `trace_step` calls left to the start-point loop of
@@ -666,14 +697,21 @@ fn bad_id() -> SolidError {
 fn or_keep<T>(r: Result<T>, fallback: T) -> Result<T> {
     match r {
         Ok(v) => Ok(v),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Ok(fallback),
     }
 }
 
-/// `SER` inside a method returning `SmBoolean`: a failing status reads as `TRUE`.
-fn or_true(r: Result<bool>) -> Result<bool> {
-    or_keep(r, true)
+/// `SER` inside a method returning `SmBoolean`: by default a failing status reads as
+/// `TRUE` ([`SolidError::Unported`] still propagates); with
+/// [`UpstreamFixes::is_point_on_curve_propagates_eval_failure`](crate::kernel::UpstreamFixes::is_point_on_curve_propagates_eval_failure)
+/// (`WR-52`), the error propagates directly.
+fn or_true(k: &Kernel, err: SolidError) -> Result<bool> {
+    if k.fixes.is_point_on_curve_propagates_eval_failure {
+        Err(err)
+    } else {
+        or_keep(Err(err), true)
+    }
 }
 
 impl<'s> SurfaceIntersector<'s> {
@@ -747,6 +785,10 @@ impl<'s> SurfaceIntersector<'s> {
             last_through_parameter: 0.0,
             extension_distance: 0.0,
             doing_extension_clipping: false,
+            extension_stops_on_closure: false,
+            extension_closes_at: None,
+            extension_left_closure: false,
+            extension_closed: false,
             curve_is_closed: false,
             trace_steps_left: u64::MAX,
             start_loop_trace_steps: super::p4::MAX_START_LOOP_TRACE_STEPS,
@@ -1175,6 +1217,72 @@ impl<'s> SurfaceIntersector<'s> {
         })
     }
 
+    /// Not upstream (WR-697 addendum): whether the span
+    /// from `a` to `b` passes the tests [`Self::test_span_accuracy`] makes of a traced
+    /// span, without touching either point: the tangent turn within `this_ang_tol_rad`,
+    /// and at the same five interior parameters the 3D Hermite span and the two UV
+    /// Hermite spans mapped onto their surfaces within `this_approx_tol_3d` of each other.
+    /// A span no longer than `100 * SM_EFF_ZERO` passes, as there.
+    ///
+    /// # Errors
+    ///
+    /// Those of the angle and the surface evaluations.
+    pub(super) fn span_keeps_accuracy(
+        &self,
+        k: &Kernel,
+        a: &TsectPnt,
+        b: &TsectPnt,
+    ) -> Result<bool> {
+        let step_size = b.curve_parameter - a.curve_parameter;
+        if step_size <= EFF_ZERO * 100.0 {
+            return Ok(true);
+        }
+        if a.crv_deriv().angle_between(b.crv_deriv())? > self.this_ang_tol_rad {
+            return Ok(false);
+        }
+        let uv_crv0 = HermiteCurve::from_2d(
+            a.uv_pos(SrfIndex::First),
+            a.uv_deriv(SrfIndex::First) * step_size,
+            b.uv_pos(SrfIndex::First),
+            b.uv_deriv(SrfIndex::First) * step_size,
+            2,
+        );
+        let uv_crv1 = HermiteCurve::from_2d(
+            a.uv_pos(SrfIndex::Second),
+            a.uv_deriv(SrfIndex::Second) * step_size,
+            b.uv_pos(SrfIndex::Second),
+            b.uv_deriv(SrfIndex::Second) * step_size,
+            2,
+        );
+        let crv_3d = HermiteCurve::new(
+            a.crv_pos(),
+            a.crv_deriv() * step_size,
+            b.crv_pos(),
+            b.crv_deriv() * step_size,
+            3,
+        );
+        let tol_sq = self.this_approx_tol_3d * self.this_approx_tol_3d;
+        for i in 0..NUM_SPAN_TEST_POINTS {
+            let param = (i as f64 + 1.0) / (NUM_SPAN_TEST_POINTS as f64 + 1.0);
+            let uv3d0 = uv_crv0.evaluate_point(param);
+            let uv3d1 = uv_crv1.evaluate_point(param);
+            let uv0 = self.uv_domains[0].clamp_point(Point2::new(uv3d0.x, uv3d0.y));
+            let uv1 = self.uv_domains[1].clamp_point(Point2::new(uv3d1.x, uv3d1.y));
+            let pnt0 = self.surfaces[0].evaluate_point(k, uv0)?;
+            let pnt1 = self.surfaces[1].evaluate_point(k, uv1)?;
+            let crv_pnt = crv_3d.evaluate_point(param);
+            let dist_sq = max3(
+                pnt0.distance_squared(pnt1),
+                pnt0.distance_squared(crv_pnt),
+                pnt1.distance_squared(crv_pnt),
+            );
+            if dist_sq > tol_sq {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// A rejected span: a singular point becomes a crossing point.
     fn demote_singularity(&mut self, id: TsectId) -> Result<()> {
         let p = self.point_mut(id)?;
@@ -1523,6 +1631,12 @@ impl<'s> SurfaceIntersector<'s> {
     /// `this_approx_tol_3d` of its drop point (`DropPoint`, `SM_SO_INTERSECT` with
     /// `10 * this_approx_tol_3d`), or within ten times that when the surfaces do not
     /// diverge between the point and the curve point.
+    ///
+    /// By default (pinned C++ parity), a failing `EvaluatePoint` (`:7376`) or
+    /// `DropPoint` (`:7391`) status is mapped to `Ok(true)` (`SER` inside `SmBoolean`,
+    /// `WR-52`; [`SolidError::Unported`] still propagates). With
+    /// [`UpstreamFixes::is_point_on_curve_propagates_eval_failure`](crate::kernel::UpstreamFixes::is_point_on_curve_propagates_eval_failure),
+    /// those failures propagate as `Err(...)`.
     pub fn is_point_on_curve(
         &self,
         k: &Kernel,
@@ -1559,7 +1673,7 @@ impl<'s> SurfaceIntersector<'s> {
                 let ivl = curve.natural_interval();
                 let crv_pnt = match curve.evaluate_point(k, ivl.min()) {
                     Ok(p) => p,
-                    Err(e) => return or_true(Err(e)),
+                    Err(e) => return or_true(k, e),
                 };
                 if crv_pnt.distance(point) < self.this_approx_tol_3d * 4.0 {
                     return Ok(true);
@@ -1580,7 +1694,7 @@ impl<'s> SurfaceIntersector<'s> {
                     jj,
                 ) {
                     Ok(d) => d,
-                    Err(e) => return or_true(Err(e)),
+                    Err(e) => return or_true(k, e),
                 };
                 let (success, crv_param, dist) = (drop.success, drop.parameter, drop.distance);
 
@@ -1903,6 +2017,12 @@ pub fn compute_curve_type(
 /// and in both UV spaces, then drop onto the Hermite span within the tolerance with
 /// a tangent pointing back along it, or onto its interior within half the chord's
 /// largest coordinate.
+///
+/// By default (pinned C++ parity), a failing Hermite `LocalPointSolve` (`:4195`)
+/// status is mapped to `Ok(true)` (`SER` inside `SmBoolean`, `WR-52`;
+/// [`SolidError::Unported`] still propagates). With
+/// [`UpstreamFixes::is_point_on_curve_propagates_eval_failure`](crate::kernel::UpstreamFixes::is_point_on_curve_propagates_eval_failure),
+/// a failure propagates as `Err(...)`.
 pub fn is_point_on_tsect_curve(
     k: &Kernel,
     point_to_test: &TsectPnt,
@@ -2007,7 +2127,7 @@ pub fn is_point_on_tsect_curve(
         guess,
     ) {
         Ok(r) => r,
-        Err(e) => return or_true(Err(e)),
+        Err(e) => return or_true(k, e),
     };
 
     // If the test point dropped to the interior of the Hermite curve,
@@ -2018,7 +2138,7 @@ pub fn is_point_on_tsect_curve(
         let t = sol.start.parameters[0];
         if dist <= tol {
             // crPointToTest has a direction: check that too.  [B401]
-            let pv = herm_3d.evaluate(t, 1, true);
+            let pv = herm_3d.evaluate(t, 1, true)?;
             let tangent = pv.get(1).copied().unwrap_or(Vec3::ZERO);
             if point_to_test.crv_deriv().dot(tangent) < 0.0 {
                 return Ok(true);
@@ -2034,6 +2154,50 @@ pub fn is_point_on_tsect_curve(
 
     // The point is not on the curve.
     Ok(false)
+}
+
+/// Not upstream (#2500): whether `point` lies on the traced span from `prev` to `next`
+/// in 3D, within `approx_tol_3d`: its foot on the span's 3D Hermite curve (as
+/// [`is_point_on_tsect_curve`] builds it) is within the tolerance. Neither the UV boxes
+/// nor the point's direction are tested: a curve traced round a surface extended past its
+/// turn comes back to its own points in 3D with other UV.
+///
+/// # Errors
+///
+/// Those of the Hermite curve's point solve.
+pub fn is_point_on_tsect_span_3d(
+    k: &Kernel,
+    point: Point3,
+    prev: &TsectPnt,
+    next: &TsectPnt,
+    approx_tol_3d: f64,
+) -> Result<bool> {
+    let delta_t = next.curve_parameter - prev.curve_parameter;
+    let herm_3d = HermiteCurve::new(
+        prev.crv_pos(),
+        prev.crv_deriv() * delta_t,
+        next.crv_pos(),
+        next.crv_deriv() * delta_t,
+        3,
+    );
+    let domain = herm_3d.natural_interval();
+    let mut box_3d = Extent3d::new();
+    herm_3d.calculate_bounding_box(Some(&mut box_3d), None, None)?;
+    let mut pnt_box = Extent3d::from_point(point);
+    pnt_box.expand_absolute(approx_tol_3d);
+    if box_3d.are_disjoint(&pnt_box, 0.0) {
+        return Ok(false);
+    }
+    let curve = Curve::from(herm_3d);
+    let (success, sol) = curve.local_point_solve::<()>(
+        k,
+        &domain,
+        SolverOperation::Minimize,
+        point,
+        &PointSolveOptions::default(),
+        domain.evaluate(0.5),
+    )?;
+    Ok(success && sol.start.solution_value <= approx_tol_3d)
 }
 
 /// Appends the piecewise cubic, C0 B-spline of `cntrl_poly` over the unique `knots`
@@ -2521,5 +2685,340 @@ mod tests {
         ];
         flush_crv(3, &pts, &[0.0, 1.0], &mut curves).unwrap();
         assert_eq!(curves.len(), 1);
+    }
+
+    /// `WR-52`: `is_point_on_curve_propagates_eval_failure` defaults to `false`, is
+    /// registered in [`UpstreamFixes`](crate::kernel::UpstreamFixes), and gates the
+    /// `or_true` helper shared by `SmSurfaceIntersector::IsPointOnCurve` (`:7376`,
+    /// `:7391`) and `sm_IsPointOnCurve` (`:4195`) while always propagating
+    /// [`SolidError::Unported`].
+    #[test]
+    fn wr52_flag_lookup_and_default_off() {
+        use crate::error::SM_ERR;
+        use crate::kernel::UpstreamFixes;
+
+        let fixes = UpstreamFixes::default();
+        assert!(!fixes.is_point_on_curve_propagates_eval_failure);
+        assert!(UpstreamFixes::NAMES.contains(&"is_point_on_curve_propagates_eval_failure"));
+
+        let mut k = Kernel::default();
+        assert!(!k.fixes.is_point_on_curve_propagates_eval_failure);
+        *k.fixes
+            .flag_mut("is_point_on_curve_propagates_eval_failure")
+            .unwrap() = true;
+        assert!(k.fixes.is_point_on_curve_propagates_eval_failure);
+
+        let k_default = Kernel::default();
+        let eval_err = SolidError::sm_err("test::eval");
+        let null_err = SolidError::null_pointer("test::null");
+        let unported = SolidError::Unported {
+            upstream: "SmCurve::LocalPointSolve",
+            unit: "curve.curve_p3",
+        };
+
+        assert_eq!(or_true(&k_default, eval_err.clone()), Ok(true));
+        assert_eq!(or_true(&k_default, null_err.clone()), Ok(true));
+        assert_eq!(or_true(&k_default, unported.clone()), Err(unported.clone()));
+
+        let propagated_eval = or_true(&k, eval_err.clone()).unwrap_err();
+        assert_eq!(propagated_eval, eval_err);
+        assert_eq!(propagated_eval.sm_status(), Some(SM_ERR));
+        let propagated_null = or_true(&k, null_err.clone()).unwrap_err();
+        assert_eq!(propagated_null, null_err);
+        assert_eq!(propagated_null.sm_status(), Some(SM_ERR_NULL_POINTER));
+        assert_eq!(or_true(&k, unported.clone()), Err(unported));
+    }
+
+    /// `WR-52` (`SmSurfaceIntersector.cpp:7376`): when `pCurve->IsDegenerate()` holds
+    /// and `pCurve->EvaluatePoint` fails, pinned C++ returns the non-zero `SmStatus`
+    /// from `SmBoolean` as `TRUE` (`Ok(true)`); the opt-in flag propagates `Err`.
+    #[test]
+    fn wr52_is_point_on_curve_degenerate_eval_failure() {
+        use crate::curve::ellipse::Ellipse;
+        use crate::curve::offset_curve::OffsetCurve;
+        use crate::error::SM_ERR;
+
+        let dom = Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0);
+        let s1 = plane([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let s2 = plane([0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+
+        let k_default = Kernel::default();
+        let mut k_fix = Kernel::default();
+        k_fix.fixes.is_point_on_curve_propagates_eval_failure = true;
+        let si = SurfaceIntersector::new(&k_default, &s1, &dom, &s2, &dom, false).unwrap();
+
+        let far = Vec3::new(100.0, 100.0, 100.0);
+
+        // 1. Degenerate `Ellipse` without NURB: `IsDegenerate` is `true` (zero radii),
+        //    `EvaluatePoint` fails with `SM_ERR` (1001).
+        let bad_ellipse = Curve::from(Ellipse::empty(3));
+        assert!(bad_ellipse
+            .is_degenerate(&k_default, EFF_ZERO, None)
+            .unwrap());
+        assert_eq!(
+            si.is_point_on_curve(&k_default, far, core::slice::from_ref(&bad_ellipse), None),
+            Ok(true)
+        );
+        let err = si
+            .is_point_on_curve(&k_fix, far, core::slice::from_ref(&bad_ellipse), None)
+            .unwrap_err();
+        assert_eq!(err.sm_status(), Some(SM_ERR), "{err:?}");
+
+        // Skipping index 0 bypasses the broken curve in both modes.
+        assert_eq!(
+            si.is_point_on_curve(
+                &k_default,
+                far,
+                core::slice::from_ref(&bad_ellipse),
+                Some(0)
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            si.is_point_on_curve(&k_fix, far, core::slice::from_ref(&bad_ellipse), Some(0)),
+            Ok(false)
+        );
+
+        // 2. Empty `OffsetCurve`: `IsDegenerate` is `true`, `EvaluatePoint` fails with
+        //    `SM_ERR_NULL_POINTER` (1006).
+        let bad_offset = Curve::from(OffsetCurve::empty());
+        assert!(bad_offset
+            .is_degenerate(&k_default, EFF_ZERO, None)
+            .unwrap());
+        assert_eq!(
+            si.is_point_on_curve(&k_default, far, core::slice::from_ref(&bad_offset), None),
+            Ok(true)
+        );
+        let err = si
+            .is_point_on_curve(&k_fix, far, core::slice::from_ref(&bad_offset), None)
+            .unwrap_err();
+        assert_eq!(err.sm_status(), Some(SM_ERR_NULL_POINTER), "{err:?}");
+    }
+
+    /// `WR-52` (`SmSurfaceIntersector.cpp:7391`): when `pCurve->IsDegenerate()` is
+    /// `false` and `pCurve->DropPoint` fails, pinned C++ returns `TRUE` (`Ok(true)`);
+    /// the opt-in flag propagates `Err`.
+    #[test]
+    fn wr52_is_point_on_curve_nondegenerate_drop_failure() {
+        use crate::curve::ellipse::Ellipse;
+        use crate::curve::line::Line;
+
+        let dom = Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0);
+        let s1 = plane([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let s2 = plane([0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+
+        let k_default = Kernel::default();
+        let mut k_fix = Kernel::default();
+        k_fix.fixes.is_point_on_curve_propagates_eval_failure = true;
+        let si = SurfaceIntersector::new(&k_default, &s1, &dom, &s2, &dom, false).unwrap();
+
+        // Non-degenerate `Ellipse` (`r = 1`, `[0, 90]` deg) without NURB or polar
+        // conversion table: `IsDegenerate` is `false`, and `DropPoint` fails in global
+        // point solve cache setup with `SM_ERR_NULL_POINTER` (1006).
+        let mut e = Ellipse::empty(3);
+        e.set_radius(1.0);
+        e.set_step_interval(Extent1d::from_min_max(0.0, 90.0));
+        let bad_nondegen = Curve::from(e);
+        assert!(!bad_nondegen
+            .is_degenerate(&k_default, EFF_ZERO, None)
+            .unwrap());
+
+        let far = Vec3::new(100.0, 100.0, 100.0);
+        assert_eq!(
+            si.is_point_on_curve(&k_default, far, core::slice::from_ref(&bad_nondegen), None),
+            Ok(true)
+        );
+        let err = si
+            .is_point_on_curve(&k_fix, far, core::slice::from_ref(&bad_nondegen), None)
+            .unwrap_err();
+        assert_eq!(err.sm_status(), Some(SM_ERR_NULL_POINTER), "{err:?}");
+
+        let mut caches = DropPointCaches::default();
+        assert_eq!(
+            si.is_point_on_curve_cached(
+                &k_default,
+                far,
+                core::slice::from_ref(&bad_nondegen),
+                None,
+                &mut caches,
+            ),
+            Ok(true)
+        );
+        let mut caches_fix = DropPointCaches::default();
+        let cached_err = si
+            .is_point_on_curve_cached(
+                &k_fix,
+                far,
+                core::slice::from_ref(&bad_nondegen),
+                None,
+                &mut caches_fix,
+            )
+            .unwrap_err();
+        assert_eq!(
+            cached_err.sm_status(),
+            Some(SM_ERR_NULL_POINTER),
+            "{cached_err:?}"
+        );
+
+        // An earlier matching curve short-circuits to `Ok(true)` in both modes; a
+        // non-matching curve advances to the broken curve and exposes the failure.
+        let valid_line = Curve::from(
+            Line::create_line_segment(3, Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), None)
+                .unwrap(),
+        );
+        let curves = [valid_line, bad_nondegen];
+        let on_line = Vec3::new(0.5, 0.0, 0.0);
+        assert_eq!(
+            si.is_point_on_curve(&k_default, on_line, &curves, None),
+            Ok(true)
+        );
+        assert_eq!(
+            si.is_point_on_curve(&k_fix, on_line, &curves, None),
+            Ok(true)
+        );
+        assert_eq!(
+            si.is_point_on_curve(&k_default, far, &curves, None),
+            Ok(true)
+        );
+        let slice_err = si
+            .is_point_on_curve(&k_fix, far, &curves, None)
+            .unwrap_err();
+        assert_eq!(
+            slice_err.sm_status(),
+            Some(SM_ERR_NULL_POINTER),
+            "{slice_err:?}"
+        );
+    }
+
+    /// `WR-52`: valid degenerate curves, valid non-degenerate curves, and traced
+    /// Hermite spans (`is_point_on_tsect_curve`, `SmSurfaceIntersector.cpp:4195`) agree
+    /// across default (`false`) and opt-in (`true`) modes for both on-curve and
+    /// off-curve points.
+    #[test]
+    fn wr52_valid_curves_and_tsect_span_parity() {
+        use crate::curve::line::Line;
+
+        fn span_point(t: f64, pos: Vec3, deriv: Vec3, uv: Vec2) -> TsectPnt {
+            let mut p = TsectPnt::new();
+            p.curve_parameter = t;
+            p.tangent_plane_angle_rad = 0.0;
+            p.curve_pv = [pos, deriv];
+            p.uv_curve_pv = [[uv, Vec2::new(1.0, 0.0)], [uv, Vec2::new(1.0, 0.0)]];
+            p
+        }
+
+        let dom = Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0);
+        let s1 = plane([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let s2 = plane([0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+
+        let degen_pos = Vec3::new(0.25, 0.0, 0.0);
+        let degen_bspline =
+            Curve::from(BSplineCurve::create_degenerate_curve(3, degen_pos).unwrap());
+        let degen_hermite = Curve::from(HermiteCurve::new(
+            degen_pos,
+            Vec3::ZERO,
+            degen_pos,
+            Vec3::ZERO,
+            3,
+        ));
+        let valid_line = Curve::from(
+            Line::create_line_segment(3, Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), None)
+                .unwrap(),
+        );
+
+        let prev = span_point(
+            0.0,
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+        );
+        let next = span_point(
+            1.0,
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec2::new(1.0, 0.0),
+        );
+        let end_back = span_point(
+            1.0,
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec2::new(1.0, 0.0),
+        );
+        let end_forward = span_point(
+            1.0,
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec2::new(1.0, 0.0),
+        );
+        let interior = span_point(
+            0.5,
+            Vec3::new(0.5, 0.2, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec2::new(0.5, 0.0),
+        );
+        let disjoint = span_point(
+            2.0,
+            Vec3::new(5.0, 5.0, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec2::new(5.0, 5.0),
+        );
+
+        for propagate in [false, true] {
+            let mut k = Kernel::default();
+            k.fixes.is_point_on_curve_propagates_eval_failure = propagate;
+            let si = SurfaceIntersector::new(&k, &s1, &dom, &s2, &dom, false).unwrap();
+
+            for degen in [&degen_bspline, &degen_hermite] {
+                assert_eq!(
+                    si.is_point_on_curve(&k, degen_pos, core::slice::from_ref(degen), None),
+                    Ok(true)
+                );
+                assert_eq!(
+                    si.is_point_on_curve(
+                        &k,
+                        Vec3::new(10.0, 10.0, 10.0),
+                        core::slice::from_ref(degen),
+                        None,
+                    ),
+                    Ok(false)
+                );
+            }
+
+            assert_eq!(
+                si.is_point_on_curve(
+                    &k,
+                    Vec3::new(0.5, 0.0, 0.0),
+                    core::slice::from_ref(&valid_line),
+                    None,
+                ),
+                Ok(true)
+            );
+            assert_eq!(
+                si.is_point_on_curve(
+                    &k,
+                    Vec3::new(0.5, 0.5, 0.0),
+                    core::slice::from_ref(&valid_line),
+                    None,
+                ),
+                Ok(false)
+            );
+
+            assert_eq!(
+                is_point_on_tsect_curve(&k, &end_back, &prev, &next, 1.0e-3),
+                Ok(true)
+            );
+            assert_eq!(
+                is_point_on_tsect_curve(&k, &end_forward, &prev, &next, 1.0e-3),
+                Ok(false)
+            );
+            assert_eq!(
+                is_point_on_tsect_curve(&k, &interior, &prev, &next, 1.0e-3),
+                Ok(true)
+            );
+            assert_eq!(
+                is_point_on_tsect_curve(&k, &disjoint, &prev, &next, 1.0e-3),
+                Ok(false)
+            );
+        }
     }
 }

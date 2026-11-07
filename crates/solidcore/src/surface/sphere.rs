@@ -133,6 +133,7 @@ use crate::geom::vector3d::{asin, sqrt, Point3, Vec3};
 use crate::kernel::Kernel;
 use crate::math::{max2, min2, EFF_ZERO, EFF_ZERO_PARAM, EFF_ZERO_SQRT, PI, UNDEF_DOUBLE};
 use crate::nurbs::b_spline_curve::BSplineCurve;
+use crate::nurbs::b_spline_surface::p2::EditNotify;
 use crate::nurbs::b_spline_surface::{
     BSplineSurface, BoundingBoxRequest, IsoCurveOptions, LocationType, SurfParamType,
 };
@@ -306,7 +307,7 @@ impl Sphere {
                 Some(opts.inside_out),
             )
             .map_err(|e| {
-                if e.is_unported() {
+                if e.is_unported_or_cancelled() {
                     e
                 } else {
                     SolidError::null_pointer(OP_NEW)
@@ -360,7 +361,7 @@ impl Sphere {
 
         // Build NURB; fail cleanly rather than leak a null-NURB object.
         match sphere.make_nurb(k) {
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             Err(_) => return Err(SolidError::sm_err(OP_CANONICAL)),
             Ok(()) => {}
         }
@@ -442,7 +443,7 @@ impl Sphere {
     }
 
     /// `RebuildPolarConverter` with the sphere's iso circles.
-    fn rebuild_polar_converter(&mut self, k: &Kernel) -> Result<()> {
+    pub(crate) fn rebuild_polar_converter(&mut self, k: &Kernel) -> Result<()> {
         let shape = self.shape();
         self.base.rebuild_polar_converter(k, &|s, k, p, t| {
             Ok(iso_curve(s, shape, k, p, t, None, false)?.curve)
@@ -1046,6 +1047,8 @@ impl Sphere {
                 need_nurb_intersection = more?;
             }
             SurfaceKind::BSpline(_)
+            | SurfaceKind::ProceduralBlend(_)
+            | SurfaceKind::BallPatch(_)
             | SurfaceKind::Cone(_)
             | SurfaceKind::Torus(_)
             | SurfaceKind::SurfOfExtrusion(_)
@@ -1575,7 +1578,7 @@ impl Sphere {
                 tol_3d,
             ) {
                 Ok(h) => h,
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => CurveIntersection::Points(Vec::new()),
             };
 
@@ -2049,6 +2052,27 @@ impl Sphere {
         test: &BSplineSurface,
         tolerance_scale: f64,
     ) -> Result<Option<Self>> {
+        Self::is_nurb_surface_sphere_on(k, test, tolerance_scale, None)
+    }
+
+    /// [`Self::is_nurb_surface_sphere`] of the `SmBSplineSurface` part of `this` (not upstream: the
+    /// fork's `SmProceduralBlend`): the corner points come from its virtual
+    /// `EvaluatePoint`, so a procedural blend's are its definition's. `None` evaluates
+    /// `test` itself.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::is_nurb_surface_sphere`].
+    pub(crate) fn is_nurb_surface_sphere_on(
+        k: &Kernel,
+        test: &BSplineSurface,
+        tolerance_scale: f64,
+        this: Option<&Surface>,
+    ) -> Result<Option<Self>> {
+        let corner = |uv| match this {
+            Some(s) => s.evaluate_point(k, uv),
+            None => test.evaluate_point(uv),
+        };
         // no work - not a degree 2 rational surface in both directions
         if test.degree(SurfParamType::U) != 2
             || test.degree(SurfParamType::V) != 2
@@ -2059,8 +2083,8 @@ impl Sphere {
 
         // evaluate min/max domain points
         let nurb_uv_domain = test.natural_uv_domain();
-        let min_pnt = test.evaluate_point(nurb_uv_domain.min())?;
-        let max_pnt = test.evaluate_point(nurb_uv_domain.max())?;
+        let min_pnt = corner(nurb_uv_domain.min())?;
+        let max_pnt = corner(nurb_uv_domain.max())?;
 
         // scale zero value
         let scaled_zero = tolerance_scale
@@ -2239,7 +2263,7 @@ impl Sphere {
         // reparameterize the NURB so that AnalyticSurface->NurbDomain ==
         // InputSurface->NurbDomain
         match sphere.reparameterize(k, &test.natural_uv_domain()) {
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             Err(_) => return Ok(None), // [B414]
             Ok(()) => {}
         }
@@ -2677,6 +2701,22 @@ impl Sphere {
         rotate_n_move: &Axis2Placement,
         scale: Option<Vec3>,
     ) -> Result<()> {
+        self.transform_notifying(k, rotate_n_move, scale, &mut |_| Ok(()))
+    }
+
+    /// [`Sphere::transform`] with the edit notifications of the base surface of revolution's NURB transform sent through
+    /// `notify`.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Sphere::transform`] and of `notify`.
+    pub(crate) fn transform_notifying(
+        &mut self,
+        k: &Kernel,
+        rotate_n_move: &Axis2Placement,
+        scale: Option<Vec3>,
+        notify: &mut EditNotify<'_>,
+    ) -> Result<()> {
         let identity_scale = Vec3::new(1.0, 1.0, 1.0);
 
         // no work - identity transform
@@ -2701,12 +2741,13 @@ impl Sphere {
         // finish the call in the parent function (status ignored upstream), whose
         // polar-converter rebuild reaches the sphere's iso circles
         let shape = self.shape();
-        ignore_status(
-            self.base
-                .transform_using(k, rotate_n_move, scale, &|s, k, p, t| {
-                    Ok(iso_curve(s, shape, k, p, t, None, false)?.curve)
-                }),
-        )?;
+        ignore_status(self.base.transform_using(
+            k,
+            rotate_n_move,
+            scale,
+            &|s, k, p, t| Ok(iso_curve(s, shape, k, p, t, None, false)?.curve),
+            notify,
+        ))?;
 
         // all done
         Ok(())

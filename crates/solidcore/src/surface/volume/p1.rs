@@ -155,24 +155,19 @@ const MAX_UNDEF_ARRAY: usize = 1 << 20;
 
 /// `(n+1)^3`, the size of an evaluation array of highest derivative `n`.
 fn eval_size(n: usize, operation: &'static str) -> Result<usize> {
-    let n1 = n.checked_add(1).ok_or(SolidError::invalid_input(
-        operation,
-        "derivative order overflows",
-    ))?;
+    let n1 = n
+        .checked_add(1)
+        .ok_or_else(|| SolidError::invalid_input(operation, "derivative order overflows"))?;
     n1.checked_mul(n1)
         .and_then(|s| s.checked_mul(n1))
-        .ok_or(SolidError::invalid_input(
-            operation,
-            "derivative order overflows",
-        ))
+        .ok_or_else(|| SolidError::invalid_input(operation, "derivative order overflows"))
 }
 
 /// Element `i` of an evaluation array.
 fn at(a: &[Vec3], i: usize, operation: &'static str) -> Result<Vec3> {
-    a.get(i).copied().ok_or(SolidError::invalid_input(
-        operation,
-        "evaluation array too short",
-    ))
+    a.get(i)
+        .copied()
+        .ok_or_else(|| SolidError::invalid_input(operation, "evaluation array too short"))
 }
 
 /// The position of a simple map's evaluation (`EvaluatePointSimple` of a
@@ -861,7 +856,7 @@ impl Volume {
             // Copy this Volume omitting any compounding volumes
             let simple = match self.copy(true) {
                 Ok(v) => v,
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => {
                     return Err(SolidError::invalid_input(
                         "surface::volume::p1::Volume::is_curve_in_param_domain",
@@ -1051,7 +1046,7 @@ impl Volume {
             // return OrientMap's simple evaluation (status ignored)
             return match orient.evaluate_simple(param_point, n) {
                 Ok(d) => Ok(d),
-                Err(e) if e.is_unported() => Err(e),
+                Err(e) if e.is_unported_or_cancelled() => Err(e),
                 Err(_) => {
                     let size = eval_size(n, OP_ORIENT)?;
                     if size > MAX_UNDEF_ARRAY {

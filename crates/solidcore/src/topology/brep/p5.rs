@@ -2498,6 +2498,7 @@ pub fn stitch_and_orient_with_identity(
     options: &StitchAndOrientOptions,
     identity: Option<crate::query::brep::BrepIdentity<'_>>,
 ) -> Result<()> {
+    k.check_cancelled(OP)?;
     let mut lamina = 0;
     let mut tolerance = initial_stitch_tolerance(b.tolerance(), options.stitch_tolerance);
     crate::error::ignore_status(crate::error::passed_on(
@@ -2543,6 +2544,99 @@ pub fn stitch_and_orient_with_identity(
         )?)?;
         Ok(())
     })
+}
+
+/// [`stitch_and_orient`] inside the caller's edit: the stitch passes and the orientation
+/// edit `b` through the caller's environment `env` (the stitch's glues, squeezes and
+/// splits as [`crate::heal::stitch::p1::BorrowedStitchEdits`] naming new curves by
+/// `curve_identity`), so no edit of their own nests in the caller's. A caller whose edit
+/// has lent the kernel context's callbacks uses this: there [`stitch_and_orient`]'s own
+/// edits are refused as nested.
+///
+/// # Errors
+///
+/// Those of [`stitch_and_orient`].
+pub(crate) fn stitch_and_orient_notified(
+    k: &mut Kernel,
+    b: &mut Brep,
+    options: &StitchAndOrientOptions,
+    env: &mut EditNotifyEnv<'_>,
+    curve_identity: crate::topology::brep::p9::CurveIdentity<'_>,
+) -> Result<()> {
+    k.check_cancelled(OP)?;
+    let mut lamina = 0;
+    let mut tolerance = initial_stitch_tolerance(b.tolerance(), options.stitch_tolerance);
+    crate::error::ignore_status(crate::error::passed_on(
+        stitch_faces_notified(
+            k,
+            b,
+            tolerance,
+            options.allow_spine_edges,
+            &mut lamina,
+            env,
+            curve_identity,
+        ),
+        k.fixes.brep_edit_statuses_pass_on,
+    )?)?;
+    if lamina > 1 {
+        tolerance = if options.stitch_tolerance <= 0.0 {
+            tolerance * 20.0
+        } else {
+            tolerance * 10.0
+        };
+        crate::error::ignore_status(crate::error::passed_on(
+            stitch_faces_notified(
+                k,
+                b,
+                tolerance,
+                options.allow_spine_edges,
+                &mut lamina,
+                env,
+                curve_identity,
+            ),
+            k.fixes.brep_edit_statuses_pass_on,
+        )?)?;
+    }
+    crate::error::ignore_status(crate::error::passed_on(
+        orient_trimmed_surfaces(
+            k,
+            b,
+            Some(env),
+            true,
+            options.just_unify.unwrap_or(lamina > 0),
+            options.faces_to_swap.as_deref(),
+        ),
+        k.fixes.brep_edit_statuses_pass_on,
+    )?)?;
+    Ok(())
+}
+
+/// [`stitch_faces`] editing through `env` ([`stitch_and_orient_notified`]).
+fn stitch_faces_notified(
+    k: &mut Kernel,
+    b: &mut Brep,
+    tolerance: f64,
+    allow_spine: bool,
+    lamina: &mut usize,
+    env: &mut EditNotifyEnv<'_>,
+    curve_identity: crate::topology::brep::p9::CurveIdentity<'_>,
+) -> Result<()> {
+    let mut edits = crate::heal::stitch::p1::BorrowedStitchEdits {
+        env,
+        curve_identity,
+    };
+    let out = crate::topology::brep::p4::stitch_faces_with_context(
+        k,
+        b,
+        tolerance,
+        None,
+        allow_spine,
+        None,
+        Some(&mut edits),
+    )?;
+    *lamina = usize::try_from(out.lamina_edges)
+        .map_err(|_| SolidError::invalid_input(OP, "lamina edge count"))?;
+    Ok(())
 }
 
 /// `StitchFaces(tol, lNumStitched, lNumLamina, dMaxVGap, dMaxEGap, NULL, bAllowSpine)`:
@@ -3094,6 +3188,11 @@ fn transformed_surface_base(
     use crate::surface::surface::SurfaceKind;
     Ok(match surface.kind_mut() {
         SurfaceKind::BSpline(base) => Some(base.clone()),
+        SurfaceKind::ProceduralBlend(pb) => {
+            let base = pb.net();
+            Some(base.clone())
+        }
+        SurfaceKind::BallPatch(bp) => Some(bp.net().clone()),
         SurfaceKind::Plane(plane) => {
             if plane.base().gw_nurb().is_none() {
                 crate::error::ignore_status(plane.make_nurb())?;
@@ -3242,8 +3341,14 @@ mod tests {
             b.face_mut(f).expect("face").surface = None;
             let mut lamina = 0;
             let tolerance = initial_stitch_tolerance(b.tolerance(), 0.0);
-            let stitched =
-                stitch_faces(&mut k, &mut b.clone(), tolerance, false, &mut lamina, None);
+            let stitched = stitch_faces(
+                &mut k,
+                &mut b.clone_standing_for_self().unwrap(),
+                tolerance,
+                false,
+                &mut lamina,
+                None,
+            );
             let r = stitch_and_orient(&mut k, &mut b, &StitchAndOrientOptions::default());
             let box_error = |r: &Result<()>| {
                 matches!(

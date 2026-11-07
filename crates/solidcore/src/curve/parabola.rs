@@ -166,7 +166,7 @@ fn trim_infinite(domain: &mut Extent1d) {
 /// `Ok` for any result but [`SolidError::Unported`] (a status upstream ignores).
 fn ignore_status<T>(r: Result<T>) -> Result<()> {
     match r {
-        Err(e @ SolidError::Unported { .. }) => Err(e),
+        Err(e @ (SolidError::Unported { .. } | SolidError::Cancelled { .. })) => Err(e),
         _ => Ok(()),
     }
 }
@@ -487,7 +487,7 @@ impl Parabola {
         let sols =
             curve.global_point_solve(k, &ivl, operation, test_point, tol, requested, &opts)?;
 
-        let mut out = Vec::with_capacity(sols.len());
+        let mut out = Vec::new();
         for sol in sols.as_slice() {
             let point_on_curve = curve.evaluate_point(k, sol.start.parameters[0])?;
             let (angle_param, _) = self.step_inversion(point_on_curve, false);
@@ -774,7 +774,7 @@ impl Parabola {
         // read the base type (status ignored upstream)
         let (base, read_ok) = match BSplineCurve::read_from_db(db, dim, version) {
             Ok(b) => (b, true),
-            Err(e @ SolidError::Unported { .. }) => return Err(e),
+            Err(e @ (SolidError::Unported { .. } | SolidError::Cancelled { .. })) => return Err(e),
             Err(_) => (BSplineCurve::default(), false),
         };
         let mut parabola = Self {

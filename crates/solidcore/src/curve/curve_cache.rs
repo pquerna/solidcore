@@ -686,6 +686,7 @@ impl<O: Copy + PartialEq> CurveCache<O> {
         let mut splits: u64 = 0;
         // 2. for every unique curve parameter span
         for (i, seg) in beziers.iter().enumerate() {
+            k.check_cancelled(OP_TESS)?;
             let mut bez = seg.clone();
             let mut span_ivl = Extent1d::from_min_max(
                 bez.knots().first().copied().unwrap_or(0.0),
@@ -782,6 +783,9 @@ impl<O: Copy + PartialEq> CurveCache<O> {
             let mut first_in_seg = true;
             while let Some(top) = stack.pop() {
                 splits += 1;
+                if (splits & 15) == 1 {
+                    k.check_cancelled(OP_TESS)?;
+                }
                 if splits > MAX_TESS_SPLITS {
                     return Err(invalid(
                         OP_TESS,
@@ -1402,7 +1406,6 @@ pub fn compute_constants(
 
     let mut efo = FindCurveDistanceExtrema::new(k, bez, original, interval, 10.0 * EFF_ZERO);
     let mut solver = LocalSolve1d::with_interval(interval, false);
-    solver.set_failed_guess_no_sign_change(k.fixes.oscillating_skips_failed_guesses);
 
     // Step along the curve: when the function changes sign, call the local solver.
     let num_steps = 20u32;
@@ -1473,7 +1476,7 @@ pub fn build_bezier_spans(k: &Kernel, curve: &Curve, knots: &[f64]) -> Result<Ve
     if knots.len() < 2 {
         return Err(SolidError::sm_err(OP_BUILD));
     }
-    let mut out = Vec::with_capacity(knots.len() - 1);
+    let mut out = Vec::new();
     let mut pv = [Vec3::UNDEF; 2];
 
     let mut param = knots.first().copied().unwrap_or(0.0);

@@ -40,10 +40,9 @@
 //! | [`Plane::max_analytic_domain`], [`Plane::is_parallel_to_vector`], [`Plane::is_parallel_to_vector_opt_in`], [`Plane::is_parallel_to_vector_with_kernel`], [`Plane::reverse`], [`Plane::swap_uv`] | `SmBSplineSurface::GetMaxAnalyticDomain`, `IsParallelToVector`, `Reverse`, `SwapUV` (inherited, re-dispatched) |
 //!
 //! Deviations:
-//! - **`SwapUV` keeps the plane's definition (WR-701, opt-in).** With
-//!   `Kernel::fixes.swap_uv_keeps_analytic_definition` the swap keeps the axes, domain
+//! - **`SwapUV` keeps the plane's definition (WR-701).** The swap keeps the axes, domain
 //!   and scales [`Plane::toggle_swap_uv_bit`] swapped (`SmPlane::SwapUVDefinition`, the
-//!   fork's tangency-labs/smlib@0c00de7) instead of rebuilding them from the net.
+//!   fork's tangency-labs/smlib@0c00de7); upstream rebuilds them from the net.
 //! - **Derived class.** `SmPlane` derives from `SmBSplineSurface`; a [`Plane`] holds
 //!   its B-spline part ([`Plane::base`]) next to the analytic data, and is the
 //!   [`SurfaceKind::Plane`] kind of [`Surface`]. Inherited methods whose upstream
@@ -919,7 +918,8 @@ impl Plane {
     /// Rebuilds the analytic data from the NURB (`RebuildSTEPFromNURBParameters`): the
     /// domain becomes the natural domain, the scales and axes come from three
     /// corners of the NURB, and the origin is moved so that the domain minimum
-    /// evaluates to the first corner (using the old axes).
+    /// evaluates to the first corner, along the old axes (a rebuild that turns no axis
+    /// keeps them; see [`Plane::reverse`] for one that does).
     ///
     /// # Errors
     ///
@@ -946,12 +946,17 @@ impl Plane {
         self.uv_scale.y = len_3d / nurb_domain.y_length();
         v_vec /= len_3d; // Unitize, for later.
 
-        // The origin is where (0,0) would evaluate to.
+        // The origin is where (0,0) would evaluate to, along the axes the plane is rebuilt
+        // on (the NURB's own, made canonical). Not upstream, which places it along the old
+        // axes, so a plane whose NURB was reversed or turned no longer evaluated as it: its
+        // origin moved by `(lo + hi) * scale` along a reversed axis.
+        self.position.set_canonical(pt00, u_vec, v_vec)?;
         let start_vec = nurb_domain.min().x * self.uv_scale.x * self.position.x_axis()
             + nurb_domain.min().y * self.uv_scale.y * self.position.y_axis();
 
-        // The new origin would be the start point minus that vector.
-        let _ = self.position.set_canonical(pt00 - start_vec, u_vec, v_vec);
+        // The new origin is the start point minus that vector.
+        self.position
+            .set_canonical(pt00 - start_vec, u_vec, v_vec)?;
 
         // Finally update the domain.
         self.anal_uv_domain = nurb_domain;
@@ -969,18 +974,19 @@ impl Plane {
         self.ensure_nurb();
         self.base.reverse(param)?;
 
-        // give analytics a chance to update their nested STEP data
+        // give analytics a chance to update their nested STEP data, the reversed axis
+        // turned about
         self.rebuild_step_from_nurb_parameters()
     }
 
     /// `SmBSplineSurface::SwapUV` (inherited): records the swap
-    /// ([`Plane::toggle_swap_uv_bit`]), transposes the NURB, then rebuilds the
-    /// analytic data from it.
+    /// ([`Plane::toggle_swap_uv_bit`], which swaps the analytic data), then transposes
+    /// the NURB; the swapped analytic data is kept (WR-701), not rebuilt from it.
     ///
     /// # Errors
     ///
-    /// Those of [`BSplineSurface::canonical`], [`BSplineSurface::set_canonical`] (the
-    /// swap bit is then restored) and [`Plane::rebuild_step_from_nurb_parameters`].
+    /// Those of [`BSplineSurface::canonical`] and [`BSplineSurface::set_canonical`] (the
+    /// swap bit is then restored).
     pub fn swap_uv(&mut self) -> Result<()> {
         self.swap_uv_notifying(&mut |_| Ok(()))
     }
@@ -994,22 +1000,6 @@ impl Plane {
     pub(crate) fn swap_uv_notifying(
         &mut self,
         notify: &mut crate::nurbs::b_spline_surface::p2::EditNotify<'_>,
-    ) -> Result<()> {
-        self.swap_uv_notifying_keeping(notify, false)
-    }
-
-    /// [`Plane::swap_uv_notifying`]; with `keep_definition` (not upstream, WR-701, the
-    /// fork's tangency-labs/smlib@0c00de7, `SmPlane::SwapUVDefinition`) the definition
-    /// [`Plane::toggle_swap_uv_bit`] has swapped (axes, domain, scales) is kept, not
-    /// rebuilt from the transposed net.
-    ///
-    /// # Errors
-    ///
-    /// Those of [`Plane::swap_uv`].
-    pub(crate) fn swap_uv_notifying_keeping(
-        &mut self,
-        notify: &mut crate::nurbs::b_spline_surface::p2::EditNotify<'_>,
-        keep_definition: bool,
     ) -> Result<()> {
         // get current surface description
         self.ensure_nurb();
@@ -1046,10 +1036,10 @@ impl Plane {
             self.toggle_swap_uv_bit();
             return Err(e);
         }
-        if keep_definition {
-            return Ok(());
-        }
-        self.rebuild_step_from_nurb_parameters()
+        // not upstream (WR-701, the fork's tangency-labs/smlib@0c00de7,
+        // `SmPlane::SwapUVDefinition`): the definition the bit has swapped (axes, domain,
+        // scales) is kept, not rebuilt from the transposed net
+        Ok(())
     }
 
     // ---- solvers ----------------------------------------------------------------------
@@ -2555,6 +2545,103 @@ mod tests {
             Vec2::new(2.0, 3.0),
             &Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
         )
+    }
+
+    /// A plane reversed in either direction evaluates as its own NURB, the point at
+    /// (u, v) the one the plane had at (lo + hi - u, v) (or in v): its origin is placed
+    /// along the reversed axis (upstream's old axis moved it by the domain's width).
+    #[test]
+    fn a_reversed_plane_evaluates_as_its_nurb() {
+        let original = Plane::new(
+            Point3::new(1.0, 2.0, 3.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec2::new(2.0, 3.0),
+            &Extent2d::from_bounds(-1.0, -2.0, 3.0, 5.0),
+        );
+        for param in [SurfParamType::U, SurfParamType::V] {
+            let mut p = original.clone();
+            p.reverse(param).unwrap();
+            let d = p.natural_uv_domain();
+            for (s, t) in [(0.0, 0.0), (0.5, 0.5), (1.0, 0.25), (0.3, 1.0)] {
+                let uv = d.evaluate(s, t);
+                let turned = match param {
+                    SurfParamType::U => d.evaluate(1.0 - s, t),
+                    _ => d.evaluate(s, 1.0 - t),
+                };
+                let (a, n, o) = (
+                    p.evaluate_point(uv),
+                    p.base.evaluate_point(uv).unwrap(),
+                    original.evaluate_point(turned),
+                );
+                assert!(
+                    a.distance(n) <= 1e-14 && a.distance(o) <= 1e-14,
+                    "{param:?} {a:?} {n:?} {o:?}"
+                );
+            }
+        }
+    }
+
+    /// A plane on a turned frame, reversed in each direction and back again: after every
+    /// reversal it evaluates as its own NURB, and twice reversed as the original. The origin
+    /// is placed along the axes the plane is rebuilt on, not its old ones.
+    #[test]
+    fn a_turned_plane_reversed_and_back_evaluates_as_its_nurb() {
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        let original = Plane::new(
+            Point3::new(1.0, 2.0, 3.0),
+            Vec3::new(h, h, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec2::new(2.0, 3.0),
+            &Extent2d::from_bounds(-1.0, -2.0, 3.0, 5.0),
+        );
+        let samples = [(0.0, 0.0), (0.5, 0.5), (1.0, 0.25), (0.3, 1.0)];
+        for param in [SurfParamType::U, SurfParamType::V] {
+            let mut p = original.clone();
+            for _ in 0..2 {
+                p.reverse(param).unwrap();
+                let d = p.natural_uv_domain();
+                for (s, t) in samples {
+                    let uv = d.evaluate(s, t);
+                    let (a, n) = (p.evaluate_point(uv), p.base.evaluate_point(uv).unwrap());
+                    assert!(a.distance(n) <= 1e-13, "{param:?} {a:?} {n:?}");
+                }
+            }
+            let d = p.natural_uv_domain();
+            for (s, t) in samples {
+                let uv = d.evaluate(s, t);
+                let (a, o) = (p.evaluate_point(uv), original.evaluate_point(uv));
+                assert!(a.distance(o) <= 1e-13, "{param:?} twice: {a:?} {o:?}");
+            }
+        }
+    }
+
+    /// A plane whose NURB is turned a quarter about z and then rebuilt from it: the analytic
+    /// plane is placed on the NURB's own axes and evaluates as it everywhere on a domain
+    /// away from the origin (on its old axes the origin moved by the domain's low corner).
+    #[test]
+    fn a_plane_rebuilt_from_a_turned_nurb_evaluates_as_it() {
+        let mut p = Plane::new(
+            Point3::new(1.0, 2.0, 3.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec2::new(2.0, 3.0),
+            &Extent2d::from_bounds(-1.0, -2.0, 3.0, 5.0),
+        );
+        p.ensure_nurb();
+        let quarter = Axis2Placement::new(
+            Vec3::ZERO,
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+        );
+        p.base.transform(&quarter, None).unwrap();
+        p.rebuild_step_from_nurb_parameters().unwrap();
+        let d = p.natural_uv_domain();
+        for (s, t) in [(0.0, 0.0), (0.5, 0.5), (1.0, 0.25), (0.3, 1.0)] {
+            let uv = d.evaluate(s, t);
+            let (a, n) = (p.evaluate_point(uv), p.base.evaluate_point(uv).unwrap());
+            assert!(a.distance(n) <= 1e-13, "{a:?} {n:?}");
+        }
     }
 
     /// `SER(SM_ERR_INVALID_INPUT)` for a zero line vector, the exact status.

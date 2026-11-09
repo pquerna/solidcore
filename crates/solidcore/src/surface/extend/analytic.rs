@@ -57,7 +57,9 @@
 //! A side is left where the analytic closes in its direction (a full turn), where the side
 //! is not proved longer than a point (a pole or an apex), or a plane's side at
 //! `+-INFINITE_PARAMETER`, as [`Surface::extended_sides`] leaves them; where no side is
-//! extended the result is the source itself. Every other side asked is extended `distance` across it, capped (said so,
+//! extendable the result is the source itself. A side whose reach is below its resolution
+//! ([`SideExtension::Unchanged`]) is extendable: with no side extended, the result is the
+//! form itself (the same B-spline family as any extension). Every other side asked is extended `distance` across it, capped (said so,
 //! [`SideExtension::UpToLimit`]):
 //! - **round the axis**, no farther than a quarter of the turn the source leaves open (the
 //!   shell's rule for a round, WR-532), so it never laps itself;
@@ -79,9 +81,9 @@
 //!
 //! Deviations: none (no upstream counterpart). No recursion.
 
-use super::ball::{knot_box, reach};
+use super::ball::{knot_box, reach, source_iso};
 use super::sides::{round_the_axis, ExtendedSides, SideExtension};
-use super::{keeps, Continuity, ExtendRefusal, Local};
+use super::{below_resolution, keeps, Continuity, ExtendRefusal, Local};
 use crate::error::{Result, SolidError};
 use crate::geom::vector2d::Point2;
 use crate::geom::vector3d::Vec3;
@@ -290,8 +292,12 @@ pub(super) fn analytic_extended_sides(
         } else {
             along
         };
-        let (grown, across, capped, bound) =
-            extend_side(&cur, side, &frame, iso, &implicit, distance)?;
+        let Some((grown, across, capped, bound)) =
+            extend_side(&cur, side, &frame, iso, &implicit, distance)?
+        else {
+            *done = SideExtension::Unchanged;
+            continue;
+        };
         cur = grown;
         extension = extension.max(bound);
         *done = if capped {
@@ -300,11 +306,17 @@ pub(super) fn analytic_extended_sides(
             SideExtension::Extended(across)
         };
     }
-    // nothing extended: the source itself, as [`Surface::extended_sides`] leaves it
-    if !sides
-        .iter()
-        .any(|x| matches!(x, SideExtension::Extended(_) | SideExtension::UpToLimit(_)))
-    {
+    // no side extendable (each closed, collapsed or unbounded): the source itself, as
+    // [`Surface::extended_sides`] leaves it. A side left `Unchanged` is extendable, its reach
+    // below its resolution: the result is the form continued by nothing, the same B-spline
+    // family as a reach one least step longer (a plane kept as itself here takes the shell
+    // offset's plane branches, which the form does not).
+    if !sides.iter().any(|x| {
+        matches!(
+            x,
+            SideExtension::Extended(_) | SideExtension::UpToLimit(_) | SideExtension::Unchanged
+        )
+    }) {
         return Ok(Some(ExtendedSides {
             surface: s.copy(k)?,
             sides,
@@ -365,13 +377,16 @@ fn circle(f: &Frame, iso: Iso, x0: Vec3) -> Result<Option<(Vec3, Vec3, f64)>> {
     })
 }
 
-/// The length along the iso from `x0` through `xm` to `x1`, in closed form.
-fn length(f: &Frame, iso: Iso, x0: Vec3, xm: Vec3, x1: Vec3) -> Result<f64> {
+/// The length along the iso from `x0` to `x1`, in closed form, the way round that continues
+/// the source's iso outward: from its far end `x_far` through its halfway point `x_half` to
+/// `x0` (`ball::source_iso`; the extension's own points are too close at the least step to
+/// say the sense).
+fn length(f: &Frame, iso: Iso, (x_far, x_half): (Vec3, Vec3), x0: Vec3, x1: Vec3) -> Result<f64> {
     let Some((centre, n, radius)) = circle(f, iso, x0)? else {
         return Ok((x1 - x0).length());
     };
-    // the swept angle, the way round through the middle point
-    let n = if (xm - x0).cross(x1 - xm).dot(n) < 0.0 {
+    // the swept angle, the way round the source's iso turns
+    let n = if (x_half - x_far).cross(x0 - x_half).dot(n) < 0.0 {
         n * -1.0
     } else {
         n
@@ -385,7 +400,8 @@ fn length(f: &Frame, iso: Iso, x0: Vec3, xm: Vec3, x1: Vec3) -> Result<f64> {
 }
 
 /// `cur` continued Natural past `side` by `distance` across it, capped (module docs): the
-/// result, its across length, whether the cap stopped it, and its construction bound.
+/// result, its across length, whether the cap stopped it, and its construction bound;
+/// `None` where the (capped) distance is below the side's resolution ([`below_resolution`]).
 fn extend_side(
     cur: &BSplineSurface,
     side: BoxSide,
@@ -393,7 +409,7 @@ fn extend_side(
     iso: Iso,
     implicit: &Implicit,
     distance: f64,
-) -> Result<(BSplineSurface, Across, bool, f64)> {
+) -> Result<Option<(BSplineSurface, Across, bool, f64)>> {
     let net = cur.gw_nurb().ok_or_else(|| SolidError::sm_err(OP))?;
     if matches!(iso, Iso::Ruling) && (if side.is_u() { net.p() } else { net.q() }) != 1 {
         return Err(SolidError::Unsupported {
@@ -441,13 +457,31 @@ fn extend_side(
             Point2::new(middle.x, x)
         }
     };
+    let sense = source_iso(cur, &dom, side, middle)?;
     let measure = |s: &BSplineSurface| -> Result<f64> {
         let x0 = s.evaluate_point(at(s, 0.0))?;
-        let xm = s.evaluate_point(at(s, 0.5))?;
         let x1 = s.evaluate_point(at(s, 1.0))?;
-        length(f, iso, x0, xm, x1)
+        length(f, iso, sense, x0, x1)
     };
     let value = |e: f64| -> Result<Option<f64>> { made(e)?.map(|(s, _)| measure(&s)).transpose() };
+    // the length across an extension whose construction bound is `bound`, with the closed
+    // form's rounding (the evaluations at the points' size, the products, the atan2) and the
+    // points' construction bound through the angle
+    let across_of = |s: &BSplineSurface, bound: f64| -> Result<Across> {
+        let length = measure(s)?;
+        let rounding = gamma(64) * (length + f.size) + 4.0 * bound;
+        Ok(Across {
+            enclosure: Bracket {
+                lower: (length - rounding).max(0.0),
+                upper: length + rounding,
+            },
+            truncation: 0.0,
+            rounding,
+            converged: true,
+            // a closed form at the points' size: its rounding part is sized on the part
+            resolution: 0.0,
+        })
+    };
     // the cap, from the side's middle point and the iso's other end inside the source
     let x_side = cur.evaluate_point(middle)?;
     let inside = {
@@ -478,23 +512,17 @@ fn extend_side(
     };
     let target = distance.min(cap);
     let capped = target < distance;
-    let e = reach(&value, target, source.range()?)?;
+    let least = source.least_step()?;
+    if let Some((g, bound)) = made(least)? {
+        if below_resolution(Some(&across_of(&g, bound)?), bound, target) {
+            return Ok(None);
+        }
+    }
+    let e = reach(&value, target, source.range()?, least)?;
     let (grown, bound) = made(e)?.ok_or_else(|| SolidError::sm_err(OP))?;
-    let length = measure(&grown)?;
+    let across = across_of(&grown, bound)?;
     certify_iso(&grown, side, middle, f, iso)?;
-    // the closed form's rounding (the evaluations at the points' size, the products, the
-    // atan2), and the points' construction bound through the angle
-    let rounding = gamma(64) * (length + f.size) + 4.0 * bound;
-    let across = Across {
-        enclosure: Bracket {
-            lower: (length - rounding).max(0.0),
-            upper: length + rounding,
-        },
-        truncation: 0.0,
-        rounding,
-        converged: true,
-    };
-    Ok((grown, across, capped, bound))
+    Ok(Some((grown, across, capped, bound)))
 }
 
 /// `out`, a net of degree 1 across `side` continued Natural past it, with the joint knot
@@ -569,6 +597,13 @@ fn joint_removed(out: &Net, side: BoxSide, joint: f64) -> Result<Net> {
 /// curve: every homogeneous control point in a plane normal to the axis (a parallel) or
 /// through it (a meridian, a tube), within its rounding; a ruling is straight by its
 /// degree. Refused as not exact otherwise.
+///
+/// The limit, `8 gamma_32` times the point's own size (`|c|` plus the frame's size times
+/// `|w|`) plus the plane's height times `|w|`, has the shape of a rounding bound but its
+/// factor is tuned, not derived: `8` and `32` count no operations of `extract_iso_crv`, the
+/// dot product or the height. It is held to that size by a test (refused at twice it,
+/// accepted at half), and measured well inside it (largest off / limit 0.0123 over the
+/// offset and extension goldens); deriving it is open.
 fn certify_iso(
     s: &BSplineSurface,
     side: BoxSide,
@@ -586,12 +621,6 @@ fn certify_iso(
         (middle.x, Direction::V)
     };
     let curve = extract_iso_crv(net, t, dir)?;
-    // the iso is interpolated between the net's rows, so its points are known to the rounding
-    // at the size of those rows, not at their own: a short arc's middle iso between rulings
-    // extended 500 mm each way
-    let rows = net.cpts().iter().flatten().fold(0.0_f64, |m, p| {
-        m.max(p.x.abs()).max(p.y.abs()).max(p.z.abs())
-    });
     let points: Vec<(Vec3, f64, f64)> = curve
         .cpts()
         .iter()
@@ -599,7 +628,7 @@ fn certify_iso(
             let w = if p.w == NOW { 1.0 } else { p.w };
             let h = Vec3::new(p.x, p.y, p.z);
             // X W from the origin, and the size of its terms
-            let mag = rows + f.size * w.abs();
+            let mag = p.x.abs().max(p.y.abs()).max(p.z.abs()) + f.size * w.abs();
             (h - f.origin * w, w, mag)
         })
         .collect();
@@ -892,4 +921,118 @@ fn slot_mut(cp: &mut [Vec<CPoint>], is_u: bool, a: usize, r: usize) -> Result<&m
     cp.get_mut(i)
         .and_then(|x| x.get_mut(j))
         .ok_or_else(|| SolidError::sm_err(OP))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::*;
+    use crate::surface::cone::p1::Cone;
+
+    /// The limit `certify_iso` holds a parallel's homogeneous control point `c` to: the
+    /// rounding at the point's own size and the frame's, `8 gamma_32 (|c| + size |w| +
+    /// |height| |w|)` (written out here so that a change to the limit's size fails).
+    fn limit(c: &CPoint, size: f64, height: f64) -> f64 {
+        let w = if c.w == NOW { 1.0 } else { c.w };
+        let mag = c.x.abs().max(c.y.abs()).max(c.z.abs()) + size * w.abs();
+        8.0 * gamma(32) * (mag + height.abs() * w.abs())
+    }
+
+    /// A cylinder of radius 1 about z, 60 degrees round, 1000 long: rows far larger than
+    /// the turn's own points, so a limit taken at the rows' size would be about 1000 times
+    /// the one at the iso's.
+    fn long_cylinder() -> BSplineSurface {
+        let k = Kernel::default();
+        let s = Surface::from(Cone::new_cylinder_bounded(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            1.0,
+            0.0,
+            60.0,
+            1000.0,
+            false,
+            false,
+            false,
+        ));
+        crate::blend::fillet_section::station::as_b_spline(&k, &s)
+            .unwrap()
+            .unwrap()
+            .into_owned()
+    }
+
+    /// The net with every control point of index `i` along the iso across `side` moved
+    /// `delta` along the axis (its homogeneous `delta w`): the iso's point `i` moves by
+    /// `delta`, the rest stay.
+    fn moved(form: &BSplineSurface, side: BoxSide, i: usize, delta: f64) -> BSplineSurface {
+        let net = form.gw_nurb().unwrap();
+        let mut cpts = net.cpts();
+        for (a, row) in cpts.iter_mut().enumerate() {
+            for (b, c) in row.iter_mut().enumerate() {
+                let along = if side.is_u() { a } else { b };
+                if along == i {
+                    let w = if c.w == NOW { 1.0 } else { c.w };
+                    c.z += delta * w;
+                }
+            }
+        }
+        let (p, q) = net.degrees();
+        BSplineSurface::from_gw_nurb(
+            &Net::new(cpts, p, q, net.u_knots().to_vec(), net.v_knots().to_vec()).unwrap(),
+        )
+    }
+
+    /// `certify_iso` refuses a parallel whose control point is off its plane by twice the
+    /// limit at the point's own size and passes one off by half of it: the limit's size is
+    /// pinned, and a limit taken at the net's rows (1000 here) would pass both.
+    #[test]
+    fn the_turn_certificate_holds_the_iso_to_its_own_size() {
+        let form = long_cylinder();
+        let frame = Frame {
+            origin: Vec3::new(0.0, 0.0, 0.0),
+            axis: Vec3::new(0.0, 0.0, 1.0),
+            apex: None,
+            size: 1.0,
+            quarter: 0.0,
+            tube_left: 0.0,
+        };
+        let dom = knot_box(&form).unwrap();
+        let mut tested = 0;
+        for side in BoxSide::ALL {
+            let middle = side.point(&dom, 0.5);
+            let (t, dir) = if side.is_u() {
+                (middle.y, Direction::U)
+            } else {
+                (middle.x, Direction::V)
+            };
+            let iso = extract_iso_crv(form.gw_nurb().unwrap(), t, dir).unwrap();
+            let pts = iso.cpts();
+            // the parallel: every point at one height (the other side's iso is a ruling)
+            let z = |c: &CPoint| c.z / if c.w == NOW { 1.0 } else { c.w };
+            if pts.len() < 3 || pts.iter().any(|c| (z(c) - z(&pts[0])).abs() > 1e-9) {
+                continue;
+            }
+            assert!(certify_iso(&form, side, middle, &frame, Iso::Parallel).is_ok());
+            let lim = limit(&pts[1], frame.size, z(&pts[0]));
+            let w1 = if pts[1].w == NOW { 1.0 } else { pts[1].w };
+            let over = moved(&form, side, 1, 2.0 * lim / w1);
+            assert!(
+                certify_iso(&over, side, middle, &frame, Iso::Parallel).is_err(),
+                "{side:?}: twice the limit passes"
+            );
+            let under = moved(&form, side, 1, 0.5 * lim / w1);
+            assert!(
+                certify_iso(&under, side, middle, &frame, Iso::Parallel).is_ok(),
+                "{side:?}: half the limit is refused"
+            );
+            tested += 1;
+        }
+        assert!(tested > 0, "no side's iso is the parallel");
+    }
 }

@@ -11,7 +11,7 @@
 //! | `find_side_edgeuse`, `find_closed_side_edgeuse` | `sm_FindSideEdgeuse`, `sm_FindClosedSideEdgeuse` |
 //! | `same_convexity_edges` | `same_convexity_edges` |
 //! | `is_tangent_seam_at_vertex` | `sm_IsTangentSeamAtVertex` (fork 856b54e) |
-//! | [`FilletCorner::make_nx1_closed_corner_topology`] ([`closed_nx1`]) | `SmFilletNx1ClosedCorner::MakeCornerTopology` |
+//! | [`FilletCorner::make_closed_turn_topology`] ([`closed_turn`]) | the blend corner's closed Turn, in place of `SmFilletNx1ClosedCorner::MakeCornerTopology` (#2349) |
 //! | [`FilletCorner::make_3x2_mixed_corner_topology`] ([`mixed_3x2`]) | `SmFillet3x2MixedConvexityCorner::MakeCornerTopology` |
 //! | `make_4x2_concave_corner_topology` (crate, `concave_4x2`) | `SmFilletNx2Corner::Make4x2ConcaveCornerTopology` |
 //! | 4x3, open and degenerate corners ([`end_corners`]) | `SmFillet4x3Corner`, `SmFilletOpenCorner`, `SmFilletDegenerateCorner` `::MakeCornerTopology` |
@@ -37,7 +37,7 @@
 //! tangency-labs/smlib@856b54e). There is no recursion.
 
 mod ball;
-pub mod closed_nx1;
+pub mod closed_turn;
 mod concave_4x2;
 pub mod concave_nxn;
 pub mod end_corners;
@@ -894,10 +894,12 @@ impl FilletCorner {
 
         // The corner is the blend corner's Turn (WR-697): SmBlendCorner::Classify made a pair
         // that is G1, or within 5 degrees at a face corner of the other convexity, a Join, with
-        // the same tests on the same edges and tolerance, so the Turn is never tangent and
-        // never blends here (`m_bG1Case` stays FALSE; the fork's smlib#113 e4083c8, #2400). At
-        // four edges it is the two blends mitred, one FILLET_X_FILLET edge; at three the edges'
-        // angle and the face corner's convexity choose the mitre's kind.
+        // the same tests on the same edges and tolerance, so the Turn never blends here
+        // (`m_bG1Case` stays FALSE; the fork's smlib#113 e4083c8, #2400). Its edges are G1
+        // only where a sharp edge stands between the blends' faces: the blends still
+        // meet on their crossing. At four edges it is the two blends mitred, one
+        // FILLET_X_FILLET edge; at three the edges' angle and the face corner's convexity
+        // choose the mitre's kind.
         let (angle_deg, mixed_convexity) = if total == 3 {
             let tangency_tol_deg = crate::math::rad_to_deg(self.tangency_tol_radians);
             let (_, angle_deg) = test_g1_continuity(

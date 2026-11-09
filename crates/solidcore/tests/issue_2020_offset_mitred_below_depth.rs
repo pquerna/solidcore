@@ -17,8 +17,9 @@
 //! the corner's bevel adjustment read the unsolved rail's crossing as parameter 0 (d =
 //! -9.5, a put-back refused); at -9 the rail met the run-on exactly at the end of its
 //! widened interval, and the put-back was refused as the fork's since 779cb9b. -9 now
-//! builds the fork's 2fc375f body (6 faces, V 1006.320632128887 through SolidCraft's
-//! capi). With the flags off, the put-back fails at -7.5 (a corner edge) and at -9
+//! builds the fork's 2fc375f body (6 faces), with the closed form's volume to 8e-12: the
+//! shrink keeps the rounds' exact trims (WR-700), where the fork's 1006.320632128887
+//! through SolidCraft's capi is 4.8e-9 over it. With the flags off, the put-back fails at -7.5 (a corner edge) and at -9
 //! (a rollover). Each such failure is now a typed refusal,
 //! `OffsetFacesRefusal::NotPutBack`, where it had none.
 #![allow(
@@ -179,8 +180,11 @@ fn solidcraft_flags_build_minus_nine_as_the_fork() {
     assert!(brep_is_manifold_solid(&b).unwrap());
     assert_eq!(b.face_list().len(), 6);
     let v = volume(k, &mut b);
-    assert!((v - analytic(-9.0)).abs() <= 1e-6 * analytic(-9.0), "V {v}");
-    assert!((v - FORK_VOLUME_D9).abs() <= 1e-9 * FORK_VOLUME_D9, "V {v}");
+    assert!(
+        (v - analytic(-9.0)).abs() <= 1e-10 * analytic(-9.0),
+        "V {v}"
+    );
+    assert!((v - FORK_VOLUME_D9).abs() <= 1e-8 * FORK_VOLUME_D9, "V {v}");
 }
 
 #[test]
@@ -306,7 +310,6 @@ fn solidcraft_flags(k: &mut Kernel) {
     k.fixes.linear_sweep_arc_to_cylinder_zero = true;
     k.fixes.local_operation_box_holds_new_surfaces = true;
     k.fixes.local_operation_closes_walls_to_nothing = true;
-    k.fixes.local_operation_offset_status = true;
     k.fixes.local_operation_refuses_loose_tangent_edges = true;
     k.fixes.local_operation_step_walls = true;
     k.fixes.loop_orientation_floor_from_loop_box = true;
@@ -355,7 +358,6 @@ fn solidcraft_flags(k: &mut Kernel) {
     k.fixes.shell_inner_shell_of_statuses = true;
     k.fixes.simple_coincidence_crossing_is_point = true;
     k.fixes.slice_coincident_faces_sheet_side = true;
-    k.fixes.sphere_small_circle_not_touching = true;
     k.fixes.ssi_low_angle_start_on_probation = true;
     k.fixes.ssi_pole_point_keeps_its_tangent = true;
     k.fixes.ssi_singular_start_inside_direction = true;

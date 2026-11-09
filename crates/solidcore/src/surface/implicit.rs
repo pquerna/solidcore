@@ -11,7 +11,6 @@
 use crate::error::{Result, SolidError};
 use crate::geom::axis2_placement::Axis2Placement;
 use crate::geom::extent2d::Extent2d;
-use crate::geom::vector2d::Point2;
 use crate::kernel::Kernel;
 use crate::math::{Vec2, Vec3, PI};
 use crate::nurbs::b_spline_curve::BSplineCurve;
@@ -67,42 +66,6 @@ pub enum Implicit {
         /// The minor radius r.
         minor: f64,
     },
-}
-
-impl Implicit {
-    /// How far `x` is from this surface.
-    #[must_use]
-    pub fn distance(&self, x: Vec3) -> f64 {
-        // the axial and radial parts of `x` about an axis through `o`
-        let about = |o: Vec3, axis: Vec3| {
-            let v = x - o;
-            let h = v.dot(axis);
-            (h, (v - axis * h).length())
-        };
-        match *self {
-            Self::Plane { origin, normal } => (x - origin).dot(normal).abs(),
-            Self::Cone {
-                origin,
-                axis,
-                radius,
-                tan_angle,
-            } => {
-                let (h, rho) = about(origin, axis);
-                (rho - (radius + tan_angle * h)).abs() / (1.0 + tan_angle * tan_angle).sqrt()
-            }
-            Self::Sphere { centre, radius } => ((x - centre).length() - radius).abs(),
-            Self::Torus {
-                centre,
-                axis,
-                major,
-                minor,
-            } => {
-                let (h, rho) = about(centre, axis);
-                let (a, b) = (rho - major, h);
-                ((a * a + b * b).sqrt() - minor).abs()
-            }
-        }
-    }
 }
 
 /// A polynomial in Bernstein form over a patch, degrees `(p, q)`, `c[i (q + 1) + j]`.
@@ -182,94 +145,10 @@ impl BPoly {
 /// `SM_ERR` without NURB data; those of the Bézier decomposition.
 pub fn lies_on(form: &BSplineSurface, a: &Implicit) -> Result<bool> {
     let nurb = form.gw_nurb().ok_or_else(|| SolidError::sm_err(OP))?;
-    let origin = match *a {
-        Implicit::Plane { origin, .. } | Implicit::Cone { origin, .. } => origin,
-        Implicit::Sphere { centre, .. } | Implicit::Torus { centre, .. } => centre,
-    };
     for row in decompose_to_bez(nurb)? {
         for patch in row {
             let (p, q) = patch.degrees();
-            let mut x = [Vec::new(), Vec::new(), Vec::new()];
-            let mut w = Vec::new();
-            // the largest absolute homogeneous term of the move to O, `|H| + |O| W`: the
-            // stored points are known to their rounding at this size, and the move rounds
-            // at it, however near O they lie
-            let mut absolute = 0.0_f64;
-            let om = origin.x.abs().max(origin.y.abs()).max(origin.z.abs());
-            for prow in patch.rows() {
-                for c in prow {
-                    // (stored weighted when rational: H, homogeneous either way)
-                    let wi = if c.w == NOW { 1.0 } else { c.w };
-                    let hm = c.x.abs().max(c.y.abs()).max(c.z.abs());
-                    absolute = absolute.max(hm + om * wi.abs());
-                    // X W = H - O W
-                    let xw = Vec3::new(c.x, c.y, c.z) - origin * wi;
-                    x[0].push(xw.x);
-                    x[1].push(xw.y);
-                    x[2].push(xw.z);
-                    w.push(wi);
-                }
-            }
-            let poly = |c: Vec<f64>| BPoly { p, q, c };
-            let [x0, x1, x2] = x;
-            let (xs, ws) = ([poly(x0), poly(x1), poly(x2)], poly(w));
-            let size = xs.iter().map(BPoly::max_abs).fold(0.0_f64, f64::max);
-            let absolute = absolute.max(size);
-            let wmax = ws.max_abs();
-            let dot = |v: Vec3| xs[0].combine(v.x, &xs[1], v.y).combine(1.0, &xs[2], v.z);
-            let norm2 = || {
-                xs[0]
-                    .mul(&xs[0])
-                    .combine(1.0, &xs[1].mul(&xs[1]), 1.0)
-                    .combine(1.0, &xs[2].mul(&xs[2]), 1.0)
-            };
-            let w2 = ws.mul(&ws);
-            let (f, scale, degree) = match *a {
-                Implicit::Plane { normal, .. } => (dot(normal), absolute, 1),
-                Implicit::Cone {
-                    axis,
-                    radius,
-                    tan_angle,
-                    ..
-                } => {
-                    let along = dot(axis);
-                    let r = ws.combine(radius, &along, tan_angle);
-                    let f = norm2().combine(1.0, &along.mul(&along), -1.0).combine(
-                        1.0,
-                        &r.mul(&r),
-                        -1.0,
-                    );
-                    let s = size + (radius + tan_angle.abs() * size) * wmax;
-                    let sa = absolute + (radius + tan_angle.abs() * absolute) * wmax;
-                    (f, s * sa, 2)
-                }
-                Implicit::Sphere { radius, .. } => {
-                    let f = norm2().combine(1.0, &w2, -radius * radius);
-                    let s = size + radius * wmax;
-                    (f, s * (absolute + radius * wmax), 2)
-                }
-                Implicit::Torus {
-                    axis, major, minor, ..
-                } => {
-                    let n2 = norm2();
-                    let along = dot(axis);
-                    let g = n2.combine(1.0, &w2, major * major - minor * minor);
-                    let radial = n2.combine(1.0, &along.mul(&along), -1.0);
-                    let f = g
-                        .mul(&g)
-                        .combine(1.0, &radial.mul(&w2), -4.0 * major * major);
-                    let s = size + (major + minor) * wmax;
-                    (f, s * s * s * (absolute + (major + minor) * wmax), 4)
-                }
-            };
-            let tol = gamma(4 * degree * (p + 1) * (q + 1) + 16) * scale;
-            let within = |v: &f64| {
-                matches!(
-                    v.abs().partial_cmp(&tol),
-                    Some(core::cmp::Ordering::Less | core::cmp::Ordering::Equal)
-                )
-            };
-            if !f.c.iter().all(within) {
+            if !bezier_on(p, q, patch.rows().flatten(), a) {
                 return Ok(false);
             }
         }
@@ -277,7 +156,157 @@ pub fn lies_on(form: &BSplineSurface, a: &Implicit) -> Result<bool> {
     Ok(true)
 }
 
-pub(crate) const OP_EXACT: &str = "surface::implicit::check_exact_net";
+/// Whether the rational curve `curve` lies on `a`, as [`lies_on`] checks it of a surface:
+/// on every Bézier segment (a patch of degrees `(p, 0)`), every Bernstein coefficient of the
+/// implicit equation is within the rounding of computing it from the segment's control
+/// points as they are stored. Nothing is sampled.
+///
+/// What it shows is that the segments' points are on `a` to the rounding of evaluating
+/// the equation at part scale, not exact containment: the bound does not cover the
+/// rounding of the Bézier decomposition (its knot insertion), nor of any trim or
+/// construction that made `curve`; a curve moved off `a` by more than that rounding is
+/// refused.
+///
+/// # Errors
+///
+/// `SM_ERR` without NURB data; those of the Bézier decomposition.
+pub fn curve_lies_on(curve: &BSplineCurve, a: &Implicit) -> Result<bool> {
+    let nurb = curve.nurb.as_ref().ok_or_else(|| SolidError::sm_err(OP))?;
+    for seg in nurb.decompose_bez()? {
+        if !bezier_on(seg.degree(), 0, seg.cpts().iter(), a) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The plane `form` lies on, certified by [`lies_on`]: through its first control point,
+/// normal to the two of its control points' chords from there that span the most (the
+/// farthest point, then the one farthest off that chord), so the normal is as well
+/// conditioned as the net allows. `None` where the net spans no plane (its points on one
+/// line) or does not lie on that one: a net off a plane by more than the rounding of its
+/// stored points is no plane.
+///
+/// # Errors
+///
+/// `SM_ERR` without NURB data; those of [`lies_on`].
+pub fn plane_of_net(form: &BSplineSurface) -> Result<Option<Implicit>> {
+    let (net, _, _) = euclidean_net(form)?;
+    let points: Vec<Vec3> = net.into_iter().flatten().collect();
+    let Some(&origin) = points.first() else {
+        return Ok(None);
+    };
+    let far = |a: &&Vec3, b: &&Vec3| (**a - origin).length().total_cmp(&(**b - origin).length());
+    let Some(&along) = points.iter().max_by(far) else {
+        return Ok(None);
+    };
+    let chord = along - origin;
+    let off = |a: &&Vec3, b: &&Vec3| {
+        let (x, y) = (chord.cross(**a - origin), chord.cross(**b - origin));
+        x.length().total_cmp(&y.length())
+    };
+    let Some(&across) = points.iter().max_by(off) else {
+        return Ok(None);
+    };
+    let Ok(normal) = chord.cross(across - origin).unitize() else {
+        return Ok(None);
+    };
+    let plane = Implicit::Plane { origin, normal };
+    Ok(lies_on(form, &plane)?.then_some(plane))
+}
+
+/// Whether the Bézier patch of degrees `(p, q)` with homogeneous points `points` (row by
+/// row) lies on `a` ([`lies_on`]).
+fn bezier_on<'a>(
+    p: usize,
+    q: usize,
+    points: impl Iterator<Item = &'a crate::nurbs::math::CPoint>,
+    a: &Implicit,
+) -> bool {
+    let origin = match *a {
+        Implicit::Plane { origin, .. } | Implicit::Cone { origin, .. } => origin,
+        Implicit::Sphere { centre, .. } | Implicit::Torus { centre, .. } => centre,
+    };
+    let mut x = [Vec::new(), Vec::new(), Vec::new()];
+    let mut w = Vec::new();
+    // the largest absolute homogeneous term of the move to O, `|H| + |O| W`: the
+    // stored points are known to their rounding at this size, and the move rounds
+    // at it, however near O they lie
+    let mut absolute = 0.0_f64;
+    let om = origin.x.abs().max(origin.y.abs()).max(origin.z.abs());
+    for c in points {
+        // (stored weighted when rational: H, homogeneous either way)
+        let wi = if c.w == NOW { 1.0 } else { c.w };
+        let hm = c.x.abs().max(c.y.abs()).max(c.z.abs());
+        absolute = absolute.max(hm + om * wi.abs());
+        // X W = H - O W
+        let xw = Vec3::new(c.x, c.y, c.z) - origin * wi;
+        x[0].push(xw.x);
+        x[1].push(xw.y);
+        x[2].push(xw.z);
+        w.push(wi);
+    }
+    let poly = |c: Vec<f64>| BPoly { p, q, c };
+    let [x0, x1, x2] = x;
+    let (xs, ws) = ([poly(x0), poly(x1), poly(x2)], poly(w));
+    let size = xs.iter().map(BPoly::max_abs).fold(0.0_f64, f64::max);
+    let absolute = absolute.max(size);
+    let wmax = ws.max_abs();
+    let dot = |v: Vec3| xs[0].combine(v.x, &xs[1], v.y).combine(1.0, &xs[2], v.z);
+    let norm2 = || {
+        xs[0]
+            .mul(&xs[0])
+            .combine(1.0, &xs[1].mul(&xs[1]), 1.0)
+            .combine(1.0, &xs[2].mul(&xs[2]), 1.0)
+    };
+    let w2 = ws.mul(&ws);
+    let (f, scale, degree) = match *a {
+        Implicit::Plane { normal, .. } => (dot(normal), absolute, 1),
+        Implicit::Cone {
+            axis,
+            radius,
+            tan_angle,
+            ..
+        } => {
+            let along = dot(axis);
+            let r = ws.combine(radius, &along, tan_angle);
+            let f = norm2()
+                .combine(1.0, &along.mul(&along), -1.0)
+                .combine(1.0, &r.mul(&r), -1.0);
+            let s = size + (radius + tan_angle.abs() * size) * wmax;
+            let sa = absolute + (radius + tan_angle.abs() * absolute) * wmax;
+            (f, s * sa, 2)
+        }
+        Implicit::Sphere { radius, .. } => {
+            let f = norm2().combine(1.0, &w2, -radius * radius);
+            let s = size + radius * wmax;
+            (f, s * (absolute + radius * wmax), 2)
+        }
+        Implicit::Torus {
+            axis, major, minor, ..
+        } => {
+            let n2 = norm2();
+            let along = dot(axis);
+            let g = n2.combine(1.0, &w2, major * major - minor * minor);
+            let radial = n2.combine(1.0, &along.mul(&along), -1.0);
+            let f = g
+                .mul(&g)
+                .combine(1.0, &radial.mul(&w2), -4.0 * major * major);
+            let s = size + (major + minor) * wmax;
+            (f, s * s * s * (absolute + (major + minor) * wmax), 4)
+        }
+    };
+    let tol = gamma(4 * degree * (p + 1) * (q + 1) + 16) * scale;
+    let within = |v: &f64| {
+        matches!(
+            v.abs().partial_cmp(&tol),
+            Some(core::cmp::Ordering::Less | core::cmp::Ordering::Equal)
+        )
+    };
+    f.c.iter().all(within)
+}
+
+const OP_EXACT: &str = "surface::implicit::check_exact_net";
 
 /// A quadric `x.A.x + 2 b.x + c = 0` as `(A, b, c)`.
 pub type QuadricEquation = ([[f64; 3]; 3], [f64; 3], f64);
@@ -371,46 +400,6 @@ pub fn check_exact_net(k: &Kernel, net: &Surface, check: &ExactNetCheck) -> Resu
         ));
     }
     Ok(())
-}
-
-/// The number of intervals [`net_miss`] samples a net at, each way.
-const MISS_SAMPLES: u32 = 16;
-
-/// How far `net` strays from the class's `surface`, sampled over its domain. A guard, not a
-/// certificate: [`check_exact_net`] is the proof, and a net that passes only this keeps no
-/// definition. It tells a net that the class's rounding leaves off the surface from one
-/// built wrongly.
-///
-/// # Errors
-///
-/// Those of the evaluations.
-pub fn net_miss(k: &Kernel, net: &Surface, surface: &ClassSurface) -> Result<f64> {
-    let dom = net.natural_uv_domain_with_nurb(k)?;
-    let (lo, hi) = (dom.min(), dom.max());
-    let mut worst = 0.0_f64;
-    for i in 0..=MISS_SAMPLES {
-        for j in 0..=MISS_SAMPLES {
-            let (fu, fv) = (
-                f64::from(i) / f64::from(MISS_SAMPLES),
-                f64::from(j) / f64::from(MISS_SAMPLES),
-            );
-            let uv = Point2::new(lo.x + (hi.x - lo.x) * fu, lo.y + (hi.y - lo.y) * fv);
-            let x = net.evaluate_point(k, uv)?;
-            let miss = match surface {
-                ClassSurface::Implicit(a) => a.distance(x),
-                ClassSurface::Canal {
-                    spine, map, radius, ..
-                } => {
-                    let w = if map.along_v { uv.y } else { uv.x };
-                    let ivl = spine.natural_interval();
-                    let s = (map.a + map.b * w).max(ivl.min()).min(ivl.max());
-                    ((x - spine.evaluate_point(s)?).length() - *radius).abs()
-                }
-            };
-            worst = worst.max(miss);
-        }
-    }
-    Ok(worst)
 }
 
 /// A Bezier segment of a rational curve, Bernstein polynomials of degree `(p, 0)`: the

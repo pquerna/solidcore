@@ -1,15 +1,5 @@
 [
   {
-    "case": "fillets/12034-round-loft-square-to-circle-circular-rim",
-    "issue": "solidcore#2844",
-    "reason": "the round of the loft's circular rim is not a closed solid"
-  },
-  {
-    "case": "fillets/12342-round-wall-and-ledge-edges-r2-5",
-    "issue": "solidcore#2845",
-    "reason": "status 1001 instead of a closed solid"
-  },
-  {
     "case": "fillets/12342-round-wall-and-ledge-edges-r5-refused",
     "issue": "solidcore#2845",
     "reason": "status 1001 instead of the refusal naming the size that fits"
@@ -18,11 +8,6 @@
     "case": "fillets/12342-round-wall-edge-r5-past-the-wall-refused",
     "issue": "solidcore#2845",
     "reason": "status 1001 instead of the refusal naming the size that fits"
-  },
-  {
-    "case": "fillets/4782-fillet-bar-edge-wider-than-both-faces",
-    "issue": "tangency-labs/solidcore#2948",
-    "reason": "continuity_order: got Box: no null seams want >= g1 at every blend seam"
   },
   {
     "case": "fillets/9-fillet-corner-curvature-with-reduce-fit",
@@ -89,10 +74,5 @@
     "issue": "tangency-labs/solidcore#2849",
     "reason": "the Mixed corner's chamfer face stands 7.2e-4 out of the front face y = 0 (its bilinear Coons patch bulges past the plane), past the case's 4e-5 box",
     "fails": "volume 9383.450962465247 (rig 9383.4506602363)"
-  },
-  {
-    "case": "shell/cov-shell-again-open-at-an-inner-wall-of-a-shelled-box",
-    "issue": "tangency-labs/solidcore#2954",
-    "reason": "step 9 (solid.shell): SMLib shell: operation: SMLib failed (status 1001)"
   }
 ]

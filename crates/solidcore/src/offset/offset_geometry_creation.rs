@@ -43,7 +43,7 @@
 //! - **Four faces at a vertex (WR-666, opt-in).** With `Kernel::fixes.offset_four_face_vertex_split`
 //!   and `offset_closes_loop_gaps`, the fork's tangency-labs/smlib@2e1bb8c: the tangency
 //!   tolerance is half a degree, `trim_extended_edge` keeps a near-tangent trim point where
-//!   the curve crosses the surface, and at an all-convex or all-concave vertex takes the cut
+//!   the curve passes through the surface by more than the tolerance, and at an all-convex or all-concave vertex takes the cut
 //!   reached first from the edge's other end. That choice also skips, on an open edge's
 //!   second end, a cut at the first trim point again (the fork's `bFirstAgain`, used there
 //!   only; the main candidate search is upstream's, WR-463's opt-in covers closed curves).
@@ -119,10 +119,10 @@
 //!   (`CreateTrimmedPlaneFromRuled`'s reading of an arc, `MakeCurvesCompatible`, the
 //!   knots and extension of a UV curve) see the B-spline part.
 //! - **Code behind stubs** is ported as upstream runs it, unchecked statuses included:
-//!   `HaveTangentGaps` ignores `NormalizedEvaluate`'s and `ClosestPoint`'s statuses (a
-//!   failed evaluation leaves the point at `SmPoint3d`'s `SM_UNDEF_DOUBLE` default, a
-//!   failed closest point counts as `bSuccess == FALSE`), `TrimExtendedEdge` ignores the
-//!   `Evaluate` / `EvaluateNormal` of a solution the same way, and `ExtendTrimEdges` keeps
+//!   `HaveTangentGaps` ignores `ClosestPoint`'s status (a failed closest point counts as
+//!   `bSuccess == FALSE`; a sample it cannot evaluate is skipped, as the fork does, see
+//!   below), `TrimExtendedEdge` ignores the `Evaluate` / `EvaluateNormal` of a solution
+//!   the same way, and `ExtendTrimEdges` keeps
 //!   `pOtherUVCurve` as the edge use's or radial's own UV trim curve when there is no
 //!   other extended surface (`cpp:1452`, `1458`), passes it to `TrimExtendedEdge` and trims
 //!   it in place (`cpp:1694`). The unchecked `Copy` calls of `ExtendTrimEdges` and
@@ -160,17 +160,18 @@
 //!   upstream's stay on the surfaces between curve replacements.
 //! - **Recursion.** None.
 //!
-//! With `offset_tangent_gap_statuses` (#483; the fork's behaviour since #2009, fork
-//! 4803d6d), `HaveTangentGaps` skips a sample it cannot evaluate (it measured an unset
-//! point); `ClosestPoint`'s status stays dropped, its success flag decides. A successful
-//! query without a solution retains its existing meaning.
+//! As the fork does (#483; fork 4803d6d, since #2009), `HaveTangentGaps` skips a sample
+//! it cannot evaluate (upstream measured an unset point); `ClosestPoint`'s status stays
+//! dropped, its success flag decides. A successful query without a solution retains its
+//! existing meaning.
 //!
 
 use crate::blend::fillet_standard_solver::p1::CircularCrossSectionFsg;
 use crate::curve::curve::p1::GlobalPointSolveOptions;
 use crate::curve::curve::p2::{Curve, CurveKind, ELLIPSE_TYPE, LINE_TYPE};
 use crate::curve::curve::p8::CurveIntersectOptions;
-use crate::error::{Result, SolidError};
+use crate::error::offset::OffsetFailure;
+use crate::error::{Failure, Reason, Result, SolidError};
 use crate::geom::assert_array::ObjectKey;
 use crate::geom::axis2_placement::Axis2Placement;
 use crate::geom::context::MarkType;
@@ -199,7 +200,7 @@ use crate::nurbs::math::{NOW, NOZ};
 use crate::query::brep::BrepFaceServices;
 use crate::query::edge::ClosestPoint;
 use crate::surface::offset_surface::{OffsetSurface, SS_UNKNOWN as OFFSET_SS_UNKNOWN};
-use crate::surface::surface::p1::SurfaceSolveContext;
+use crate::surface::surface::p1::{SurfaceIntersectContext, SurfaceSolveContext};
 use crate::surface::surface::p2::{
     SurfaceKind, TsectCurveType, CONE_TYPE, CYLINDER_TYPE, PLANE_TYPE, SPHERE_TYPE, TORUS_TYPE,
 };
@@ -365,12 +366,9 @@ fn tangent_gap_samples<B>(
 ) -> Result<bool> {
     for i in 0..=num_samples {
         let param = (i as f64 * 1.0) / (num_samples as f64 * 1.0);
-        let evaluation = ignore_soft(evaluate(k, brep, param))?;
-        let pnt = match evaluation {
-            Some(pnt) => pnt,
-            // fork 4803d6d: a sample that cannot be evaluated shows no gap
-            None if k.fixes.offset_tangent_gap_statuses => continue,
-            None => Vec3::new(UNDEF_DOUBLE, UNDEF_DOUBLE, UNDEF_DOUBLE),
+        // fork 4803d6d: a sample that cannot be evaluated shows no gap
+        let Some(pnt) = ignore_soft(evaluate(k, brep, param))? else {
+            continue;
         };
         // `ClosestPoint`'s status is dropped (the fork keeps it so: its `bSuccess`
         // says whether a closest point was found)
@@ -416,6 +414,14 @@ pub trait OffsetExecutive<O> {
     fn is_local_operation(&self) -> bool {
         false
     }
+    /// Not upstream: whether original edge use `original`'s edge keeps its geometry in a
+    /// local operation (its faces and every face at its vertices keep their surfaces):
+    /// its offsets keep their faces' own curves, not mated again; `false` unless the
+    /// adapter says so.
+    fn keeps_edge(&self, original: O) -> bool {
+        let _ = original;
+        false
+    }
     /// Not upstream (WR-346): whether any inset face's offset collapsed (a convex round
     /// thinner than the wall); `false` unless `Kernel::fixes.offset_collapsed_rounds_mated`.
     fn has_collapsed_faces(&self) -> bool {
@@ -455,6 +461,16 @@ pub trait OffsetExecutive<O> {
         brep: &mut B,
         base: O,
     ) -> Result<(O, Extent2d)>;
+    /// The margin the analytic copy of `base` is extended by for the exact mate
+    /// (`Kernel::fixes.offset_analytic_mate_edges`): the one its extension
+    /// ([`Self::get_create_extended_surface`]) is made with, so the copy holds every piece
+    /// marched on that extension. The default is `upstream`, the fork's five offset
+    /// distances (an implementation compared against it keeps it); the executive's
+    /// adapter gives its face's recorded reach (not upstream).
+    fn analytic_extension_margin(&self, base: O, upstream: f64) -> f64 {
+        let _ = base;
+        upstream
+    }
 }
 
 /// What the unit reads from and writes to the original and offset B-reps,
@@ -620,6 +636,8 @@ pub trait OffsetBrep<O>: ProtoGeometry<O> {
     fn edge_create_trimmed_nurbs_curve(&mut self, k: &Kernel, edge: O) -> Result<Option<O>>;
     /// `SmVertex::GetPoint` (`topology::vertex::point`).
     fn vertex_point(&self, vertex: O) -> Result<Point3>;
+    /// `SmVertex::GetTolerance` (`topology::vertex::tolerance`).
+    fn vertex_tolerance(&self, vertex: O) -> Result<f64>;
     /// `SmVertex::SetPoint` (`topology::vertex::set_point`).
     fn set_vertex_point(&mut self, k: &Kernel, vertex: O, point: Point3) -> Result<()>;
     /// `SmVertex::IsLaminaVertex` (`topology::vertex::is_lamina_vertex`).
@@ -1094,6 +1112,35 @@ fn b_spline_part(c: &Curve) -> Result<Option<BSplineCurve>> {
     })
 }
 
+/// Like [`b_spline_part`], materialising the rational NURB on a clone when an analytic
+/// conic (`Ellipse`, `Hyperbola`, `Parabola`) has cleared its lazy NURB (e.g. after
+/// [`Curve::trim`]).
+fn b_spline_with_nurb(k: &Kernel, c: &Curve) -> Result<Option<BSplineCurve>> {
+    Ok(match c.kind() {
+        CurveKind::BSpline(b) => Some(b.clone()),
+        CurveKind::Line(l) => Some(l.base_with_nurb()?.into_owned()),
+        CurveKind::Ellipse(e) if e.base().gw_nurb().is_none() => {
+            let mut made = e.clone();
+            made.make_nurb(k)?;
+            Some(made.base().clone())
+        }
+        CurveKind::Ellipse(e) => Some(e.base().clone()),
+        CurveKind::Hyperbola(h) if h.base().gw_nurb().is_none() => {
+            let mut made = h.clone();
+            made.make_nurb(None)?;
+            Some(made.base().clone())
+        }
+        CurveKind::Hyperbola(h) => Some(h.base().clone()),
+        CurveKind::Parabola(p) if p.base().gw_nurb().is_none() => {
+            let mut made = p.clone();
+            made.make_nurb(None)?;
+            Some(made.base().clone())
+        }
+        CurveKind::Parabola(p) => Some(p.base().clone()),
+        _ => None,
+    })
+}
+
 /// The NURB part of an `SmBSplineCurve` kind, in place: the static
 /// `SmBSplineCurve::MakeCurvesCompatible` edits the NURB of whatever kind it is given
 /// (a line's NURB is made first when it has none); `None` for the other kinds.
@@ -1517,6 +1564,49 @@ fn is_arc(k: &Kernel, c: &BSplineCurve, num_samples: u64, tol: f64) -> Result<Op
 /// effect, as the split alone leaves those faces' loops open).
 pub(crate) fn four_face_vertex_split(fixes: &crate::kernel::UpstreamFixes) -> bool {
     fixes.offset_four_face_vertex_split && fixes.offset_closes_loop_gaps
+}
+
+/// Whether `curve` at `t` passes through `surface` at `uv` (where they meet) by more than
+/// `tol`. To second order in arc length s the curve's height over the surface is
+/// `g1 s + g2 s^2 / 2`, `g1` the sine of the angle between them and `g2` the curve's
+/// curvature towards the surface's normal less the surface's normal curvature along the
+/// curve: it is back on the surface at `-2 g1 / g2` and between the two it reaches
+/// `g1^2 / (2 |g2|)` from the surface. Within `tol` that is a touch: a curve exact to `tol`
+/// that touches the surface meets it twice, close together, wherever the error leaves it.
+///
+/// # Errors
+///
+/// `SM_ERR` where the curve stops or the surface is singular (no tangent plane); those of
+/// the evaluations.
+fn passes_through(
+    k: &Kernel,
+    curve: &Curve,
+    t: f64,
+    surface: &Surface,
+    uv: Point2,
+    tol: f64,
+) -> Result<bool> {
+    let err = || sm_err("offset_geometry_creation::passes_through");
+    let pv = curve.evaluate(k, t, 2, true, true)?;
+    let (d1, d2) = (*pv.get(1).ok_or_else(err)?, *pv.get(2).ok_or_else(err)?);
+    let s = surface.evaluate(k, uv, 2, 2, EvaluateFlags::default())?;
+    let at = |i: usize, j: usize| s.get(i).and_then(|r| r.get(j)).copied().ok_or_else(err);
+    let (du, dv, duu, duv, dvv) = (at(1, 0)?, at(0, 1)?, at(2, 0)?, at(1, 1)?, at(0, 2)?);
+    let n = du.cross(dv).unitize().map_err(|_| err())?;
+    let speed2 = d1.length_squared();
+    let tangent = d1.unitize().map_err(|_| err())?;
+    // the tangent's components along du and dv
+    let (e, f, g) = (du.dot(du), du.dot(dv), dv.dot(dv));
+    let det = e * g - f * f;
+    if det <= EFF_ZERO * e * g {
+        return Err(err());
+    }
+    let (tu, tv) = (tangent.dot(du), tangent.dot(dv));
+    let (a, b) = ((g * tu - f * tv) / det, (e * tv - f * tu) / det);
+    let normal_curvature = n.dot(duu) * a * a + 2.0 * n.dot(duv) * a * b + n.dot(dvv) * b * b;
+    let g1 = n.dot(tangent);
+    let g2 = n.dot(d2 - tangent * d2.dot(tangent)) / speed2 - normal_curvature;
+    Ok(g1 * g1 > 2.0 * g2.abs() * tol)
 }
 
 /// The offset geometry creator (`SmOffsetGeometryCreation`).
@@ -2800,26 +2890,21 @@ impl OffsetGeometryCreation {
                     // shallow angle crosses it all the same (a trough's floor facets falling
                     // 1 degree, whose offsets cut the offset edges along the walls 0.6
                     // degrees off them): only a touch, the curve meeting the surface without
-                    // passing through it, is no trim point. The curve crosses where it lies
-                    // on either side of the surface just before and just after the point.
-                    let mut crosses = false;
-                    if four_face && !(angle_deg < 85.0 || angle_deg > 95.0) {
-                        let c_ivl = curve_of(brep, curve_3d)?.natural_interval();
-                        let step = 1.0e-3 * c_ivl.length();
-                        let t = sol.start.param(0)?;
-                        let (before, after) = (t - step, t + step);
-                        if before >= c_ivl.min() && after <= c_ivl.max() {
-                            let on = surface_of(brep, ext_surface)?.evaluate_point(k, uv)?;
-                            let curve = curve_of(brep, curve_3d)?;
-                            let b_pnt = curve.evaluate_point(k, before)?;
-                            let a_pnt = curve.evaluate_point(k, after)?;
-                            let d_b = (b_pnt - on).dot(normal);
-                            let d_a = (a_pnt - on).dot(normal);
-                            let least =
-                                10.0 * EFF_ZERO * (1.0 + distance(on, Point3::new(0.0, 0.0, 0.0)));
-                            crosses = d_b * d_a < 0.0 && d_b.abs() > least && d_a.abs() > least;
-                        }
-                    }
+                    // passing through it, is no trim point. A curve exact to the tolerance
+                    // that touches the surface (the drafted end of a round, cut where the
+                    // round meets the top face tangentially) crosses it twice within the
+                    // tolerance, so it crosses only where it passes through by more than
+                    // the tolerance ([`passes_through`]).
+                    let crosses = four_face
+                        && !(angle_deg < 85.0 || angle_deg > 95.0)
+                        && passes_through(
+                            k,
+                            curve_of(brep, curve_3d)?,
+                            sol.start.param(0)?,
+                            surface_of(brep, ext_surface)?,
+                            uv,
+                            tol_3d,
+                        )?;
                     if angle_deg < 85.0 || angle_deg > 95.0 || crosses {
                         // save solution as possible trimPoint
                         solutions.add(sol);
@@ -3707,26 +3792,28 @@ impl OffsetGeometryCreation {
             return Err(sm_err(OP_EXTEND));
         };
 
-        // Trim the 3 curves to the common interval (may snap sIvl by tol to existing knots:
-        // the snapped interval is what the next trim gets)
-        let mut ti = trim_ivl;
-        {
-            let c = brep
-                .curve_mut(lifted_h)
-                .ok_or(dangling("curve handle cannot be resolved"))?;
-            c.trim(k, &mut ti, TrimMode::Notify)?;
-        }
-        {
-            let c = brep
-                .curve_mut(uv_curve_extended_h)
-                .ok_or(dangling("curve handle cannot be resolved"))?;
-            c.trim(k, &mut ti, TrimMode::Notify)?;
-        }
+        // Trim the curves to the common interval so the 3D curve and its UV curves end together
+        let c_lifted = curve_of(brep, lifted_h)?;
+        let c_uv = curve_of(brep, uv_curve_extended_h)?;
+        let mut curves_to_trim = vec![c_lifted, c_uv];
         if let Some(other) = other_uv_h {
+            curves_to_trim.push(curve_of(brep, other)?);
+        }
+        let ti = crate::surface::surface::exact_pieces::common_trim_interval(
+            k,
+            &curves_to_trim,
+            trim_ivl,
+            OP_EXTEND,
+        )?;
+        let mut handles = vec![lifted_h, uv_curve_extended_h];
+        if let Some(other) = other_uv_h {
+            handles.push(other);
+        }
+        for h in handles {
             let c = brep
-                .curve_mut(other)
+                .curve_mut(h)
                 .ok_or(dangling("curve handle cannot be resolved"))?;
-            c.trim(k, &mut ti, TrimMode::Notify)?;
+            crate::surface::surface::exact_pieces::trim_unsnapped(k, c, ti, OP_EXTEND)?;
         }
 
         let lifted_copy = curve_of(brep, lifted_h)?.copy(k)?;
@@ -3844,6 +3931,35 @@ impl OffsetGeometryCreation {
             Some(ssi_tol),
             Some(deg20_rad),
         )?;
+        // Not upstream: an extension kept exactly keeps its analytic kind, so the
+        // intersection may be an analytic special case's exact curve, over the whole
+        // analytic surfaces and without UV curves, where upstream's fitted extensions give
+        // marched pieces bounded by the domains, with their UV curves. Each such curve is
+        // its pieces inside both extended domains, with their UV curves, proved on both.
+        // Every failure of the cut is typed and passed on (never read as "unmated").
+        // The drops run under the intersection's face-aware context: an extended surface
+        // that is a face's own surface traces on its face's cache.
+        ssi.clip_exact_curves_with_context(
+            k,
+            Some(SurfaceIntersectContext {
+                solver: &mut OffsetSurfaceSolveContext(brep),
+                handles: [Some(ext_surface1), Some(ext_surface2)],
+            }),
+            &s1,
+            &domain1,
+            other,
+            &domain2,
+            ssi_tol,
+        )
+        .map_err(|e| {
+            if e.is_unported_or_cancelled() {
+                e
+            } else {
+                Failure::new(OP_MATE, OffsetFailure::ExactCurveUncut)
+                    .caused_by(e)
+                    .into_error()
+            }
+        })?;
 
         // `Kernel::fixes.offset_analytic_mate_edges` (tangency-labs/smlib@fddc366 and
         // @98ab1b0, #1453/#1130): two analytic surfaces meet on lines and conics. The
@@ -3853,9 +3969,11 @@ impl OffsetGeometryCreation {
         // analytic surfaces, not on a tangent extension) is replaced by that curve, its
         // UV curves dropped from it.
         if k.fixes.offset_analytic_mate_edges {
-            let ext_dist = self.offset_distance().abs() * 5.0;
-            let analytic1 = create_analytic_extension(k, surface_of(brep, surf1)?, ext_dist)?;
-            let analytic2 = create_analytic_extension(k, surface_of(brep, surf2)?, ext_dist)?;
+            let upstream = self.offset_distance().abs() * 5.0;
+            let margin1 = executive.analytic_extension_margin(surf1, upstream);
+            let margin2 = executive.analytic_extension_margin(surf2, upstream);
+            let analytic1 = create_analytic_extension(k, surface_of(brep, surf1)?, margin1)?;
+            let analytic2 = create_analytic_extension(k, surface_of(brep, surf2)?, margin2)?;
             if let (Some(analytic1), Some(analytic2)) = (&analytic1, &analytic2) {
                 if !ssi.curves_3d.is_empty() {
                     let exact = analytic1.global_surface_intersect(
@@ -3950,17 +4068,25 @@ impl OffsetGeometryCreation {
                 continue;
             }
 
-            // get iith XSect 3D and UVTrim Curves (null UVTrimCurves are an error)
+            // get iith XSect 3D and UVTrim Curves (null UVTrimCurves are an error; not
+            // upstream: a port invariant, every curve the intersection gives here has
+            // both, so it is passed on, never taken for an edge that cannot be mated)
+            let missing_uv = || {
+                SolidError::port_invariant(
+                    OP_MATE,
+                    "an intersection curve of the extended surfaces has no UV curve",
+                )
+            };
             let uv1 = surface1_uv_curves
                 .get(ii)
                 .copied()
                 .flatten()
-                .ok_or(SolidError::null_pointer(OP_MATE))?;
+                .ok_or_else(missing_uv)?;
             let uv2 = surface2_uv_curves
                 .get(ii)
                 .copied()
                 .flatten()
-                .ok_or(SolidError::null_pointer(OP_MATE))?;
+                .ok_or_else(missing_uv)?;
             if !is_b_spline_kind(curve_of(brep, uv1)?) || !is_b_spline_kind(curve_of(brep, uv2)?) {
                 return Err(SolidError::null_pointer(OP_MATE));
             }
@@ -4025,14 +4151,29 @@ impl OffsetGeometryCreation {
 
         // (the found curves are removed from the arrays upstream so that they are not deleted)
 
-        // Trim bound best XSectCurves to sTrimIvl (may snap sIvl by tol to existing knots:
-        // the snapped interval is what the next trim gets)
-        let mut ti = trim_ivl;
+        // Trim bound best XSectCurves to sTrimIvl (may snap sIvl by tol to existing knots).
+        // Not upstream: upstream trims them in turn, the interval snapped by each trim
+        // given to the next, so a curve trimmed before a later snap ends at the unsnapped
+        // parameter: the edge's interval (its 3D curve's, `replace_edge_curves`) is then
+        // not its UV curves'. Upstream's marched curves share their knots and snap alike;
+        // an exact curve's piece (`clip_exact_curves`, a conic snapping onto its NURB's
+        // knots) and its dropped UV curves do not. All three are trimmed to the one
+        // interval none of their trims snaps.
+        let ti = crate::surface::surface::exact_pieces::common_trim_interval(
+            k,
+            &[
+                curve_of(brep, curve_3d_found)?,
+                curve_of(brep, uv_curve1_found)?,
+                curve_of(brep, uv_curve2_found)?,
+            ],
+            trim_ivl,
+            OP_MATE,
+        )?;
         for h in [curve_3d_found, uv_curve1_found, uv_curve2_found] {
             let c = brep
                 .curve_mut(h)
                 .ok_or(dangling("curve handle cannot be resolved"))?;
-            c.trim(k, &mut ti, TrimMode::Notify)?;
+            crate::surface::surface::exact_pieces::trim_unsnapped(k, c, ti, OP_MATE)?;
         }
 
         // Replace Curve of edge and set its new domain.
@@ -4071,10 +4212,9 @@ impl OffsetGeometryCreation {
     ///
     /// # Errors
     ///
-    /// Evaluation and closest-point statuses are ignored (`Unported` aside); with
-    /// `offset_tangent_gap_statuses` a sample that cannot be evaluated is skipped
-    /// (fork 4803d6d). A successful closest-point query without a solution does not
-    /// establish a gap.
+    /// Evaluation and closest-point statuses are ignored (`Unported` aside); a sample
+    /// that cannot be evaluated is skipped (fork 4803d6d). A successful closest-point
+    /// query without a solution does not establish a gap.
     /// [`SolidError::InvalidInput`] for an edge use without edge.
     pub fn have_tangent_gaps<O: ClassObject + SolutionObject>(
         &self,
@@ -4367,6 +4507,12 @@ impl OffsetGeometryCreation {
 
         // If we are extending convex edges, extend both offset surfaces to hit each other.
         if executive.extend_convex_edges() && !shell_tangent_gap {
+            // Not upstream: in a local operation, an edge whose faces and vertices' faces
+            // all keep their surfaces keeps its geometry: the offset edges keep the faces'
+            // own curves (owner's decision; their surfaces are not intersected again)
+            if executive.keeps_edge(original_edgeuse) {
+                return Ok(out);
+            }
             let lamina = brep.edge_is_lamina(orig_edge)?;
 
             // No, we have to call ExtendTrimEdges() for Lamina Edges.  [cbi B01; B256 ok]
@@ -4415,8 +4561,10 @@ impl OffsetGeometryCreation {
                 return Ok(out);
             }
 
-            // Mate a couple of edges by extension and intersection (a problem is only reported).
-            let mated = ignore_soft(self.mate_edges(
+            // Mate a couple of edges by extension and intersection (a problem is only
+            // reported; not upstream: a port invariant (through `ignore_soft`), and an
+            // exact intersection curve that cannot be cut into its pieces, are passed on)
+            let mated = match self.mate_edges(
                 k,
                 brep,
                 executive,
@@ -4425,7 +4573,17 @@ impl OffsetGeometryCreation {
                 offset_edgeuse,
                 other_offset_edgeuse,
                 mark,
-            ))?;
+            ) {
+                Err(e)
+                    if matches!(
+                        e.failure().map(|f| &f.reason),
+                        Some(Reason::Offset(OffsetFailure::ExactCurveUncut))
+                    ) =>
+                {
+                    return Err(e)
+                }
+                r => ignore_soft(r)?,
+            };
             // Not upstream (WR-344 refinement, #1795): the merge must still intersect the
             // offsets of an edge that could not be mated
             if mated.is_none() && k.fixes.offset_extended_edges_mated {
@@ -4544,8 +4702,33 @@ impl OffsetGeometryCreation {
                 rail2 = b_spline_of(brep, h)?;
             }
         }
-
-        // When not given an OffsetEdgeuse - make a Rail1Curve by approximating OrigEU->UVTrimCurve Offset
+        if shell_tangent_gap {
+            if let (Some(off), Some(other_off)) = (offset_edgeuse, other_offset_edgeuse) {
+                let cl_pv = center_line.evaluate(k, edge_ivl.evaluate(0.5), 1, true, true)?;
+                let cl_tan = cl_pv
+                    .get(1)
+                    .copied()
+                    .ok_or(dangling("centre line tangent"))?;
+                self.reconcile_shell_tangent_rails(
+                    k,
+                    brep,
+                    executive,
+                    [
+                        ShellTangentInput {
+                            orig_eu: original_edgeuse,
+                            off_eu: off,
+                            rail: &mut rail1,
+                        },
+                        ShellTangentInput {
+                            orig_eu: other_original_edgeuse,
+                            off_eu: other_off,
+                            rail: &mut rail2,
+                        },
+                    ],
+                    cl_tan,
+                )?;
+            }
+        }
         if rail1.is_none() {
             // make temporary copy of the OrigEU->UVTrimCurve trimmed to sEdgeIvl
             let uv = brep
@@ -4756,6 +4939,14 @@ impl OffsetGeometryCreation {
         if rail1.degree()? > 2 || rail2.degree()? > 2 {
             // make rail1/rail2/centerLine curves compatible i.e. share a common knotVector
             // (the static routine edits the NURB part of the centre line, whatever its kind)
+            if shell_tangent_gap {
+                if let Some(mut made_cl) = b_spline_with_nurb(k, &center_line)? {
+                    made_cl.edit_parameterization(&rail1.natural_interval())?;
+                    if let Some(cl_slot) = b_spline_part_mut(&mut center_line)? {
+                        *cl_slot = made_cl;
+                    }
+                }
+            }
             let cl_part =
                 b_spline_part_mut(&mut center_line)?.ok_or(dangling("centre line kind"))?;
             let mut curves = [rail1, rail2, cl_part.clone()];
@@ -4793,6 +4984,9 @@ impl OffsetGeometryCreation {
                         &rail2,
                         SurfParamType::U,
                     )?);
+                    if shell_tangent_gap {
+                        out.closing_wall = true;
+                    }
                 }
             }
         } // end one face is a shell face check
@@ -4949,6 +5143,675 @@ impl OffsetGeometryCreation {
         // all done
         Ok(out)
     }
+
+    /// Inspects one offset side of a deferred shell-tangent gap, returning `Ok(None)` when the
+    /// edge has unsettled vertices or degenerates within its zone/edge tolerance (which acts
+    /// as a no-op in `reconcile_shell_tangent_rails`, leaving the original `edgeuse_offset`
+    /// curve and step-wall rail intact), or its endpoint match status and certified endpoint
+    /// margins (`tau_e + tau_v` floored by the pre-`Fix_TolSizes` meeting tolerance).
+    fn prepare_shell_tangent_side<O: ClassObject + SolutionObject>(
+        &self,
+        k: &Kernel,
+        brep: &impl OffsetBrep<O>,
+        orig_eu: O,
+        off_eu: O,
+    ) -> Result<Option<ShellTangentPrepared<O>>> {
+        let edge = brep.edgeuse_edge(off_eu)?.ok_or(dangling("off edge"))?;
+        let v1 = brep.edgeuse_vertex(off_eu)?;
+        let mate = brep.edgeuse_mate(off_eu)?;
+        let v2 = mate.map(|m| brep.edgeuse_vertex(m)).transpose()?.flatten();
+        let p1 = v1.map(|v| brep.vertex_point(v)).transpose()?;
+        let p2 = v2.map(|v| brep.vertex_point(v)).transpose()?;
+        let (Some(p1), Some(p2)) = (p1, p2) else {
+            return Ok(None);
+        };
+        // `docs/validity-and-tolerances.md` §4 (Edge test 7) & §5.1: an edge is at least
+        // its tube radius `tau_e` and two points within the body's zone tolerance are one
+        // point.
+        let tol = brep.edge_tolerance(edge)?;
+        let min_len = tol.max(brep.brep_tolerance(edge)?);
+        if (p1 - p2).length() <= min_len {
+            return Ok(None);
+        }
+        let tv1 = v1
+            .map(|v| brep.vertex_tolerance(v))
+            .transpose()?
+            .unwrap_or(0.0)
+            .max(tol);
+        let tv2 = v2
+            .map(|v| brep.vertex_tolerance(v))
+            .transpose()?
+            .unwrap_or(0.0)
+            .max(tol);
+        // `docs/validity-and-tolerances.md` §4 (Edge tests 16, 17) & §5.1:
+        // `|C(t_end) - P_v| <= tau_e + tau_v`, floored by the pre-`Fix_TolSizes`
+        // offset edge meeting tolerance `10 * max(tau_e, this_approx_tol_3d)`
+        // (`extend_trim_edges` / `is_step_across_edge`).
+        let meet_tol = 10.0 * max2(tol, self.this_approx_tol_3d);
+        let margin1 = (tol + tv1).max(meet_tol);
+        let margin2 = (tol + tv2).max(meet_tol);
+        let matched = if let Some(ch) = brep.edge_curve(edge)? {
+            let cv = curve_of(brep, ch)?;
+            let ivl = brep.edge_interval(edge)?;
+            let e0 = cv.evaluate_point(k, ivl.min())?;
+            let e1 = cv.evaluate_point(k, ivl.max())?;
+            ((p1 - e0).length() <= margin1 && (p2 - e1).length() <= margin2)
+                || ((p1 - e1).length() <= margin1 && (p2 - e0).length() <= margin2)
+        } else {
+            false
+        };
+        Ok(Some(ShellTangentPrepared {
+            orig_eu,
+            off_eu,
+            edge,
+            v1,
+            v2,
+            p1,
+            p2,
+            tol,
+            matched,
+            margin1,
+            margin2,
+        }))
+    }
+
+    /// Validates a pre-existing matched rail's interval against its edge's stored interval,
+    /// or materializes the rail when the edge's curve is analytic without a pre-built NURBS
+    /// slot.
+    fn ensure_matched_shell_tangent_rail<O: ClassObject>(
+        k: &Kernel,
+        brep: &impl OffsetBrep<O>,
+        side: &ShellTangentPrepared<O>,
+        rail: &mut Option<BSplineCurve>,
+    ) -> Result<()> {
+        if let Some(r) = rail.as_ref() {
+            let e_ivl = brep.edge_interval(side.edge)?;
+            let r_ivl = r.natural_interval();
+            if r_ivl.is_init()
+                || r_ivl.length() <= EFF_ZERO_PARAM
+                || !r_ivl.is_value_on_boundary(e_ivl.min(), EFF_ZERO).0
+                || !r_ivl.is_value_on_boundary(e_ivl.max(), EFF_ZERO).0
+            {
+                return Err(sm_err(OP_EDGEUSE));
+            }
+        } else {
+            let (_, r, _, _) = Self::derive_shell_tangent_curve_and_rail(
+                k,
+                brep,
+                side.edge,
+                side.p1,
+                side.p2,
+                side.margin1,
+                side.margin2,
+            )?;
+            *rail = Some(r);
+        }
+        Ok(())
+    }
+
+    /// Rebuilds the 3D curve, certified UV trim, and step-wall rail for an unmatched side of
+    /// a shell-tangent gap.
+    fn rebuild_shell_tangent_side<O: ClassObject + SolutionObject>(
+        k: &Kernel,
+        brep: &mut impl OffsetBrep<O>,
+        executive: &mut impl OffsetExecutive<O>,
+        side: &ShellTangentPrepared<O>,
+    ) -> Result<ShellTangentRebuilt> {
+        let (curve, rail, start, end) = Self::derive_shell_tangent_curve_and_rail(
+            k,
+            brep,
+            side.edge,
+            side.p1,
+            side.p2,
+            side.margin1,
+            side.margin2,
+        )?;
+        let uv =
+            Self::drop_curve_onto_extended_face(k, brep, executive, side.off_eu, &curve, side.tol)?;
+        Ok(ShellTangentRebuilt {
+            curve,
+            uv,
+            rail,
+            start,
+            end,
+        })
+    }
+
+    /// Normalizes both step-wall rails onto `[0, 1]` oriented along `cl_tan`.
+    fn normalize_shell_tangent_rails(
+        rail1: &mut Option<BSplineCurve>,
+        rail2: &mut Option<BSplineCurve>,
+        cl_tan: Vec3,
+    ) -> Result<()> {
+        if let (Some(r1), Some(r2)) = (rail1.as_mut(), rail2.as_mut()) {
+            for r in [r1, r2] {
+                r.edit_parameterization(&Extent1d::from_min_max(0.0, 1.0))?;
+                let r_pv = r.evaluate(0.5, 1, true, true)?;
+                let r_tan = r_pv.get(1).copied().ok_or(dangling("rail tangent"))?;
+                if r_tan.dot(cl_tan) < 0.0 {
+                    let nat = r.natural_interval();
+                    r.reverse_parameterization(&nat)?;
+                    r.edit_parameterization(&Extent1d::from_min_max(0.0, 1.0))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconciles the boundary curves, UV trims, and step-wall rails across a deferred
+    /// shell-tangent gap (`shell_tangent_gap`), replacing only an offset edge whose
+    /// curve does not already span its settled vertices within the certified endpoint
+    /// bound `tau_e + tau_v` (`docs/validity-and-tolerances.md` §4 Edge 16–17, §5.1).
+    fn reconcile_shell_tangent_rails<O: ClassObject + SolutionObject>(
+        &self,
+        k: &Kernel,
+        brep: &mut impl OffsetBrep<O>,
+        executive: &mut impl OffsetExecutive<O>,
+        [in1, in2]: [ShellTangentInput<'_, O>; 2],
+        cl_tan: Vec3,
+    ) -> Result<()> {
+        let Some(s1) = self.prepare_shell_tangent_side(k, brep, in1.orig_eu, in1.off_eu)? else {
+            return Ok(());
+        };
+        let Some(s2) = self.prepare_shell_tangent_side(k, brep, in2.orig_eu, in2.off_eu)? else {
+            return Ok(());
+        };
+        if s1.matched && s2.matched {
+            return Ok(());
+        }
+        if s1.matched {
+            Self::ensure_matched_shell_tangent_rail(k, brep, &s1, in1.rail)?;
+        }
+        if s2.matched {
+            Self::ensure_matched_shell_tangent_rail(k, brep, &s2, in2.rail)?;
+        }
+
+        let work1 = if s1.matched {
+            None
+        } else {
+            Some(Self::rebuild_shell_tangent_side(k, brep, executive, &s1)?)
+        };
+        let work2 = if s2.matched {
+            None
+        } else {
+            Some(Self::rebuild_shell_tangent_side(k, brep, executive, &s2)?)
+        };
+
+        // Before `replace_edge_curves` updates any shared vertex position, verify that
+        // every other incident edge at each moved vertex remains within `tau_inc + tau_v`.
+        let partner_for_1 = work2.as_ref().map(|w| s2.as_partner(w));
+        let partner_for_2 = work1.as_ref().map(|w| s1.as_partner(w));
+        for (side, work, partner) in [
+            (&s1, work1.as_ref(), partner_for_1),
+            (&s2, work2.as_ref(), partner_for_2),
+        ] {
+            if let Some(w) = work {
+                for (v, pt) in [(side.v1, w.start), (side.v2, w.end)] {
+                    Self::verify_vertex_move_on_incident_edges(
+                        k, brep, v, pt, side.edge, side.tol, partner,
+                    )?;
+                }
+            }
+        }
+
+        for (side, work, rail_out) in [(&s1, work1, &mut *in1.rail), (&s2, work2, &mut *in2.rail)] {
+            if let Some(w) = work {
+                let h_c = store_curve(brep, w.curve)?;
+                let h_uv = store_curve(brep, w.uv)?;
+                self.replace_edge_curves(
+                    k,
+                    brep,
+                    side.off_eu,
+                    Some(h_c),
+                    Some(h_uv),
+                    Some(side.orig_eu),
+                )?;
+                *rail_out = Some(w.rail);
+            }
+        }
+
+        Self::normalize_shell_tangent_rails(in1.rail, in2.rail, cl_tan)
+    }
+
+    /// Derives a trimmed 3D curve and `[0, 1]` B-spline rail between `q1` and `q2` from
+    /// `e`'s boundary curve, certifying endpoint and interior deviations against
+    /// `(margin1, margin2)` directly from control nets without point sampling.
+    fn derive_shell_tangent_curve_and_rail<O: ClassObject>(
+        k: &Kernel,
+        brep: &impl OffsetBrep<O>,
+        e: O,
+        q1: Point3,
+        q2: Point3,
+        margin1: f64,
+        margin2: f64,
+    ) -> Result<(Curve, BSplineCurve, Point3, Point3)> {
+        let Some(ch) = brep.edge_curve(e)? else {
+            let line = BSplineCurve::create_line_segment(3, q1, q2)?;
+            let mut r = line.clone();
+            r.edit_parameterization(&Extent1d::from_min_max(0.0, 1.0))?;
+            return Ok((Curve::from(line), r, q1, q2));
+        };
+        let cv = curve_of(brep, ch)?;
+        if let Some((pt, dir, eps_line)) = exact_collinear_line(cv) {
+            let dir_u = dir.unitize_or_z();
+            let s1 = pt + (q1 - pt).dot(dir_u) * dir_u;
+            let s2 = pt + (q2 - pt).dot(dir_u) * dir_u;
+            let d1 = (q1 - s1).length();
+            let d2 = (q2 - s2).length();
+            if d1 + eps_line > margin1 || d2 + eps_line > margin2 || (s1 - s2).length() <= EFF_ZERO
+            {
+                return Err(sm_err(OP_EDGEUSE));
+            }
+            let line = BSplineCurve::create_line_segment(3, s1, s2)?;
+            let mut r = line.clone();
+            r.edit_parameterization(&Extent1d::from_min_max(0.0, 1.0))?;
+            return Ok((Curve::from(line), r, s1, s2));
+        }
+
+        let nat = cv.natural_interval();
+        let dp1 = cv.drop_point(k, &nat, q1, None, margin1, None, SolverOperation::Minimize)?;
+        let dp2 = cv.drop_point(k, &nat, q2, None, margin2, None, SolverOperation::Minimize)?;
+        if !dp1.success
+            || !dp2.success
+            || dp1.distance > margin1
+            || dp2.distance > margin2
+            || (dp1.parameter - dp2.parameter).abs() <= EFF_ZERO_PARAM
+        {
+            return Err(sm_err(OP_EDGEUSE));
+        }
+        let t1 = dp1.parameter;
+        let t2 = dp2.parameter;
+        let mut trimmed_cv = cv.copy(k)?;
+        let mut ivl = Extent1d::from_min_max(t1.min(t2), t1.max(t2));
+        trimmed_cv.trim(k, &mut ivl, TrimMode::Notify)?;
+        if t1 > t2 {
+            trimmed_cv.reverse_parameterization(k, &ivl)?;
+        }
+        match trimmed_cv.kind_mut() {
+            CurveKind::Ellipse(e) if e.base().gw_nurb().is_none() => e.make_nurb(k)?,
+            CurveKind::Hyperbola(h) if h.base().gw_nurb().is_none() => h.make_nurb(None)?,
+            CurveKind::Parabola(p) if p.base().gw_nurb().is_none() => p.make_nurb(None)?,
+            _ => {}
+        }
+        let trimmed_ivl = trimmed_cv.natural_interval();
+        let c_start = trimmed_cv.evaluate_point(k, trimmed_ivl.min())?;
+        let c_end = trimmed_cv.evaluate_point(k, trimmed_ivl.max())?;
+        if (c_start - q1).length() > margin1 || (c_end - q2).length() > margin2 {
+            return Err(sm_err(OP_EDGEUSE));
+        }
+        let src_bs = b_spline_with_nurb(k, &trimmed_cv)?.ok_or_else(|| sm_err(OP_EDGEUSE))?;
+        let mut b_spline = src_bs.clone();
+        b_spline.edit_parameterization(&Extent1d::from_min_max(0.0, 1.0))?;
+        if !is_exact_unit_reparameterization(&src_bs, &b_spline) {
+            return Err(sm_err(OP_EDGEUSE));
+        }
+        Ok((trimmed_cv, b_spline, c_start, c_end))
+    }
+
+    /// Projects `c3` onto the extended surface of `eu`'s owning face within `tol`
+    /// (`executive.get_create_extended_surface` + `Surface::drop_curve`), requiring a
+    /// certified 3D bound `<= tol` on `||ext_s(uvc(t)) - c3(t)||` over `c3`'s full interval
+    /// ([`crate::surface::surface::exact_pieces::certified_lift`]).
+    fn drop_curve_onto_extended_face<O: ClassObject + SolutionObject>(
+        k: &Kernel,
+        brep: &mut impl OffsetBrep<O>,
+        executive: &mut impl OffsetExecutive<O>,
+        eu: O,
+        c3: &Curve,
+        tol: f64,
+    ) -> Result<Curve> {
+        if !(tol.is_finite() && tol > 0.0) {
+            return Err(SolidError::Unsupported {
+                operation: OP_EDGEUSE,
+                reason: "shell-tangent UV lift requires a positive finite tolerance",
+            });
+        }
+        let face = brep.edgeuse_face(eu)?.ok_or(dangling("face"))?;
+        let surf_h = brep.face_surface(face)?.ok_or(dangling("surf"))?;
+        let (ext_surf_h, ext_dom) = executive.get_create_extended_surface(k, brep, surf_h)?;
+        let raw_ext_s = surface_of(brep, ext_surf_h)?;
+        if crate::surface::surface::exact_pieces::surface_uses_approximate_net(raw_ext_s) {
+            return Err(SolidError::Unsupported {
+                operation: OP_EDGEUSE,
+                reason: crate::surface::surface::exact_pieces::APPROXIMATE_NET_REASON,
+            });
+        }
+        let ext_s = raw_ext_s.clone_for_evaluation()?;
+        let c3_ivl = c3.natural_interval();
+        let dropped =
+            ext_s.drop_curve::<NoObject>(k, &ext_dom, c3, &c3_ivl, tol, false, None, true)?;
+        let drop_dev = dropped.max_drop_to_surf.hypot(dropped.max_approx_dev);
+        if dropped.uv_curves.is_empty() || !drop_dev.is_finite() || drop_dev > tol {
+            return Err(SolidError::Unsupported {
+                operation: OP_EDGEUSE,
+                reason: "a UV curve's lift is farther than the tolerance from its 3D curve",
+            });
+        }
+        let uvc = if dropped.uv_curves.len() == 1 {
+            let candidate = dropped
+                .uv_curves
+                .into_iter()
+                .next()
+                .ok_or_else(|| sm_err(OP_EDGEUSE))?;
+            let uv_ivl = candidate.natural_interval();
+            if !uv_ivl.is_value_on_boundary(c3_ivl.min(), EFF_ZERO).0
+                || !uv_ivl.is_value_on_boundary(c3_ivl.max(), EFF_ZERO).0
+            {
+                return Err(sm_err(OP_EDGEUSE));
+            }
+            candidate
+        } else {
+            // When extending a bounded surface (e.g. a half-cylinder) closes it into a
+            // periodic surface, an edge along that periodic seam drops to two full-interval
+            // UV seam branches (`u_min` and `u_max`, or `v_min` and `v_max`). Select the
+            // full-interval branch on `eu`'s side of the face using its existing UV trim
+            // curve (`extend_trim_edges`, `extended_sides_keeping_parameters`).
+            let edge = brep.edgeuse_edge(eu)?.ok_or(dangling("edge"))?;
+            let orig_uv_h = brep
+                .edgeuse_uv_trim_curve(eu)?
+                .ok_or_else(|| sm_err(OP_EDGEUSE))?;
+            let orig_mid = curve_of(brep, orig_uv_h)?
+                .evaluate_point(k, brep.edge_interval(edge)?.evaluate(0.5))?;
+            let mut best_idx: Option<usize> = None;
+            let mut min_dist = BIG_DOUBLE;
+            for (idx, cand) in dropped.uv_curves.iter().enumerate() {
+                let uv_ivl = cand.natural_interval();
+                if !uv_ivl.is_value_on_boundary(c3_ivl.min(), EFF_ZERO).0
+                    || !uv_ivl.is_value_on_boundary(c3_ivl.max(), EFF_ZERO).0
+                {
+                    continue;
+                }
+                let sols: SolutionArray<NoObject> = cand.global_point_solve(
+                    k,
+                    &uv_ivl,
+                    SolverOperation::Minimize,
+                    orig_mid,
+                    EFF_ZERO_SQRT,
+                    SolutionRequested::Single,
+                    &GlobalPointSolveOptions::default(),
+                )?;
+                if let Some(sol) = sols.get(0) {
+                    if sol.start.solution_value < min_dist {
+                        min_dist = sol.start.solution_value;
+                        best_idx = Some(idx);
+                    }
+                }
+            }
+            let best_idx = best_idx.ok_or_else(|| sm_err(OP_EDGEUSE))?;
+            dropped
+                .uv_curves
+                .into_iter()
+                .nth(best_idx)
+                .ok_or_else(|| sm_err(OP_EDGEUSE))?
+        };
+        crate::surface::surface::exact_pieces::certified_lift(k, &ext_s, &uvc, c3, c3_ivl, tol)?;
+        Ok(uvc)
+    }
+
+    /// Verifies that moving `opt_v` to `moved_pt` keeps every other incident edge's
+    /// endpoint at `opt_v` within `tau_inc + tau_v` (`AssertValid` Edge tests 16–17,
+    /// with `tau_v >= max(tau_self, tau_inc)` after `Fix_TolSizes`,
+    /// `docs/validity-and-tolerances.md` §5.1).
+    pub(crate) fn verify_vertex_move_on_incident_edges<O: ClassObject>(
+        k: &Kernel,
+        brep: &mut impl OffsetBrep<O>,
+        opt_v: Option<O>,
+        moved_pt: Point3,
+        self_edge: O,
+        self_tol: f64,
+        partner_rebuilt: Option<RebuiltPartnerEdge<O>>,
+    ) -> Result<()> {
+        let Some(v) = opt_v else {
+            return Ok(());
+        };
+        let cur_pt = brep.vertex_point(v)?;
+        let raw_v_tol = brep.vertex_tolerance(v)?;
+        for inc_e in brep.vertex_edges(v)? {
+            if inc_e == self_edge {
+                continue;
+            }
+            if let Some(p) = partner_rebuilt {
+                if inc_e == p.edge {
+                    let eff_v_tol = raw_v_tol.max(self_tol).max(p.tol);
+                    if p.v1 == Some(v) && (moved_pt - p.start).length() > p.tol + eff_v_tol {
+                        return Err(sm_err(OP_EDGEUSE));
+                    }
+                    if p.v2 == Some(v) && (moved_pt - p.end).length() > p.tol + eff_v_tol {
+                        return Err(sm_err(OP_EDGEUSE));
+                    }
+                    continue;
+                }
+            }
+            if (moved_pt - cur_pt).length() <= EFF_ZERO || brep.edge_curve(inc_e)?.is_none() {
+                continue;
+            }
+            let inc_tol = brep.edge_tolerance(inc_e)?;
+            let eff_v_tol = raw_v_tol.max(self_tol).max(inc_tol);
+            let bound = inc_tol + eff_v_tol;
+            for inc_eu in brep.edge_edgeuses(inc_e)? {
+                if brep.edgeuse_vertex(inc_eu)? == Some(v) {
+                    let end_pt =
+                        edgeuse_normalized_evaluate(k, brep, inc_eu, 0.0, false, false, false)?;
+                    if (cur_pt - end_pt).length() <= bound && (moved_pt - end_pt).length() > bound {
+                        return Err(sm_err(OP_EDGEUSE));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Input edgeuses and rail slot for one side of `reconcile_shell_tangent_rails`.
+struct ShellTangentInput<'a, O> {
+    orig_eu: O,
+    off_eu: O,
+    rail: &'a mut Option<BSplineCurve>,
+}
+
+/// Settled endpoint data and endpoint-match margins for one side of a shell-tangent gap.
+struct ShellTangentPrepared<O> {
+    orig_eu: O,
+    off_eu: O,
+    edge: O,
+    v1: Option<O>,
+    v2: Option<O>,
+    p1: Point3,
+    p2: Point3,
+    tol: f64,
+    matched: bool,
+    margin1: f64,
+    margin2: f64,
+}
+
+impl<O: Copy> ShellTangentPrepared<O> {
+    fn as_partner(&self, rebuilt: &ShellTangentRebuilt) -> RebuiltPartnerEdge<O> {
+        RebuiltPartnerEdge {
+            edge: self.edge,
+            tol: self.tol,
+            v1: self.v1,
+            start: rebuilt.start,
+            v2: self.v2,
+            end: rebuilt.end,
+        }
+    }
+}
+
+/// Rebuilt 3D curve, certified UV trim, and step-wall rail for one side of a shell-tangent gap.
+struct ShellTangentRebuilt {
+    curve: Curve,
+    uv: Curve,
+    rail: BSplineCurve,
+    start: Point3,
+    end: Point3,
+}
+
+/// Candidate rebuilt partner rail endpoints checked before mutating shared vertices.
+#[derive(Clone, Copy)]
+pub(crate) struct RebuiltPartnerEdge<O> {
+    edge: O,
+    tol: f64,
+    v1: Option<O>,
+    start: Point3,
+    v2: Option<O>,
+    end: Point3,
+}
+
+/// Returns `(origin, direction, eps_line)` when `cv` is an exact line (`eps_line = 0`) or a
+/// 3D positive-weight B-spline whose control polygon is collinear to machine precision,
+/// bounding `sup_t dist(cv(t), line(origin, direction)) <= eps_line` in outward-rounded [`Ivl`]
+/// arithmetic via NURBS convex-hull containment and convexity of Euclidean point-to-line
+/// distance. Curved conics and non-collinear B-splines return `None`.
+fn exact_collinear_line(cv: &Curve) -> Option<(Point3, Vec3, f64)> {
+    use crate::blend::fillet_section::interval::Ivl;
+    use crate::blend::fillet_section::series::{v_sub, V3};
+
+    if cv.dim() != 3 {
+        return None;
+    }
+    match cv.kind() {
+        CurveKind::Line(l) => {
+            let (pt, dir) = l.is_line();
+            (dir.length() > EFF_ZERO).then_some((pt, dir, 0.0))
+        }
+        CurveKind::BSpline(bs) => {
+            let nurb = bs.gw_nurb()?;
+            let cpts = nurb.cpts();
+            if cpts.len() < 2 {
+                return None;
+            }
+            let rational = nurb.is_rational();
+            let to_ivl_pt = |cp: &crate::nurbs::math::CPoint| -> Option<V3<Ivl>> {
+                if rational {
+                    if !(cp.w.is_finite() && cp.w > 0.0) {
+                        return None;
+                    }
+                    let inv_w = Ivl::from(1.0) / Ivl::from(cp.w);
+                    Some(V3 {
+                        x: Ivl::from(cp.x) * inv_w,
+                        y: Ivl::from(cp.y) * inv_w,
+                        z: Ivl::from(cp.z) * inv_w,
+                    })
+                } else {
+                    Some(V3 {
+                        x: Ivl::from(cp.x),
+                        y: Ivl::from(cp.y),
+                        z: Ivl::from(cp.z),
+                    })
+                }
+            };
+            let p0 = to_ivl_pt(cpts.first()?)?;
+            let pn = to_ivl_pt(cpts.last()?)?;
+            let d_ivl = v_sub(pn, p0);
+            let d_len = (d_ivl.x * d_ivl.x + d_ivl.y * d_ivl.y + d_ivl.z * d_ivl.z).sqrt();
+            if !(d_len.lo.is_finite() && d_len.lo > EFF_ZERO) {
+                return None;
+            }
+            let scale = 1.0 + p0.x.mag().max(p0.y.mag()).max(p0.z.mag()).max(d_len.hi);
+            let mut eps_line = 0.0_f64;
+            for cp in cpts.iter().skip(1).take(cpts.len().saturating_sub(2)) {
+                let pi = to_ivl_pt(cp)?;
+                let rel = v_sub(pi, p0);
+                let cr = V3 {
+                    x: rel.y * d_ivl.z - rel.z * d_ivl.y,
+                    y: rel.z * d_ivl.x - rel.x * d_ivl.z,
+                    z: rel.x * d_ivl.y - rel.y * d_ivl.x,
+                };
+                let cr_norm_hi = (cr.x * cr.x + cr.y * cr.y + cr.z * cr.z).sqrt().hi;
+                let dist_hi = (Ivl::from(cr_norm_hi) / d_len).hi;
+                if !dist_hi.is_finite() {
+                    return None;
+                }
+                eps_line = eps_line.max(dist_hi);
+            }
+            if eps_line > EFF_ZERO * scale {
+                return None;
+            }
+            let pt0 = cpts.first()?.to_euclid();
+            let ptn = cpts.last()?.to_euclid();
+            let dir = ptn - pt0;
+            if dir.length() <= EFF_ZERO {
+                return None;
+            }
+            Some((pt0, dir, eps_line + 2.0 * f64::EPSILON * scale))
+        }
+        _ => None,
+    }
+}
+
+/// Verifies directly on the NURBS nets that `unit` on `[0, 1]` is an affine knot
+/// reparameterization of `src` with identical degree, rationality, and homogeneous control
+/// points (so both curves trace the exact same 3D locus by affine invariance of B-spline basis
+/// functions, without point sampling).
+fn is_exact_unit_reparameterization(src: &BSplineCurve, unit: &BSplineCurve) -> bool {
+    use crate::blend::fillet_section::interval::Ivl;
+
+    let (Some(n1), Some(n2)) = (src.gw_nurb(), unit.gw_nurb()) else {
+        return false;
+    };
+    if n1.degree() != n2.degree()
+        || n1.is_rational() != n2.is_rational()
+        || n1.cpts().len() != n2.cpts().len()
+    {
+        return false;
+    }
+    for (c1, c2) in n1.cpts().iter().zip(n2.cpts().iter()) {
+        if c1.x.to_bits() != c2.x.to_bits()
+            || c1.y.to_bits() != c2.y.to_bits()
+            || c1.z.to_bits() != c2.z.to_bits()
+            || c1.w.to_bits() != c2.w.to_bits()
+        {
+            return false;
+        }
+    }
+    let (u1, u2) = (n1.knots(), n2.knots());
+    let Some(m) = u1.len().checked_sub(1) else {
+        return false;
+    };
+    let p = n1.degree();
+    if u1.len() != u2.len() || 2_usize.saturating_mul(p).saturating_add(1) > u1.len() {
+        return false;
+    }
+    if u2.windows(2).any(|w| match (w.first(), w.get(1)) {
+        (Some(&a), Some(&b)) => !(a.is_finite() && b.is_finite() && a <= b),
+        _ => true,
+    }) {
+        return false;
+    }
+    let (Some(&first), Some(&last), Some(&u2_first), Some(&u2_last)) =
+        (u1.first(), u1.last(), u2.first(), u2.last())
+    else {
+        return false;
+    };
+    if u1
+        .iter()
+        .zip(u2.iter())
+        .all(|(k1, k2)| k1.to_bits() == k2.to_bits())
+    {
+        return u2_first.abs() <= EFF_ZERO && (u2_last - 1.0).abs() <= EFF_ZERO;
+    }
+    let span = Ivl::from(last) - Ivl::from(first);
+    if !(span.lo.is_finite() && span.lo > EFF_ZERO_PARAM) {
+        return false;
+    }
+    for (idx, (&k1, &k2)) in u1.iter().zip(u2.iter()).enumerate() {
+        if idx <= p {
+            if k2 != 0.0 {
+                return false;
+            }
+        } else if idx >= m.saturating_sub(p) {
+            if k2 != 1.0 {
+                return false;
+            }
+        } else {
+            let ideal = (Ivl::from(k1) - Ivl::from(first)) / span;
+            let pad = 4.0 * f64::EPSILON;
+            if k2 < ideal.lo - pad || k2 > ideal.hi + pad {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 // ---- the local-operation variant --------------------------------------------------------------
@@ -5096,98 +5959,133 @@ mod tests {
 
     #[test]
     fn audit_483_tangent_gaps_preserve_errors_and_no_solution() {
-        let mut k = Kernel::default();
+        let k = Kernel::default();
         let error = SolidError::sm_err("injected tangent-gap service");
-        for checked in [false, true] {
-            k.fixes.offset_tangent_gap_statuses = checked;
-            for fail_evaluation in [false, true] {
-                let mut calls = Vec::new();
-                let result = tangent_gap_samples(
-                    &k,
-                    &mut calls,
-                    2,
-                    1e-6,
-                    |_, calls, _| {
-                        calls.push("evaluate");
-                        if fail_evaluation {
-                            Err(error.clone())
-                        } else {
-                            Ok(Vec3::ZERO)
-                        }
-                    },
-                    |_, calls, _| {
-                        calls.push("closest");
+        for fail_evaluation in [false, true] {
+            let mut calls = Vec::new();
+            let result = tangent_gap_samples(
+                &k,
+                &mut calls,
+                2,
+                1e-6,
+                |_, calls, _| {
+                    calls.push("evaluate");
+                    if fail_evaluation {
                         Err(error.clone())
-                    },
-                );
-                if checked {
-                    // fork 4803d6d: a failed sample is skipped; ClosestPoint's status
-                    // stays dropped
-                    assert!(!result.unwrap());
-                    assert_eq!(
-                        calls,
-                        if fail_evaluation {
-                            vec!["evaluate"; 3]
-                        } else {
-                            ["evaluate", "closest"].repeat(3)
-                        }
-                    );
-                } else {
-                    assert!(!result.unwrap());
-                    assert_eq!(calls.len(), 6);
-                }
-            }
-            let mut samples = Vec::new();
-            assert!(!tangent_gap_samples(
-                &k,
-                &mut samples,
-                2,
-                1e-6,
-                |_, calls, t| {
-                    calls.push(t);
-                    Ok(Vec3::X * t)
-                },
-                |_, _, _| Ok(None)
-            )
-            .unwrap());
-            assert_eq!(samples, vec![0.0, 0.5, 1.0]);
-            assert!(tangent_gap_samples(
-                &k,
-                &mut (),
-                2,
-                1e-6,
-                |_, (), _| Ok(Vec3::X),
-                |_, (), _| Ok(Some(2e-6))
-            )
-            .unwrap());
-        }
-    }
-
-    /// fork 4803d6d (`SmOffsetGeometryCreation::HaveTangentGaps`): a sample that
-    /// cannot be evaluated shows no gap. Upstream measures the unset point instead, and
-    /// a closest point far from it reads as a gap.
-    #[test]
-    fn tangent_gaps_skip_a_sample_that_cannot_be_evaluated() {
-        for skip in [false, true] {
-            let mut k = Kernel::default();
-            k.fixes.offset_tangent_gap_statuses = skip;
-            let gap = tangent_gap_samples(
-                &k,
-                &mut (),
-                2,
-                1e-6,
-                |_, (), t| {
-                    if t == 0.5 {
-                        Err(SolidError::sm_err("injected evaluation failure"))
                     } else {
-                        Ok(Vec3::X * t)
+                        Ok(Vec3::ZERO)
                     }
                 },
-                |_, (), p| Ok(Some(if p.x == UNDEF_DOUBLE { 1.0 } else { 0.0 })),
-            )
-            .unwrap();
-            assert_eq!(gap, !skip);
+                |_, calls, _| {
+                    calls.push("closest");
+                    Err(error.clone())
+                },
+            );
+            // fork 4803d6d: a failed sample is skipped; ClosestPoint's status stays
+            // dropped
+            assert!(!result.unwrap());
+            assert_eq!(
+                calls,
+                if fail_evaluation {
+                    vec!["evaluate"; 3]
+                } else {
+                    ["evaluate", "closest"].repeat(3)
+                }
+            );
         }
+        let mut samples = Vec::new();
+        assert!(!tangent_gap_samples(
+            &k,
+            &mut samples,
+            2,
+            1e-6,
+            |_, calls, t| {
+                calls.push(t);
+                Ok(Vec3::X * t)
+            },
+            |_, _, _| Ok(None)
+        )
+        .unwrap());
+        assert_eq!(samples, vec![0.0, 0.5, 1.0]);
+        assert!(tangent_gap_samples(
+            &k,
+            &mut (),
+            2,
+            1e-6,
+            |_, (), _| Ok(Vec3::X),
+            |_, (), _| Ok(Some(2e-6))
+        )
+        .unwrap());
+    }
+
+    /// fork 4803d6d (`SmOffsetGeometryCreation::HaveTangentGaps`), and the default
+    /// kernel: a sample that cannot be evaluated shows no gap and is not measured.
+    /// Upstream measured the unset point instead, and a closest point far from it read
+    /// as a gap.
+    #[test]
+    fn tangent_gaps_skip_a_sample_that_cannot_be_evaluated() {
+        let k = Kernel::default();
+        let mut measured = Vec::new();
+        let gap = tangent_gap_samples(
+            &k,
+            &mut measured,
+            2,
+            1e-6,
+            |_, _, t| {
+                if t == 0.5 {
+                    Err(SolidError::sm_err("injected evaluation failure"))
+                } else {
+                    Ok(Vec3::X * t)
+                }
+            },
+            |_, measured, p| {
+                measured.push(p.x);
+                Ok(Some(if p.x == UNDEF_DOUBLE { 1.0 } else { 0.0 }))
+            },
+        )
+        .unwrap();
+        assert!(!gap);
+        assert_eq!(measured, vec![0.0, 1.0]);
+    }
+
+    /// A quadratic in the plane y = 0 over the plane z = 0, from x = -1 to 1 (t = 0 to 1):
+    /// `z = e - k x^2 / 2` when `curved`, else the line `z = e x`.
+    fn over_the_plane(e: f64, k: f64, curved: bool) -> Curve {
+        use crate::nurbs::crv_basic::Curve as NlCurve;
+        use crate::nurbs::math::CPoint;
+        let (z0, z1, z2) = if curved {
+            (e - k / 2.0, e + k / 2.0, e - k / 2.0)
+        } else {
+            (-e, 0.0, e)
+        };
+        let pw = vec![
+            CPoint::new(-1.0, 0.0, z0, NOW),
+            CPoint::new(0.0, 0.0, z1, NOW),
+            CPoint::new(1.0, 0.0, z2, NOW),
+        ];
+        let nl = NlCurve::new(pw, 2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
+        Curve::from(BSplineCurve::from_nurb(nl, 3, false))
+    }
+
+    /// A curve that touches a surface, exact to the tolerance, meets it where its error
+    /// lifts it: the curve of radius 3 lifted 1e-6 over the plane meets it 2.4e-3 from the
+    /// touch, 0.05 degrees off it, and does not pass through it by more than the 1e-5
+    /// tolerance. Lifted 1e-3, or a line 0.6 degrees off the plane, it does.
+    #[test]
+    fn a_curve_passes_through_a_surface_only_by_more_than_the_tolerance() {
+        use crate::surface::plane::Plane;
+        let k = Kernel::default();
+        let plane = Surface::from(Plane::from_normal(Vec3::ZERO, Vec3::Z));
+        let uv = Point2::new(0.0, 0.0);
+        let tol = 1e-5;
+        let at = |e: f64| (1.0 + (6.0 * e).sqrt()) / 2.0;
+        let touching = over_the_plane(1e-6, 1.0 / 3.0, true);
+        assert!(touching.evaluate_point(&k, at(1e-6)).unwrap().z.abs() < 1e-15);
+        assert!(!passes_through(&k, &touching, at(1e-6), &plane, uv, tol).unwrap());
+        let lifted = over_the_plane(1e-3, 1.0 / 3.0, true);
+        assert!(passes_through(&k, &lifted, at(1e-3), &plane, uv, tol).unwrap());
+        let shallow = over_the_plane(0.6_f64.to_radians().tan(), 0.0, false);
+        assert!(passes_through(&k, &shallow, 0.5, &plane, uv, tol).unwrap());
     }
 
     #[test]
@@ -5234,5 +6132,87 @@ mod tests {
         d.deviations.push(0.5);
         d.reset();
         assert!(d.curves_3d.is_empty() && d.deviations.is_empty());
+    }
+
+    #[test]
+    fn exact_collinear_line_and_unit_reparameterization_use_control_nets_not_samples() {
+        use crate::curve::line::Line;
+        use crate::nurbs::crv_basic::Curve as NlCurve;
+        use crate::nurbs::math::CPoint;
+
+        // 1. Exact `Line` and collinear 3D B-spline pass `exact_collinear_line`.
+        let seg = Curve::from(Line::from_points(
+            Point3::new(1.0, 2.0, 3.0),
+            Point3::new(5.0, -2.0, 7.0),
+            3,
+        ));
+        let (pt, dir, eps) = exact_collinear_line(&seg).expect("exact line");
+        assert_eq!(eps, 0.0);
+        assert!((pt - Point3::new(1.0, 2.0, 3.0)).length() < 1e-15);
+        assert!(dir.length() > 1.0);
+
+        let collinear_bs = Curve::from(BSplineCurve::from_nurb(
+            NlCurve::new(
+                vec![
+                    CPoint::new(0.0, 0.0, 0.0, 1.0),
+                    CPoint::new(2.0, 4.0, 6.0, 2.0), // Euclidean `(1, 2, 3)`
+                    CPoint::new(3.0, 6.0, 9.0, 1.0), // Euclidean `(3, 6, 9)`
+                ],
+                2,
+                vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            )
+            .unwrap(),
+            3,
+            true,
+        ));
+        let (_, _, eps_bs) = exact_collinear_line(&collinear_bs).expect("collinear rational net");
+        assert!(eps_bs <= 1e-11);
+
+        // 2. A shallow quadratic arc of sagitta `5e-5` (strictly below `10 * tau_e = 1e-4`
+        //    where `cv.is_line(k, 10, line_tol)` previously collapsed it into a straight chord!)
+        //    is rejected by `exact_collinear_line` so its curved geometry is preserved, and its
+        //    `[0, 1]` knot reparameterization passes `is_exact_unit_reparameterization`.
+        let shallow_arc_bs = BSplineCurve::from_nurb(
+            NlCurve::new(
+                vec![
+                    CPoint::new(0.0, 0.0, 0.0, NOW),
+                    CPoint::new(2.5, 5e-5, 0.0, NOW),
+                    CPoint::new(7.5, 5e-5, 0.0, NOW),
+                    CPoint::new(10.0, 0.0, 0.0, NOW),
+                ],
+                2,
+                vec![2.0, 2.0, 2.0, 5.5, 9.0, 9.0, 9.0],
+            )
+            .unwrap(),
+            3,
+            false,
+        );
+        assert!(exact_collinear_line(&Curve::from(shallow_arc_bs.clone())).is_none());
+        let mut unit_bs = shallow_arc_bs.clone();
+        unit_bs
+            .edit_parameterization(&Extent1d::from_min_max(0.0, 1.0))
+            .unwrap();
+        assert!(is_exact_unit_reparameterization(&shallow_arc_bs, &unit_bs));
+
+        // Perturbing an interior knot or control point invalidates the affine equivalence.
+        let perturbed = BSplineCurve::from_nurb(
+            NlCurve::new(
+                vec![
+                    CPoint::new(0.0, 0.0, 0.0, NOW),
+                    CPoint::new(2.5, 5e-5, 0.0, NOW),
+                    CPoint::new(7.5, 5e-5, 0.0, NOW),
+                    CPoint::new(10.0, 0.0, 0.0, NOW),
+                ],
+                2,
+                vec![0.0, 0.0, 0.0, 0.6, 1.0, 1.0, 1.0],
+            )
+            .unwrap(),
+            3,
+            false,
+        );
+        assert!(!is_exact_unit_reparameterization(
+            &shallow_arc_bs,
+            &perturbed
+        ));
     }
 }

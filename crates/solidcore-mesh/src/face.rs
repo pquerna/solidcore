@@ -1830,7 +1830,8 @@ impl MapContext<'_> {
 
     /// The points of one edge use in loop order (`reverse`: against the edge) mapped
     /// into UV: by the UV trim curve at the same normalised edge parameter when given
-    /// (polished towards the edge point only when its surface point is off it), else
+    /// (polished towards the edge point only when its surface point is off it, and
+    /// after the first point kept within half a period of the one before), else
     /// by point inversion continuing from the previous point (`seed` for the first),
     /// kept within half a period of it on a closed surface.
     fn edgeuse_points(
@@ -1868,13 +1869,21 @@ impl MapContext<'_> {
                         return Err(invalid("UV trim curve is not finite"));
                     }
                     let uv = Point2::new(q.x, q.y);
-                    if poly.degenerate
+                    let uv = if poly.degenerate
                         || surface_point(k, s, self.chart.reduce(uv))?.distance(xyz)
                             <= self.polish_above
                     {
                         uv
                     } else {
                         foot(k, s, uv, xyz, self.chart).0
+                    };
+                    // A trim follows its edge continuously: a sample a whole period
+                    // from the one before it (a projected closed edge whose end lands
+                    // back in the base period) is the same surface point, taken on
+                    // the trim's side of the seam.
+                    match prev {
+                        Some(before) if pos > 0 && !poly.degenerate => self.unwrap(uv, before),
+                        _ => uv,
                     }
                 }
                 None => match prev {

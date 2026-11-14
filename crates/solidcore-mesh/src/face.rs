@@ -32,8 +32,8 @@ use solidcore::{FaceId, Result};
 use crate::backend::{BackendFace, FaceBackend, FaceMeshView};
 use crate::edges::{EdgeSet, SegmentSplit, MAX_SPLIT_PIECES};
 use crate::geom::{
-    angle, closes_with_budget, foot_with_budget, invalid, invert_point_with_budget, power_of_two,
-    segment_distance, surface_normal, surface_point, surface_scales_with_budget,
+    angle, foot_with_budget, invalid, invert_point_with_budget, power_of_two, segment_distance,
+    surface_normal, surface_point, surface_scales_with_budget, Chart,
 };
 use crate::grid::{bounded_with_budget, grid_lines_with_budget, MAX_CELL_ASPECT, SAMPLE_GRID};
 use crate::mesh::EdgePolyline;
@@ -199,10 +199,9 @@ pub(crate) struct FaceState {
     sense: f64,
     /// Triangles counter-clockwise in UV face inward and are wound the other way.
     flip: bool,
-    /// The surface's natural domain (UV searches stay in it).
-    domain: Extent2d,
-    /// Periods of a surface closed in u or v (over its natural domain).
-    period: (Option<f64>, Option<f64>),
+    /// The surface's natural domain and periods: UV searches stay in it along open
+    /// directions, evaluations reduce into it along closed ones.
+    chart: Chart,
     nurbs: Option<Nurbs>,
     /// The model size (bounds the fast path's disagreement).
     size: f64,
@@ -329,19 +328,12 @@ impl FaceState {
         budget.checkpoint()?;
         let surface = surface_of(b, f)?;
         let sense = outward_sense(b, f)?;
-        let natural = surface.natural_uv_domain_with_nurb(k)?;
+        let chart = Chart::of_with_budget(k, surface, 1e-9 * model_size.max(1e-300), budget)?;
         let mut domain = b.face(f)?.uv_domain;
         if !(domain.u_min() < domain.u_max() && domain.v_min() < domain.v_max()) {
-            domain = natural;
+            domain = chart.domain;
         }
-        let scale = surface_scales_with_budget(k, surface, &domain, budget)?;
-        let tol = 1e-9 * model_size.max(1e-300);
-        let period = (
-            closes_with_budget(k, surface, &natural, true, tol, budget)?
-                .then(|| natural.u_max() - natural.u_min()),
-            closes_with_budget(k, surface, &natural, false, tol, budget)?
-                .then(|| natural.v_max() - natural.v_min()),
-        );
+        let scale = surface_scales_with_budget(k, surface, &chart, &domain, budget)?;
         Ok(Self {
             face: f,
             origin: domain.mid(),
@@ -349,8 +341,7 @@ impl FaceState {
             speed: scale,
             sense,
             flip: false,
-            domain: natural,
-            period,
+            chart,
             nurbs: Nurbs::from_surface_with_budget(k, surface, budget)?,
             size: model_size,
             fast: None,
@@ -422,6 +413,7 @@ impl FaceState {
         budget: &QueryBudget<'_>,
     ) -> Result<Point3> {
         budget.charge(1)?;
+        let uv = self.chart.reduce(uv);
         if let (Some(nb), Some(_)) = (&self.nurbs, self.fast) {
             if let Some((p, _, _)) = nb
                 .eval_with_budget(uv.x, uv.y, budget)?
@@ -456,6 +448,7 @@ impl FaceState {
                     bbox.u_min() + (bbox.u_max() - bbox.u_min()) * f64::from(i) / 4.0,
                     bbox.v_min() + (bbox.v_max() - bbox.v_min()) * f64::from(j) / 4.0,
                 );
+                let uv = self.chart.reduce(uv);
                 let (Some((p, _, _)), Ok(q)) = (
                     nb.eval_with_budget(uv.x, uv.y, budget)?,
                     s.evaluate_point(k, uv),
@@ -480,6 +473,7 @@ impl FaceState {
         budget: &QueryBudget<'_>,
     ) -> Result<Option<Vec3>> {
         budget.charge(1)?;
+        let uv = self.chart.reduce(uv);
         if let (Some(nb), Some(sign)) = (&self.nurbs, self.fast) {
             if let Some((_, su, sv)) = nb.eval_with_budget(uv.x, uv.y, budget)? {
                 if let Some(n) = unit_cross(su, sv) {
@@ -583,7 +577,7 @@ impl FaceState {
             };
         }
         let normal = self.outward(k, s, uv, budget)?;
-        let gap = surface_gap(k, s, uv, xyz, budget)?;
+        let gap = surface_gap(k, s, &self.chart, uv, xyz, budget)?;
         self.insert(
             FaceVertex {
                 uv,
@@ -638,7 +632,7 @@ impl FaceState {
             if self.cdt.vertex(to).data().id == usize::MAX {
                 let pos = self.cdt.vertex(to).position();
                 let uv = self.unscaled(pos);
-                let xyz = surface_point(k, s, uv)?;
+                let xyz = surface_point(k, s, self.chart.reduce(uv))?;
                 let normal = self.outward(k, s, uv, budget)?;
                 let id = self.vertices.len();
                 budget.push(
@@ -901,7 +895,7 @@ impl FaceState {
         p: &FaceParams,
         budget: &QueryBudget<'_>,
     ) -> Result<Vec<Vec<LoopPoint>>> {
-        let domain = self.domain;
+        let domain = self.chart.domain;
         let scale = self.scale;
         let span = ((domain.u_max() - domain.u_min()) * scale.0)
             .max((domain.v_max() - domain.v_min()) * scale.1);
@@ -910,6 +904,17 @@ impl FaceState {
             .face(self.face)?
             .faceuse
             .ok_or_else(|| invalid("face without face use"))?;
+        let ctx = MapContext {
+            budget,
+            k,
+            s,
+            chart: &self.chart,
+            edges,
+            polish_above,
+            chord: p.chord,
+            span,
+            scale,
+        };
         let mut loops = Vec::new();
         let mut inverted = Vec::new();
         let loopuses = eu1::faceuse_loopuses(b, fu, false, None)?;
@@ -942,15 +947,6 @@ impl FaceState {
                 let trim = eu1::uv_trim_curve(b, eu)?.0;
                 let reverse = eu1::orientation(b, eu)? == OrientType::Opposite;
                 let seed = pts.last().map(|q| q.uv);
-                let ctx = MapContext {
-                    budget,
-                    k,
-                    s,
-                    domain: &domain,
-                    edges,
-                    polish_above,
-                    period: self.period,
-                };
                 let mapped = match trim {
                     Some(c) => ctx.edgeuse_points(poly, &ivl, Some(c), reverse, seed).ok(),
                     None => None,
@@ -962,7 +958,7 @@ impl FaceState {
                     budget.push(&mut inverted, eu)?;
                     ctx.edgeuse_points(poly, &ivl, None, reverse, seed)?
                 };
-                join(&mut pts, seq, k, s, p.chord, span, scale, budget)?;
+                ctx.join(&mut pts, seq)?;
             }
             // close the loop
             if pts.len() > 1 {
@@ -970,7 +966,7 @@ impl FaceState {
                     if first.vertex != last.vertex {
                         return Err(invalid("loop does not close"));
                     }
-                    if junction_is_pole(k, s, p.chord, last, first, span, scale, budget)? {
+                    if ctx.junction_is_pole(last, first)? {
                         if let Some(l) = pts.last_mut() {
                             l.pole_next = true;
                         }
@@ -1108,7 +1104,7 @@ impl FaceState {
                             normal,
                             boundary: true,
                             alive: true,
-                            gap: surface_gap(k, s, *uv, *xyz, budget)?,
+                            gap: surface_gap(k, s, &self.chart, *uv, *xyz, budget)?,
                             depth: 0,
                         },
                     )?;
@@ -1401,7 +1397,7 @@ impl FaceState {
     /// normal `Su x Sv` can be turned like the surface normal.
     fn cross_sign(&self, k: &Kernel, s: &Surface, budget: &QueryBudget<'_>) -> Result<Option<f64>> {
         budget.charge(1)?;
-        let uv = self.origin;
+        let uv = self.chart.reduce(self.origin);
         let Ok((_, su, sv)) = s.evaluate_1st_derivatives(k, uv, false, false) else {
             return Ok(None);
         };
@@ -1430,6 +1426,7 @@ impl FaceState {
                     bbox.u_min() + (bbox.u_max() - bbox.u_min()) * (0.1 + 0.8 * f64::from(i) / 4.0),
                     bbox.v_min() + (bbox.v_max() - bbox.v_min()) * (0.1 + 0.8 * f64::from(j) / 4.0),
                 );
+                let uv = self.chart.reduce(uv);
                 let Ok((_, su, sv)) = s.evaluate_1st_derivatives(k, uv, false, false) else {
                     continue;
                 };
@@ -1997,7 +1994,7 @@ impl FaceState {
             let (dev, over) = crate::deviation::face_mesh_deviation_with_budget(
                 k,
                 s,
-                &self.domain,
+                &self.chart,
                 &m,
                 chord,
                 budget,
@@ -2082,13 +2079,61 @@ struct MapContext<'a, 'q> {
     budget: &'a QueryBudget<'q>,
     k: &'a Kernel,
     s: &'a Surface,
-    domain: &'a Extent2d,
+    chart: &'a Chart,
     edges: &'a EdgeSet,
     polish_above: f64,
-    period: (Option<f64>, Option<f64>),
+    /// The chord tolerance, the face's span in scaled UV and its UV scale (for joining
+    /// edge uses at their shared points).
+    chord: f64,
+    span: f64,
+    scale: (f64, f64),
 }
 
 impl MapContext<'_, '_> {
+    /// Whether the UV jump from `a` to `b` (one mesh vertex) is a pole: far apart in UV
+    /// but the surface stays at the vertex between them. A jump across most of the
+    /// domain where the surface does not stay is a loop that only closes across a seam.
+    fn junction_is_pole(&self, a: LoopPoint, b: LoopPoint) -> Result<bool> {
+        let (chord, span) = (self.chord, self.span);
+        let gap = scaled_gap(a.uv, b.uv, self.scale);
+        if gap <= chord.max(1e-9 * span) {
+            return Ok(false);
+        }
+        let mid = Point2::new((a.uv.x + b.uv.x) / 2.0, (a.uv.y + b.uv.y) / 2.0);
+        self.budget.charge(1)?;
+        if surface_point(self.k, self.s, self.chart.reduce(mid))?.distance(a.xyz) <= chord {
+            return Ok(true);
+        }
+        if gap > 0.1 * span {
+            return Err(invalid(
+                "loop does not close in UV (periodic face without seam edge)",
+            ));
+        }
+        Ok(false)
+    }
+
+    /// Appends an edge use's points to a loop, merging the shared junction point.
+    fn join(&self, pts: &mut Vec<LoopPoint>, mut seq: Vec<LoopPoint>) -> Result<()> {
+        if let (Some(last), Some(first)) = (pts.last().copied(), seq.first().copied()) {
+            if last.vertex != first.vertex {
+                return Err(invalid("loop edge uses do not connect"));
+            }
+            if self.junction_is_pole(last, first)? {
+                if let Some(l) = pts.last_mut() {
+                    l.pole_next = true;
+                }
+            } else {
+                pts.pop();
+                if let Some(f) = seq.first_mut() {
+                    f.pole_next |= last.pole_next;
+                }
+            }
+        }
+        self.budget.reserve_vec(pts, seq.len())?;
+        pts.extend(seq);
+        Ok(())
+    }
+
     /// `uv` moved by whole periods to within half a period of `near`.
     fn unwrap(&self, uv: Point2, near: Point2) -> Point2 {
         let shift = |x: f64, c: f64, p: Option<f64>| match p {
@@ -2096,8 +2141,8 @@ impl MapContext<'_, '_> {
             _ => x,
         };
         Point2::new(
-            shift(uv.x, near.x, self.period.0),
-            shift(uv.y, near.y, self.period.1),
+            shift(uv.x, near.x, self.chart.period.0),
+            shift(uv.y, near.y, self.chart.period.1),
         )
     }
 
@@ -2145,19 +2190,20 @@ impl MapContext<'_, '_> {
                     }
                     let uv = Point2::new(q.x, q.y);
                     if poly.degenerate
-                        || surface_point(k, s, uv)?.distance(xyz) <= self.polish_above
+                        || surface_point(k, s, self.chart.reduce(uv))?.distance(xyz)
+                            <= self.polish_above
                     {
                         uv
                     } else {
-                        foot_with_budget(k, s, uv, xyz, self.domain, budget)?.0
+                        foot_with_budget(k, s, uv, xyz, self.chart, budget)?.0
                     }
                 }
                 None => match prev {
                     Some(seed) => {
-                        let uv = foot_with_budget(k, s, seed, xyz, self.domain, budget)?.0;
+                        let uv = foot_with_budget(k, s, seed, xyz, self.chart, budget)?.0;
                         self.unwrap(uv, seed)
                     }
-                    None => invert_point_with_budget(k, s, xyz, self.domain, budget)?,
+                    None => invert_point_with_budget(k, s, xyz, self.chart, budget)?,
                 },
             };
             prev = Some(uv);
@@ -2188,79 +2234,20 @@ fn unit_cross(su: Vec3, sv: Vec3) -> Option<Vec3> {
 fn surface_gap(
     k: &Kernel,
     s: &Surface,
+    chart: &Chart,
     uv: Point2,
     xyz: Point3,
     budget: &QueryBudget<'_>,
 ) -> Result<f64> {
     budget.charge(1)?;
-    Ok(s.evaluate_point(k, uv).map_or(0.0, |p| p.distance(xyz)))
+    Ok(s.evaluate_point(k, chart.reduce(uv))
+        .map_or(0.0, |p| p.distance(xyz)))
 }
 
 /// Distance in scaled UV between `a` and `c`.
 fn scaled_gap(a: Point2, c: Point2, scale: (f64, f64)) -> f64 {
     let (du, dv) = ((a.x - c.x) * scale.0, (a.y - c.y) * scale.1);
     (du * du + dv * dv).sqrt()
-}
-
-/// Whether the UV jump from `a` to `b` (one mesh vertex) is a pole: far apart in UV but
-/// the surface stays at the vertex between them. A jump across most of the domain where
-/// the surface does not stay is a loop that only closes across a seam.
-fn junction_is_pole(
-    k: &Kernel,
-    s: &Surface,
-    chord: f64,
-    a: LoopPoint,
-    b: LoopPoint,
-    span: f64,
-    scale: (f64, f64),
-    budget: &QueryBudget<'_>,
-) -> Result<bool> {
-    let gap = scaled_gap(a.uv, b.uv, scale);
-    if gap <= chord.max(1e-9 * span) {
-        return Ok(false);
-    }
-    let mid = Point2::new((a.uv.x + b.uv.x) / 2.0, (a.uv.y + b.uv.y) / 2.0);
-    budget.charge(1)?;
-    if surface_point(k, s, mid)?.distance(a.xyz) <= chord {
-        return Ok(true);
-    }
-    if gap > 0.1 * span {
-        return Err(invalid(
-            "loop does not close in UV (periodic face without seam edge)",
-        ));
-    }
-    Ok(false)
-}
-
-/// Appends an edge use's points to a loop, merging the shared junction point.
-fn join(
-    pts: &mut Vec<LoopPoint>,
-    mut seq: Vec<LoopPoint>,
-    k: &Kernel,
-    s: &Surface,
-    chord: f64,
-    span: f64,
-    scale: (f64, f64),
-    budget: &QueryBudget<'_>,
-) -> Result<()> {
-    if let (Some(last), Some(first)) = (pts.last().copied(), seq.first().copied()) {
-        if last.vertex != first.vertex {
-            return Err(invalid("loop edge uses do not connect"));
-        }
-        if junction_is_pole(k, s, chord, last, first, span, scale, budget)? {
-            if let Some(l) = pts.last_mut() {
-                l.pole_next = true;
-            }
-        } else {
-            pts.pop();
-            if let Some(f) = seq.first_mut() {
-                f.pole_next |= last.pole_next;
-            }
-        }
-    }
-    budget.reserve_vec(pts, seq.len())?;
-    pts.extend(seq);
-    Ok(())
 }
 
 /// Flood fill from the outer face, flipping at every constraint edge: `true` for faces

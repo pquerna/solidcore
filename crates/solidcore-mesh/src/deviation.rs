@@ -3,7 +3,6 @@
 //! the distance bounds the true one from above), and each edge segment against its
 //! curve. (The sampling follows the nurbs-grid-mesh design note's `deviation`.)
 
-use solidcore::geom::extent2d::Extent2d;
 use solidcore::kernel::Kernel;
 use solidcore::math::{Point2, Point3};
 use solidcore::surface::surface::Surface;
@@ -12,8 +11,7 @@ use solidcore::Result;
 
 use crate::budget::QueryBudget;
 use crate::face::FaceMesh;
-use crate::geom::foot_with_budget;
-use crate::geom::{curve_eval, invalid, segment_distance, surface_normal};
+use crate::geom::{curve_eval, foot_with_budget, invalid, segment_distance, surface_normal, Chart};
 use crate::mesh::{EdgePolyline, Mesh};
 
 /// Barycentric weights of the seven samples: centroid, edge midpoints, and three points
@@ -54,7 +52,7 @@ pub struct DeviationReport {
 pub(crate) fn triangle_deviation_with_budget(
     k: &Kernel,
     s: &Surface,
-    domain: &Extent2d,
+    chart: &Chart,
     uv: [Point2; 3],
     p: [Point3; 3],
     budget: &QueryBudget<'_>,
@@ -67,7 +65,7 @@ pub(crate) fn triangle_deviation_with_budget(
             uv[0].x * w[0] + uv[1].x * w[1] + uv[2].x * w[2],
             uv[0].y * w[0] + uv[1].y * w[1] + uv[2].y * w[2],
         );
-        if let (_, Some(d)) = foot_with_budget(k, s, start, q, domain, budget)? {
+        if let (_, Some(d)) = foot_with_budget(k, s, start, q, chart, budget)? {
             worst = worst.max(d);
         }
     }
@@ -79,7 +77,7 @@ pub(crate) fn triangle_deviation_with_budget(
 pub(crate) fn face_mesh_deviation_with_budget(
     k: &Kernel,
     s: &Surface,
-    domain: &Extent2d,
+    chart: &Chart,
     m: &FaceMesh,
     chord: f64,
     budget: &QueryBudget<'_>,
@@ -93,7 +91,7 @@ pub(crate) fn face_mesh_deviation_with_budget(
             continue;
         };
         let d =
-            triangle_deviation_with_budget(k, s, domain, [a.0, b.0, c.0], [a.1, b.1, c.1], budget)?;
+            triangle_deviation_with_budget(k, s, chart, [a.0, b.0, c.0], [a.1, b.1, c.1], budget)?;
         let gap = t
             .iter()
             .filter_map(|i| m.gaps.get(*i as usize))
@@ -152,6 +150,10 @@ pub fn deviation(k: &Kernel, b: &Brep, mesh: &Mesh, tolerance: f64) -> Result<De
     }
     let mut r = DeviationReport::default();
     let mut sum = 0.0;
+    // Each face's chart, closed where its surface meets itself within a part per
+    // billion of the mesh's size (the mesher's own closure test).
+    let closure = 1e-9 * mesh_size(mesh).max(1e-300);
+    let mut charts = std::collections::BTreeMap::new();
     for (i, ((t, uv), f)) in mesh
         .triangles
         .iter()
@@ -167,8 +169,14 @@ pub fn deviation(k: &Kernel, b: &Brep, mesh: &Mesh, tolerance: f64) -> Result<De
         let Some(p) = mesh.triangle_points(*t) else {
             continue;
         };
-        let domain = s.natural_uv_domain_with_nurb(k)?;
-        let d = triangle_deviation_with_budget(k, s, &domain, *uv, p, &QueryBudget::unbounded())?;
+        let chart = if let Some(chart) = charts.get(f) {
+            *chart
+        } else {
+            let chart = Chart::of_with_budget(k, s, closure, &QueryBudget::unbounded())?;
+            charts.insert(*f, chart);
+            chart
+        };
+        let d = triangle_deviation_with_budget(k, s, &chart, *uv, p, &QueryBudget::unbounded())?;
         sum += d;
         let facet = (p[1] - p[0]).cross(p[2] - p[0]);
         let centroid = (p[0] + p[1] + p[2]) / 3.0;
@@ -176,8 +184,8 @@ pub fn deviation(k: &Kernel, b: &Brep, mesh: &Mesh, tolerance: f64) -> Result<De
             (uv[0].x + uv[1].x + uv[2].x) / 3.0,
             (uv[0].y + uv[1].y + uv[2].y) / 3.0,
         );
-        let (at, _) = foot_with_budget(k, s, start, centroid, &domain, &QueryBudget::unbounded())?;
-        if let Some(n) = surface_normal(k, s, at) {
+        let (at, _) = foot_with_budget(k, s, start, centroid, &chart, &QueryBudget::unbounded())?;
+        if let Some(n) = surface_normal(k, s, chart.reduce(at)) {
             if n.dot(facet) * crate::face::outward_sense(b, *f)? < 0.0 {
                 r.flipped += 1;
                 r.flipped_triangles.push(i);
@@ -199,4 +207,25 @@ pub fn deviation(k: &Kernel, b: &Brep, mesh: &Mesh, tolerance: f64) -> Result<De
     }
     r.max = r.face_max.max(r.edge_max);
     Ok(r)
+}
+
+/// The diagonal of the box of `mesh`'s positions (`0` when empty).
+fn mesh_size(mesh: &Mesh) -> f64 {
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for p in &mesh.positions {
+        for (i, x) in [p.x, p.y, p.z].into_iter().enumerate() {
+            if let (Some(l), Some(h)) = (lo.get_mut(i), hi.get_mut(i)) {
+                *l = l.min(x);
+                *h = h.max(x);
+            }
+        }
+    }
+    let d = Point3::new(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+    let n = (d.x * d.x + d.y * d.y + d.z * d.z).sqrt();
+    if n.is_finite() {
+        n
+    } else {
+        0.0
+    }
 }

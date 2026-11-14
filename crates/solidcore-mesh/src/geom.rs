@@ -89,30 +89,83 @@ pub(crate) fn surface_point(k: &Kernel, s: &Surface, uv: Point2) -> Result<Point
     }
 }
 
-pub(crate) fn clamp_uv(uv: Point2, d: &Extent2d) -> Point2 {
-    if d.u_min() <= d.u_max() && d.v_min() <= d.v_max() {
+/// A surface's natural UV domain and its period in each direction where it closes on
+/// itself. A face's UV may wind past the domain along a closed direction (a thread
+/// flank whose trims run just over one turn); its UV is then kept unwrapped and each
+/// evaluation takes the same point one or more whole periods back in the domain.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Chart {
+    pub(crate) domain: Extent2d,
+    pub(crate) period: (Option<f64>, Option<f64>),
+}
+
+impl Chart {
+    /// `s`'s chart: its natural domain, closed in a direction when its two opposite
+    /// sides agree within `tol`.
+    pub(crate) fn of_with_budget(
+        k: &Kernel,
+        s: &Surface,
+        tol: f64,
+        budget: &crate::budget::QueryBudget<'_>,
+    ) -> Result<Self> {
+        let domain = s.natural_uv_domain_with_nurb(k)?;
+        let period = (
+            closes_with_budget(k, s, &domain, true, tol, budget)?
+                .then(|| domain.u_max() - domain.u_min()),
+            closes_with_budget(k, s, &domain, false, tol, budget)?
+                .then(|| domain.v_max() - domain.v_min()),
+        );
+        Ok(Self { domain, period })
+    }
+
+    /// `uv` kept inside the domain along open directions; closed directions are not
+    /// bounded.
+    pub(crate) fn clamp(&self, uv: Point2) -> Point2 {
+        let d = &self.domain;
+        if !(d.u_min() <= d.u_max() && d.v_min() <= d.v_max()) {
+            return uv;
+        }
+        let keep = |x: f64, lo: f64, hi: f64, p: Option<f64>| match p {
+            Some(p) if p > 0.0 => x,
+            _ => x.clamp(lo, hi),
+        };
         Point2::new(
-            uv.x.clamp(d.u_min(), d.u_max()),
-            uv.y.clamp(d.v_min(), d.v_max()),
+            keep(uv.x, d.u_min(), d.u_max(), self.period.0),
+            keep(uv.y, d.v_min(), d.v_max(), self.period.1),
         )
-    } else {
-        uv
+    }
+
+    /// `uv` moved by whole periods into the domain along closed directions, where the
+    /// surface evaluates the same point; unchanged (bit for bit) when already inside.
+    pub(crate) fn reduce(&self, uv: Point2) -> Point2 {
+        let d = &self.domain;
+        let wrap = |x: f64, lo: f64, hi: f64, p: Option<f64>| match p {
+            Some(p) if p > 0.0 && x.is_finite() && !(lo..=hi).contains(&x) => {
+                (x - ((x - lo) / p).floor() * p).clamp(lo, hi)
+            }
+            _ => x,
+        };
+        Point2::new(
+            wrap(uv.x, d.u_min(), d.u_max(), self.period.0),
+            wrap(uv.y, d.v_min(), d.v_max(), self.period.1),
+        )
     }
 }
 
-/// A damped Newton proposal with caller checks before each native evaluation.
-/// Kernel-owned evaluation scratch remains an opaque host allocation.
-
+/// `uv` moved by damped Gauss-Newton steps towards the surface point nearest
+/// `target`, kept inside `chart` along its open directions and unwrapped along closed
+/// ones, with caller checks before each native evaluation. Kernel-owned evaluation
+/// scratch remains an opaque host allocation.
 pub(crate) fn foot_with_budget(
     k: &Kernel,
     s: &Surface,
     uv: Point2,
     target: Point3,
-    domain: &Extent2d,
+    chart: &Chart,
     budget: &crate::budget::QueryBudget<'_>,
 ) -> Result<(Point2, Option<f64>)> {
     budget.charge(1)?;
-    let Ok(p0) = s.evaluate_point(k, uv) else {
+    let Ok(p0) = s.evaluate_point(k, chart.reduce(uv)) else {
         return Ok((uv, None));
     };
     let mut best = p0.distance(target);
@@ -122,7 +175,7 @@ pub(crate) fn foot_with_budget(
         if best == 0.0 {
             break;
         }
-        let Ok((p, su, sv)) = s.evaluate_1st_derivatives(k, uv, false, false) else {
+        let Ok((p, su, sv)) = s.evaluate_1st_derivatives(k, chart.reduce(uv), false, false) else {
             break;
         };
         let r = target - p;
@@ -140,8 +193,8 @@ pub(crate) fn foot_with_budget(
         let mut f = 1.0;
         for _ in 0..DAMPING_HALVINGS {
             budget.charge(1)?;
-            let next = clamp_uv(Point2::new(uv.x + du * f, uv.y + dv * f), domain);
-            if let Ok(q) = s.evaluate_point(k, next) {
+            let next = chart.clamp(Point2::new(uv.x + du * f, uv.y + dv * f));
+            if let Ok(q) = s.evaluate_point(k, chart.reduce(next)) {
                 let d = q.distance(target);
                 if d < best {
                     improved = Some((d, next));
@@ -159,14 +212,15 @@ pub(crate) fn foot_with_budget(
     Ok((uv, Some(best)))
 }
 
-/// The UV of `target` by a coarse search over `domain` and a Newton polish.
+/// The UV of `target` by a coarse search over the chart's domain and a Newton polish.
 pub(crate) fn invert_point_with_budget(
     k: &Kernel,
     s: &Surface,
     target: Point3,
-    domain: &Extent2d,
+    chart: &Chart,
     budget: &crate::budget::QueryBudget<'_>,
 ) -> Result<Point2> {
+    let domain = &chart.domain;
     let mut best: Option<(f64, Point2)> = None;
     for j in 0..=INVERT_GRID {
         for i in 0..=INVERT_GRID {
@@ -184,7 +238,7 @@ pub(crate) fn invert_point_with_budget(
         }
     }
     let (_, uv) = best.ok_or_else(|| invalid("surface does not evaluate"))?;
-    Ok(foot_with_budget(k, s, uv, target, domain, budget)?.0)
+    Ok(foot_with_budget(k, s, uv, target, chart, budget)?.0)
 }
 
 /// The power of two nearest `x` (`x` positive and finite), so scaling by it is exact.
@@ -196,11 +250,12 @@ pub(crate) fn power_of_two(x: f64) -> f64 {
     2.0_f64.powi(e as i32)
 }
 
-/// Mean `|Su|` and `|Sv|` over a sample grid of `d`, each rounded to a power of two (so
-/// scaling is exact both ways), so `(u * su, v * sv)` is roughly arc length.
+/// Mean `|Su|` and `|Sv|` over a sample grid of `d` (in `chart`), each rounded to a power
+/// of two (so scaling is exact both ways), so `(u * su, v * sv)` is roughly arc length.
 pub(crate) fn surface_scales_with_budget(
     k: &Kernel,
     s: &Surface,
+    chart: &Chart,
     d: &Extent2d,
     budget: &crate::budget::QueryBudget<'_>,
 ) -> Result<(f64, f64)> {
@@ -212,7 +267,7 @@ pub(crate) fn surface_scales_with_budget(
                 d.u_min() + (d.u_max() - d.u_min()) * f64::from(i) / 4.0,
                 d.v_min() + (d.v_max() - d.v_min()) * f64::from(j) / 4.0,
             );
-            if let Ok((_, su, sv)) = s.evaluate_1st_derivatives(k, uv, false, false) {
+            if let Ok((_, su, sv)) = s.evaluate_1st_derivatives(k, chart.reduce(uv), false, false) {
                 let (a, b) = (su.length(), sv.length());
                 if a.is_finite() && b.is_finite() {
                     su_sum += a;

@@ -1737,3 +1737,36 @@ fn restarting_a_curve_returns_typed_errors_with_its_operation() {
         }
     ));
 }
+
+/// A pcurve a kernel made on an edge interval of its own moves onto the edge's interval by the
+/// affine change of parameter (its knots move, its points stay), where the kernel's ends are
+/// within the tolerance of the edge's along its curve; farther is refused, and the same interval
+/// is the pcurve as it was.
+#[test]
+fn a_pcurve_made_on_a_moved_interval_is_put_on_the_edges_own() {
+    // A line along x from 0 to 10, parameterised by length.
+    let line = Curve::Line {
+        start: [0.0, 0.0, 0.0],
+        end: [10.0, 0.0, 0.0],
+    };
+    let made = Curve2::Spline {
+        knots: vec![0.001, 0.001, 0.5, 1.0, 1.0],
+        points: vec![[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]],
+    };
+    // The line's parameter runs 0 to 1 over its length 10: 0.001 is 0.01 mm along it.
+    assert_eq!(
+        on_interval(made.clone(), &line, [0.001, 1.0], [0.001, 1.0], 1e-6).unwrap(),
+        made
+    );
+    let moved = on_interval(made.clone(), &line, [0.0, 1.0], [0.001, 1.0], 0.02).unwrap();
+    let Curve2::Spline { knots, points } = moved else {
+        panic!("a spline stays a spline")
+    };
+    assert_eq!(knots.first(), Some(&0.0));
+    assert_eq!(knots.last(), Some(&1.0));
+    let mid = 0.0 + (0.5 - 0.001) * (1.0 / 0.999);
+    assert!((knots[2] - mid).abs() <= 1e-15, "{knots:?}");
+    assert_eq!(points, vec![[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]]);
+    let far = on_interval(made, &line, [0.0, 1.0], [0.001, 1.0], 0.005);
+    assert!(matches!(&far, Err(Error::Failed(m)) if m.contains("moved an edge's interval")), "{far:?}");
+}

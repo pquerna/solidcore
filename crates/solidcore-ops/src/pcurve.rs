@@ -157,6 +157,29 @@ pub fn exact_pcurves(
         .collect())
 }
 
+/// A pcurve made on its edge's interval `theirs`, on `ours` ([`solidcore::eval::pcurve::on_interval`]).
+///
+/// # Errors
+/// [`Error::Invalid`] for a malformed record or interval; [`Error::Failed`] for an end moved
+/// farther than `tolerance` along the edge's `curve`.
+pub fn on_interval(
+    pc: &Curve2,
+    curve: &Curve,
+    ours: [f64; 2],
+    theirs: [f64; 2],
+    tolerance: f64,
+) -> Result<Curve2> {
+    let curve = solidcore_convert::curve(curve).map_err(|e| Error::Invalid(e.0.to_owned()))?;
+    let made = k::on_interval(
+        solidcore_convert::curve2(pc),
+        &curve,
+        ours,
+        theirs,
+        tolerance,
+    )?;
+    Ok(solidcore_convert::record_curve2(made))
+}
+
 /// The point of pcurve `c` at `t` (`None` outside its interval or for a malformed record)
 /// ([`solidcore::eval::pcurve::eval`]).
 #[must_use]

@@ -70,6 +70,7 @@ pub mod surface_cvs;
 pub mod sweep;
 pub mod tangent;
 pub mod trim;
+pub mod trims;
 pub mod untrim;
 
 pub use blend::{

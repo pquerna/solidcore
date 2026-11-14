@@ -912,6 +912,65 @@ fn move_by(c: &mut Curve2, d: usize, by: f64) {
     }
 }
 
+/// A pcurve made on its edge's interval `theirs`, on the edge's interval `ours`. A kernel may
+/// end an edge at a parameter of its own when it makes the edge's trim (a knot its vertex lies
+/// at, or where an edge run past its face's patch leaves it): where each end it chose is within
+/// `tolerance` of ours on the edge's `curve`, the pcurve is moved onto `ours` by the affine
+/// change of parameter, exact for a B-spline (its knots move, its points stay). Farther is the
+/// kernel trimming the edge, refused (`Failed`) with how far.
+///
+/// # Errors
+/// [`Error::Invalid`] for an empty or reversed interval or a curve that does not evaluate at
+/// an end; [`Error::Failed`] for an end moved farther than `tolerance`.
+pub fn on_interval(
+    pc: Curve2,
+    curve: &Curve,
+    ours: [f64; 2],
+    theirs: [f64; 2],
+    tolerance: f64,
+) -> Result<Curve2> {
+    let [a, b] = ours;
+    let [c, d] = theirs;
+    if a == c && b == d {
+        return Ok(pc);
+    }
+    if !(b > a && d > c) {
+        return Err(Error::Invalid(format!(
+            "an edge's interval {ours:?} or {theirs:?} is empty"
+        )));
+    }
+    let e = CurveEval::new(curve)?;
+    let at = |t: f64| {
+        e.point(t)
+            .ok_or_else(|| Error::Invalid(format!("the edge's curve has no point at {t}")))
+    };
+    let shift = at(a)?.dist(at(c)?).max(at(b)?.dist(at(d)?));
+    if shift.is_nan() || shift > tolerance {
+        return Err(Error::Failed(format!(
+            "the kernel moved an edge's interval from {ours:?} to {theirs:?}, its ends {shift} mm along its curve (tolerance {tolerance} mm)"
+        )));
+    }
+    let map = |k: f64| {
+        if k == c {
+            a
+        } else if k == d {
+            b
+        } else {
+            a + (k - c) * ((b - a) / (d - c))
+        }
+    };
+    Ok(match pc {
+        Curve2::Spline { knots, points } => Curve2::Spline {
+            knots: knots.into_iter().map(map).collect(),
+            points,
+        },
+        Curve2::RationalSpline { knots, homogeneous } => Curve2::RationalSpline {
+            knots: knots.into_iter().map(map).collect(),
+            homogeneous,
+        },
+    })
+}
+
 /// The point of pcurve `c` at `t` (`None` outside its interval or for a malformed record).
 pub fn eval(c: &Curve2, t: f64) -> Option<[f64; 2]> {
     let (knots, h): (&[f64], Vec<[f64; 3]>) = match c {

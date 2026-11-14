@@ -2090,14 +2090,10 @@ impl Trims for Projected {
     }
 }
 
-/// A quarter-cylinder wedge (radius 0.2 mm, height 5 mm, 0 to 100 degrees about +z) whose straight
-/// edge runs from 1.9 um before the x axis to 1.9 um past it, 0.6 um outside the cylinder, in a
-/// file of uncertainty 2e-3 mm: the face's extent ends within that of the x axis, so its form
-/// starts there, while the pcurve its kernel projects for the skewed edge starts before it.
-/// Every pcurve of the record lies in its face's domain, as SMLib's check asks
-/// (`SmBrep::ValidatePointers` tests 70 and 71, "Edge endpoints within face domain").
-#[test]
-fn a_projected_pcurve_past_the_quarter_line_a_face_form_ends_on_stays_in_the_face_domain() {
+/// The quarter-cylinder wedge of
+/// [`a_projected_pcurve_past_the_quarter_line_a_face_form_ends_on_stays_in_the_face_domain`]:
+/// its skewed straight edge has no closed-form pcurve on the cylinder.
+fn skewed_wedge() -> Exchange {
     let (r, h, q): (f64, f64, f64) = (0.2, 5.0, 100f64.to_radians());
     // The edge 1.9 um either side of the x axis at the rim, and 0.6 um outside the cylinder: more
     // than half the tolerance off any line on the form, so its pcurve is the kernel's.
@@ -2140,8 +2136,20 @@ fn a_projected_pcurve_past_the_quarter_line_a_face_form_ends_on_stays_in_the_fac
     ];
     let shell = closed_shell(&mut w, &faces);
     let solid = w.add(format!("MANIFOLD_SOLID_BREP('wedge',#{shell})"));
+    w.file_with_uncertainty(&[solid], 2e-3)
+}
+
+/// A quarter-cylinder wedge (radius 0.2 mm, height 5 mm, 0 to 100 degrees about +z) whose straight
+/// edge runs from 1.9 um before the x axis to 1.9 um past it, 0.6 um outside the cylinder, in a
+/// file of uncertainty 2e-3 mm: the face's extent ends within that of the x axis, so its form
+/// starts there, while the pcurve its kernel projects for the skewed edge starts before it.
+/// Every pcurve of the record lies in its face's domain, as SMLib's check asks
+/// (`SmBrep::ValidatePointers` tests 70 and 71, "Edge endpoints within face domain").
+#[test]
+fn a_projected_pcurve_past_the_quarter_line_a_face_form_ends_on_stays_in_the_face_domain() {
+    let ex = skewed_wedge();
     let kernel = Projected(std::sync::atomic::AtomicUsize::new(0));
-    let read = read_solids_with(&w.file_with_uncertainty(&[solid], 2e-3), &kernel);
+    let read = read_solids_with(&ex, &kernel);
     assert!(read.failures.is_empty(), "{:?}", read.failures);
     assert!(kernel.0.load(std::sync::atomic::Ordering::Relaxed) > 0, "the skewed edge's pcurve is the kernel's");
     let b = &read.solids[0].brep;
@@ -2160,6 +2168,21 @@ fn a_projected_pcurve_past_the_quarter_line_a_face_form_ends_on_stays_in_the_fac
             }
         }
     }
+    solidcore_ops::record_check::validate(b).unwrap();
+    solidcore_ops::record_check::agreement(b).unwrap();
+}
+
+/// The skewed wedge's missing pcurve made by the kernel itself
+/// ([`solidcore_ops::trims::KernelTrims`]): the solid reads whole, every pcurve lies in its
+/// face's domain and lifts onto its edge as the record's own checks ask.
+#[test]
+fn the_kernel_makes_the_pcurve_a_skewed_edge_has_no_closed_form_for() {
+    let ex = skewed_wedge();
+    assert!(!read_solids(&ex).failures.is_empty(), "without trims the skewed edge refuses its solid");
+    let read = read_solids_with(&ex, &solidcore_ops::trims::KernelTrims);
+    assert!(read.failures.is_empty(), "{:?}", read.failures);
+    let b = &read.solids[0].brep;
+    assert_eq!(counts(b), [2, 1, 5, 9, 6]);
     solidcore_ops::record_check::validate(b).unwrap();
     solidcore_ops::record_check::agreement(b).unwrap();
 }

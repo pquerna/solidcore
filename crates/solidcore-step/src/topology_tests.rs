@@ -2516,3 +2516,38 @@ fn a_closed_spline_cylinders_seam_uses_are_on_its_two_sides() {
     let [x, y] = seam_us.as_slice() else { panic!("a seam's two uses: {seam_us:?}") };
     assert!(((x - y).abs() - 4.0).abs() < 1e-9, "{seam_us:?}");
 }
+/// A half cylinder (radius 3, height 4) over angles π to 2π of its frame: its form is on the
+/// frame's third and fourth quarters, so the label's frame is turned two quarters (exactly) to
+/// start the form on the first. The kernel then proves the form on the label and keeps the face
+/// a cylinder, not a bare NURBS.
+#[test]
+fn a_round_face_past_its_frames_first_quarter_keeps_its_kernel_support() {
+    let (r, h) = (3.0, 4.0);
+    let mut w = W::default();
+    let p = |a: f64, z: f64| [r * a.cos(), r * a.sin(), z];
+    let (a0, a1, b0, b1) = (w.vertex(p(PI, 0.0)), w.vertex(p(0.0, 0.0)), w.vertex(p(PI, h)), w.vertex(p(0.0, h)));
+    let arc = |w: &mut W, s: u64, e: u64, z: f64| {
+        let c = w.circle([0.0, 0.0, z], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], r);
+        w.add(format!("EDGE_CURVE('',#{s},#{e},#{c},.T.)"))
+    };
+    let (bottom, top) = (arc(&mut w, a0, a1, 0.0), arc(&mut w, b0, b1, h));
+    let left = w.line_edge((a0, p(PI, 0.0)), (b0, p(PI, h)), true, 1.0);
+    let right = w.line_edge((a1, p(0.0, 0.0)), (b1, p(0.0, h)), true, 1.0);
+    let oes: Vec<u64> = [(bottom, true), (right, true), (top, false), (left, false)].iter().map(|&(e, o)| w.oe(e, o)).collect();
+    let bound = w.bound(&oes, true, true);
+    let a = w.axis([0.0; 3], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]);
+    let cylinder = w.add(format!("CYLINDRICAL_SURFACE('',#{a},{})", real(r)));
+    let face = w.face(&[bound], cylinder, true);
+    let shell = w.add(format!("OPEN_SHELL('',(#{face}))"));
+    let model = w.add(format!("SHELL_BASED_SURFACE_MODEL('',(#{shell}))"));
+    let s = one_solid(&w.file(&[model]));
+    let f = &s.brep.faces[0];
+    let BSurface::Cylinder { frame, .. } = &f.surface else { panic!("a cylinder label") };
+    assert_eq!((frame.x_axis, frame.y_axis), ([-1.0, -0.0, -0.0], [-0.0, -1.0, -0.0]));
+    let Some(BSurface::RationalSpline { u_knots, .. }) = &f.nurbs else { panic!("a rational form") };
+    assert_eq!(u_knots.first(), Some(&0.0));
+    let mut k = solidcore::kernel::Kernel::default();
+    let (body, order) = solidcore_convert::brep::to_kernel(&mut k, &s.brep, true).unwrap();
+    let made = body.face(order.faces[0]).unwrap().surface.as_ref().unwrap();
+    assert!(matches!(made.kind(), solidcore::surface::surface::p2::SurfaceKind::Cone(_)), "{}", made.type_string());
+}

@@ -45,6 +45,7 @@ pub fn curve_points(
         tol,
         max_len: f64::INFINITY,
         turn,
+        meter: crate::control::Meter::NONE,
     };
     let ends = [at(t0)?, at(t1)?];
     let [front, back] = ends;
@@ -184,6 +185,7 @@ mod tests {
                     tol,
                     max_len: f64::INFINITY,
                     turn,
+                    meter: crate::control::Meter::NONE,
                 };
                 let ends = [at(0.0).unwrap(), at(1.0).unwrap()];
                 let nodes = bisect(&at, [0.0, 1.0], ends, 4, &rules, f64::INFINITY).unwrap();

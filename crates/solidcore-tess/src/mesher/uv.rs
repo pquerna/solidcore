@@ -8,6 +8,7 @@ pub(crate) use solidcore::eval::plan::uv::{Domain, domain, unwrap};
 
 use super::edges::{QUARTER_TURN, turn};
 use super::size::Rules;
+use crate::control::Meter;
 
 /// Division of `range` along direction `d` so that between neighbouring lines the surface sags
 /// at most the tolerance from its chord, the chord is at most `h` long and the normal turns
@@ -21,7 +22,7 @@ pub(crate) fn divide(s: &EvalSurface, d: usize, range: (f64, f64), across: (f64,
     // The whole range first: the limits split it, and no interval spans more than a quarter
     // turn of its iso-lines, so a closed iso-line is never taken for a flat one. Both ends
     // exactly: the end lines are the face's own parameter box, which the boundary nodes sit on.
-    split(&[a0, a1], &limits(s, d, across, rules, h), max_lines)
+    split(&[a0, a1], &limits(s, d, across, rules, h), max_lines, rules.meter)
 }
 
 /// `lines` (increasing, ends included) with every interval that fails the same limits as
@@ -29,15 +30,19 @@ pub(crate) fn divide(s: &EvalSurface, d: usize, range: (f64, f64), across: (f64,
 /// node, but nothing else checks how far the surface turns between them inside the face.
 pub(crate) fn refine(s: &EvalSurface, d: usize, lines: &[f64], across: (f64, f64), rules: &Rules, h: f64, max_lines: usize) -> Vec<f64> {
     let flat = limits(s, d, across, rules, h);
-    split(lines, &flat, max_lines)
+    split(lines, &flat, max_lines, rules.meter)
 }
 
-/// Depth-first bisection of the intervals between `starts` until `flat` holds for each.
-fn split(starts: &[f64], flat: &dyn Fn(f64, f64) -> bool, max_lines: usize) -> Vec<f64> {
+/// Depth-first bisection of the intervals between `starts` until `flat` holds for each, each
+/// interval tried a step of `meter`'s work (stopped, the lines so far: the plan is refused).
+fn split(starts: &[f64], flat: &dyn Fn(f64, f64) -> bool, max_lines: usize, meter: Meter<'_>) -> Vec<f64> {
     let Some(&first) = starts.first() else { return Vec::new() };
     let mut out = vec![first];
     let mut stack: Vec<(f64, f64, u32)> = starts.windows(2).rev().filter_map(|w| if let [a, b] = *w { Some((a, b, 0)) } else { None }).collect();
     while let Some((a, b, depth)) = stack.pop() {
+        if !meter.charge(1) {
+            break;
+        }
         if depth >= 20 || out.len() + stack.len() >= max_lines.max(2) || flat(a, b) {
             out.push(b);
         } else {
@@ -144,14 +149,14 @@ mod tests {
     fn divides_the_turn_but_not_the_straight_direction() {
         let s = cylinder();
         let turn =
-            divide(&s, 1, (0.0, std::f64::consts::TAU), (0.0, 1.0), &Rules { tol: 0.01, max_len: f64::INFINITY, turn: None }, f64::INFINITY, 10_000);
+            divide(&s, 1, (0.0, std::f64::consts::TAU), (0.0, 1.0), &Rules { tol: 0.01, max_len: f64::INFINITY, turn: None, meter: Meter::NONE }, f64::INFINITY, 10_000);
         let along =
-            divide(&s, 0, (0.0, 1.0), (0.0, std::f64::consts::TAU), &Rules { tol: 0.01, max_len: f64::INFINITY, turn: None }, f64::INFINITY, 10_000);
+            divide(&s, 0, (0.0, 1.0), (0.0, std::f64::consts::TAU), &Rules { tol: 0.01, max_len: f64::INFINITY, turn: None, meter: Meter::NONE }, f64::INFINITY, 10_000);
         assert_eq!(along, vec![0.0, 1.0]);
         // Chord sag r(1 − cos(θ/2)) ≤ 0.01 with r = 3 needs θ ≤ 0.163: at least 39 segments.
         assert!(turn.len() >= 40 && turn.len() < 80, "{}", turn.len());
         // With a longest side the straight direction is divided too: 4 mm in sides ≤ 0.5.
-        let along = divide(&s, 0, (0.0, 1.0), (0.0, std::f64::consts::TAU), &Rules { tol: 0.01, max_len: f64::INFINITY, turn: None }, 0.5, 10_000);
+        let along = divide(&s, 0, (0.0, 1.0), (0.0, std::f64::consts::TAU), &Rules { tol: 0.01, max_len: f64::INFINITY, turn: None, meter: Meter::NONE }, 0.5, 10_000);
         assert_eq!(along.len(), 9);
     }
 
@@ -169,7 +174,7 @@ mod tests {
             [2, 3],
             vec![[1.0, 0.0, 0.0, 1.0], [1.0, 0.0, 40.0, 1.0], [w, w, 0.0, w], [w, w, 40.0 * w, w], [0.0, 1.0, 0.0, 1.0], [0.0, 1.0, 40.0, 1.0]],
         );
-        let coarse = Rules { tol: 3.0, max_len: f64::INFINITY, turn: None };
+        let coarse = Rules { tol: 3.0, max_len: f64::INFINITY, turn: None, meter: Meter::NONE };
         assert_eq!(divide(&s, 1, (-6.7e-13, q), (0.0, 40.0), &coarse, f64::INFINITY, 10_000), vec![-6.7e-13, q]);
         let whole = divide(&cylinder(), 1, (0.0, std::f64::consts::TAU), (0.0, 1.0), &Rules { tol: 100.0, ..coarse }, f64::INFINITY, 10_000);
         assert_eq!(whole.len(), 5, "{whole:?}");
@@ -181,7 +186,7 @@ mod tests {
     #[test]
     fn divides_with_the_ends_exactly() {
         let (a0, a1) = (-1.010485317689877, 1.083909784703316);
-        let lines = divide(&cylinder(), 1, (a0, a1), (0.0, 1.0), &Rules { tol: 0.01, max_len: f64::INFINITY, turn: None }, f64::INFINITY, 10_000);
+        let lines = divide(&cylinder(), 1, (a0, a1), (0.0, 1.0), &Rules { tol: 0.01, max_len: f64::INFINITY, turn: None, meter: Meter::NONE }, f64::INFINITY, 10_000);
         assert_eq!(lines.first().copied(), Some(a0));
         assert_eq!(lines.last().copied(), Some(a1));
     }

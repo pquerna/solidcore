@@ -55,6 +55,9 @@ pub struct TessPlan {
     pub faces: Vec<FacePlan>,
     /// B-rep edges as polylines (the shared edge nodes), in the body's edge order.
     pub edges: Vec<Vec<Vec3>>,
+    /// Per edge: each node's parameter on the edge's curve (its interval, ends included), as
+    /// many as [`TessPlan::edges`] has nodes; empty for an edge left out.
+    pub edge_params: Vec<Vec<f64>>,
     /// Per edge: the faces it bounds.
     pub edge_faces: Vec<Vec<u32>>,
 }
@@ -128,9 +131,41 @@ impl TessPlan {
     /// across faces, so creases keep their own normals), with the faces left out of it.
     #[must_use]
     pub fn evaluate(&self) -> (Mesh, Vec<crate::RefusedFace>) {
+        self.evaluate_metered(crate::control::Meter::NONE)
+    }
+
+    /// [`TessPlan::evaluate`] under the caller's `control` ([`crate::Control`]): each face's
+    /// nodes and triangles are counted as work and admitted before they join the mesh.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::TessError::Stopped`] when `control` stopped it; no mesh is returned then.
+    pub fn evaluate_with(
+        &self,
+        control: &dyn crate::Control,
+    ) -> crate::Result<(Mesh, Vec<crate::RefusedFace>)> {
+        let gauge = crate::control::Gauge::new(control);
+        let evaluated = self.evaluate_metered(gauge.meter());
+        match gauge.stopped() {
+            Some(stop) => Err(crate::TessError::Stopped(stop)),
+            None => Ok(evaluated),
+        }
+    }
+
+    fn evaluate_metered(
+        &self,
+        meter: crate::control::Meter<'_>,
+    ) -> (Mesh, Vec<crate::RefusedFace>) {
         let mut out = Mesh::default();
         let mut refused = Vec::new();
         for f in &self.faces {
+            // A node evaluated and a triangle kept are steps of work; what joins the mesh is
+            // admitted first. Stopped, the mesh so far is dropped by the caller.
+            let kept = f.uv.len() * (2 * size_of::<Vec3>())
+                + f.triangles.len() * (size_of::<[u32; 3]>() + size_of::<u32>());
+            if !(meter.charge((f.uv.len() + f.triangles.len()) as u64) && meter.admit(kept)) {
+                break;
+            }
             let base = out.positions.len();
             let surface = f.surface.and_then(|i| self.surfaces.get(i as usize));
             let FaceNodes {
@@ -309,6 +344,7 @@ impl TessPlan {
                 .iter()
                 .map(|e| e.iter().map(|p| point(*p)).collect())
                 .collect(),
+            edge_params: self.edge_params.clone(),
             edge_faces: self.edge_faces.clone(),
         }
     }
@@ -383,6 +419,7 @@ mod tests {
             surfaces: vec![nurbs, revolved],
             faces: vec![face(0), face(1)],
             edges: vec![vec![Vec3::new(1.0, 1.0, 1.0)]],
+            edge_params: vec![vec![0.0]],
             edge_faces: vec![vec![0, 1]],
         };
         let (a, b) = (plan.evaluate().0, plan.transformed(&m).evaluate().0);
@@ -415,6 +452,7 @@ mod tests {
                 poles: vec![],
             }],
             edges: vec![],
+            edge_params: vec![],
             edge_faces: vec![],
         };
         let m = plan.evaluate().0;

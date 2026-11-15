@@ -74,6 +74,7 @@ use solidcore::eval::plan::EvalSurface;
 use crate::{FacePlan, TessPlan};
 
 use crate::{Result, TessError};
+use crate::control::{Gauge, Meter};
 
 /// The three of a triangle's corners (or sides) read from number `k` on, wrapping round.
 pub(crate) fn rot3<T>(mut a: [T; 3], k: usize) -> [T; 3] {
@@ -190,7 +191,14 @@ const MAX_UNTANGLE: u32 = 16;
 fn detail(e: &TessError) -> &str {
     match e {
         TessError::Invalid(m) | TessError::Failed(m) | TessError::Internal(m) => m,
+        TessError::Stopped(_) => "stopped by the caller",
     }
+}
+
+/// The error a loop the caller's control stopped returns: [`plan_with`] replaces whatever it
+/// becomes with [`TessError::Stopped`], so nothing planned before the stop is returned.
+fn stopped(meter: Meter<'_>) -> TessError {
+    TessError::Stopped(meter.stop().unwrap_or(crate::Stop::Cancelled))
 }
 
 fn unsupported(what: impl std::fmt::Display) -> TessError {
@@ -240,16 +248,32 @@ fn face_edges(f: &brep::Face) -> impl Iterator<Item = &brep::OrientedEdge> {
 /// Plan the display tessellation of `b`, a body of size `size` (its box diagonal), at the
 /// tolerance `t` ([`crate::MeshTolerance`]): faces and edges are the record's, in its order.
 pub fn plan(b: &brep::Brep, t: &crate::MeshTolerance, size: f64) -> Result<(TessPlan, PlanStats)> {
+    plan_with(b, t, size, &crate::Unlimited)
+}
+
+/// [`plan`] under the caller's `control` of its work and retained memory ([`crate::Control`]):
+/// its loops count their work and admit what they keep, so the caller can cancel the plan or
+/// hold it to a budget while it runs. A stop refuses the plan whole.
+///
+/// # Errors
+///
+/// As [`plan`]; [`TessError::Stopped`] when `control` stopped it.
+pub fn plan_with(b: &brep::Brep, t: &crate::MeshTolerance, size: f64, control: &dyn crate::Control) -> Result<(TessPlan, PlanStats)> {
+    let gauge = Gauge::new(control);
     let (tol, turn) = t.rules(size);
-    plan_at(b, tol, turn, Purpose::Display)
+    let planned = plan_at(b, tol, turn, Purpose::Display, gauge.meter());
+    match gauge.stopped() {
+        Some(stop) => Err(TessError::Stopped(stop)),
+        None => planned,
+    }
 }
 
 /// What the planner reads of a body before it plans any face, in the record's order: each face's
 /// surface (in the evaluator's parameters), target size and boundary loops in (u, v), every
 /// edge's shared nodes, and why each face left out is. [`plan_at`] plans the faces from it.
-pub(crate) struct Prepared {
+pub(crate) struct Prepared<'m> {
     /// The rules every edge was sampled to.
-    pub(crate) rules: size::Rules,
+    pub(crate) rules: size::Rules<'m>,
     /// Whether each face's normal is its surface's natural normal.
     pub(crate) forward: Vec<bool>,
     /// The faces each edge bounds.
@@ -276,14 +300,20 @@ pub(crate) struct Prepared {
 /// Plan the tessellation of `b` with chord tolerance `tol` and, when given, a facet angle no
 /// facet may turn more than (where it sags above the angle's floor), for `purpose`. Faces and
 /// edges are the record's, in its order.
-pub(crate) fn plan_at(b: &brep::Brep, tol: f64, turn: Option<size::Turn>, purpose: Purpose<'_>) -> Result<(TessPlan, PlanStats)> {
+pub(crate) fn plan_at(b: &brep::Brep, tol: f64, turn: Option<size::Turn>, purpose: Purpose<'_>, meter: Meter<'_>) -> Result<(TessPlan, PlanStats)> {
     let faces = &b.faces;
     let Prepared { rules, forward, edge_faces, evals, sizes, mut nodes, unsampled_edges, kept_strict, mut boundaries, params, why, tangled } =
-        prepare(b, tol, turn, purpose)?;
+        prepare(b, tol, turn, purpose, meter)?;
+    if meter.stopped() {
+        return Err(stopped(meter));
+    }
     let curved = evals.iter().filter(|e| !matches!(***e, EvalSurface::Plane { .. })).count();
     // One face for `purpose`: its plan, oriented, with its poles of higher order; or the boundary
     // sides the mesh path's shaping split.
     let plan_one = |fi: usize, purpose, boundaries: &[Boundary]| -> Result<(Planned, PlanStats)> {
+        if !meter.charge(1) {
+            return Err(stopped(meter));
+        }
         if let Some(Some(e)) = why.get(fi) {
             return Err(e.clone());
         }
@@ -307,6 +337,15 @@ pub(crate) fn plan_at(b: &brep::Brep, tol: f64, turn: Option<size::Turn>, purpos
         // Its poles of higher order and the normals they get, on the oriented triangles, by the
         // kernel's evaluator ([`crate::pole`]).
         let (poles, averaged) = crate::pole::plan_poles(fi, eval.kernel(), &fp, fb.reach);
+        // The face's plan is kept: its triangles count, and its nodes and triangles are admitted.
+        let kept = fp.uv.len() * size_of::<[f64; 2]>()
+            + fp.fixed.len() * size_of::<Vec3>()
+            + fp.normals.len() * size_of::<Vec3>()
+            + fp.triangles.len() * size_of::<[u32; 3]>()
+            + poles.len() * size_of::<crate::PoleNode>();
+        if !(meter.charge(fp.triangles.len() as u64) && meter.admit(kept)) {
+            return Err(stopped(meter));
+        }
         let mut stats = stats;
         stats.averaged_poles = averaged;
         Ok((Planned::Face(FacePlan { poles, ..fp }), stats))
@@ -405,7 +444,7 @@ pub(crate) fn plan_at(b: &brep::Brep, tol: f64, turn: Option<size::Turn>, purpos
         again.retain(|fi| !lost.contains(fi));
         again.sort_unstable();
         again.dedup();
-        if again.is_empty() {
+        if again.is_empty() || meter.stopped() {
             break;
         }
         todo = again;
@@ -448,6 +487,7 @@ pub(crate) fn plan_at(b: &brep::Brep, tol: f64, turn: Option<size::Turn>, purpos
             stats.edges_capped.push(crate::CappedEdge { edge, cap, sag, excess, tol: rules.tol, within: sag <= rules.tol });
         }
     }
+    plan.edge_params = nodes.iter().map(|n| n.params.clone()).collect();
     plan.edges = nodes.into_iter().map(|n| n.points.into_iter().map(kernel::record_vec3).collect()).collect();
     plan.edge_faces = edge_faces.into_iter().map(|fs| fs.into_iter().map(|f| u32::try_from(f).unwrap_or(u32::MAX)).collect()).collect();
     Ok((plan, stats))
@@ -480,7 +520,7 @@ fn on_edges(f: &brep::Face, nodes: &[edges::Nodes], sides: &[SplitSide]) -> Vec<
 /// ([`Prepared`]), with chord tolerance `tol` and the facet angle `turn`, for `purpose`: on the
 /// mesh path every face, planar ones included, asks for the spec's side where its surface asks
 /// for no less, and every edge follows the caller's size function too.
-pub(crate) fn prepare(b: &brep::Brep, tol: f64, turn: Option<size::Turn>, purpose: Purpose<'_>) -> Result<Prepared> {
+pub(crate) fn prepare<'m>(b: &brep::Brep, tol: f64, turn: Option<size::Turn>, purpose: Purpose<'_>, meter: Meter<'m>) -> Result<Prepared<'m>> {
     let faces = &b.faces;
     let forward = forward_faces(b);
     // The faces each edge bounds, each once, in the order of the edge's uses.
@@ -497,7 +537,7 @@ pub(crate) fn prepare(b: &brep::Brep, tol: f64, turn: Option<size::Turn>, purpos
             fs
         })
         .collect();
-    let rules = size::Rules::new(tol, size::extent(b.vertices.iter().map(|v| Vec3::new(v.point[0], v.point[1], v.point[2]))), turn);
+    let rules = size::Rules::metered(tol, size::extent(b.vertices.iter().map(|v| Vec3::new(v.point[0], v.point[1], v.point[2]))), turn, meter);
     // Each face's surface and target side length, then every edge once at the smaller size of
     // its faces; faces then read their nodes. A planar face costs microseconds and a curved
     // one about a hundred, so the pool is used only where curved faces (or intersection
@@ -1829,7 +1869,7 @@ fn plan_face(
         // A flat face with no size asked of it: the boundary nodes alone, no interior seeds.
         let seeds = if bare { Vec::new() } else { cdt::lattice(bbox, step, &polys, speed) };
         let eval = |u: f64, v: f64| s.derivs(u, v).map(|(p, su, sv)| (p, su.cross(sv).normalized()));
-        let sag = cdt::Sag { eval: &eval, tol, h, turn: rules.turn, scale: speed };
+        let sag = cdt::Sag { eval: &eval, tol, h, turn: rules.turn, scale: speed, meter: rules.meter };
         let fill = cdt::Fill {
             seeds: &seeds,
             refine: if bare { None } else { Some((sag, MAX_REFINE)) },
@@ -1927,7 +1967,7 @@ fn plan_face(
         let mpolys: Vec<&[[f64; 2]]> = mranges.iter().filter_map(|r| muv.get(r.clone())).collect();
         let (seeds, whole) = mesh_seeds(s, bbox, h, &mpolys, fast, &pos, shape.size_at);
         let eval = |u: f64, v: f64| s.derivs(u, v).map(|(p, su, sv)| (p, su.cross(sv).normalized()));
-        let sag = cdt::Sag { eval: &eval, tol, h, turn: rules.turn, scale: fast };
+        let sag = cdt::Sag { eval: &eval, tol, h, turn: rules.turn, scale: fast, meter: rules.meter };
         let meshed = cdt::mesh(&muv, &mranges, &seeds, &sag, shape.size_at, MAX_MESH_REFINE).ok_or_else(|| fail("boundary crosses itself"))?;
         let mut limits: Vec<crate::ShapeLimit> = Vec::new();
         if !whole {
@@ -1975,6 +2015,7 @@ fn plan_face(
             budget: MAX_MESH_REFINE.saturating_sub(meshed.extra.len()),
             whole: whole_sides,
             project: &project,
+            meter: rules.meter,
         };
         // Shaped whole: the fans kept as they are, the rings split in the face where they must,
         // the face's own boundary sides on their edges.
@@ -2110,7 +2151,7 @@ fn plan_face(
     if !planar {
         // Which nodes are poles, asked once per node over both passes.
         let poles = sag::Poles::new(s, reach);
-        if sag::refine(s, tol, &poles, &fixed, &mut all, &mut triangles, MAX_REFINE) {
+        if sag::refine(s, tol, &poles, &fixed, &mut all, &mut triangles, MAX_REFINE, rules.meter) {
             caps.push(crate::Cap::Refine);
         }
         // The mesh path's triangles are the surface's Delaunay ones, shaped in 3D: flips toward
@@ -2146,7 +2187,7 @@ struct Region<'a> {
     uvs: &'a [[f64; 2]],
     fixed: &'a [Vec3],
     ranges: &'a [std::ops::Range<usize>],
-    rules: &'a size::Rules,
+    rules: &'a size::Rules<'a>,
     h: f64,
     speed: [f64; 2],
     us: &'a [f64],
@@ -2264,7 +2305,7 @@ fn plan_pieces(f: &Region) -> Option<(Vec<[f64; 2]>, Vec<[u32; 3]>)> {
                 let polys: Vec<&[[f64; 2]]> = ranges.iter().filter_map(|r| luv.get(r.clone())).collect();
                 let seeds = cdt::lattice(bbox, [f.h / f.speed[0], f.h / f.speed[1]], &polys, f.speed);
                 let eval = |u: f64, v: f64| s.derivs(u, v).map(|(p, su, sv)| (p, su.cross(sv).normalized()));
-                let sag = cdt::Sag { eval: &eval, tol: f.rules.tol, h: f.h, turn: f.rules.turn, scale: f.speed };
+                let sag = cdt::Sag { eval: &eval, tol: f.rules.tol, h: f.h, turn: f.rules.turn, scale: f.speed, meter: f.rules.meter };
                 cdt::triangulate(&luv, &ranges, cdt::Fill { seeds: &seeds, refine: Some((sag, MAX_REFINE)), shape: true, lenient: false, flat: None })
             })?;
         let (lextra, ltris) = local;

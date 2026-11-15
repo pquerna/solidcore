@@ -19,7 +19,7 @@ use super::{comp, rot3};
 /// than `tol` from the surface `s`, adding at most `max_points` points to `uv`. `poles`: which
 /// nodes are poles, asked once per node ([`Poles`]). True when it stopped at `max_points` with
 /// triangles still to look at.
-pub(crate) fn refine(s: &super::poles::Face, tol: f64, poles: &Poles, fixed: &[Vec3], uv: &mut Vec<[f64; 2]>, tris: &mut Vec<[u32; 3]>, max_points: usize) -> bool {
+pub(crate) fn refine(s: &super::poles::Face, tol: f64, poles: &Poles, fixed: &[Vec3], uv: &mut Vec<[f64; 2]>, tris: &mut Vec<[u32; 3]>, max_points: usize, meter: crate::control::Meter<'_>) -> bool {
     if !(tol.is_finite() && tol > 0.0) || tris.is_empty() {
         return false;
     }
@@ -47,7 +47,8 @@ pub(crate) fn refine(s: &super::poles::Face, tol: f64, poles: &Poles, fixed: &[V
     let limit = uv.len().saturating_add(max_points);
     let mut queue: Vec<u32> = (0..tris.len() as u32).rev().collect();
     while let Some(ti) = queue.pop() {
-        if uv.len() >= limit {
+        // Each triangle measured is a step of the caller's work; stopped, the plan is refused.
+        if uv.len() >= limit || !meter.charge(1) {
             return true;
         }
         let Some(&t) = tris.get(ti as usize) else { continue };
@@ -426,7 +427,7 @@ mod tests {
         let s = super::super::poles::Face::new(s, 0.0);
         let poles = Poles::new(&s, 1e-9);
         let start = uv.len();
-        refine(&s, 5e-2, &poles, &[], &mut uv, &mut tris, 300);
+        refine(&s, 5e-2, &poles, &[], &mut uv, &mut tris, 300, crate::control::Meter::NONE);
         flip(&s, 5e-2, &poles, &[], &uv, &mut tris);
         assert!(uv.len() > 2 * start, "{} nodes: not refined", uv.len());
         assert!(poles.asked.get() > 0);

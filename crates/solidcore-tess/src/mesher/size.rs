@@ -13,6 +13,7 @@ use crate::vec::VecExt as _;
 use solidcore::eval::plan::EvalSurface;
 
 use super::uv::Domain;
+use crate::control::Meter;
 
 /// Longest side, as a fraction of the body's extent.
 const MAX_LEN_FRACTION: f64 = 1.0 / 5.0;
@@ -59,19 +60,29 @@ impl Turn {
     }
 }
 
-/// The chord tolerance, the longest side and the facet angle of one body.
+/// The chord tolerance, the longest side and the facet angle of one body, and the caller's
+/// control of the work done to them.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Rules {
+pub(crate) struct Rules<'m> {
     pub tol: f64,
     pub max_len: f64,
     pub turn: Option<Turn>,
+    pub meter: Meter<'m>,
 }
 
-impl Rules {
-    /// Rules for a body of extent `extent` (see [`extent`]).
-    pub(crate) fn new(tol: f64, extent: f64, turn: Option<Turn>) -> Rules {
+#[cfg(test)]
+impl Rules<'static> {
+    /// Rules for a body of extent `extent` (see [`extent`]), with no control.
+    pub(crate) fn new(tol: f64, extent: f64, turn: Option<Turn>) -> Rules<'static> {
+        Rules::metered(tol, extent, turn, Meter::NONE)
+    }
+}
+
+impl<'m> Rules<'m> {
+    /// [`Rules::new`] under the caller's control `meter`.
+    pub(crate) fn metered(tol: f64, extent: f64, turn: Option<Turn>, meter: Meter<'m>) -> Rules<'m> {
         let max_len = if extent.is_finite() && extent > 0.0 { extent * MAX_LEN_FRACTION } else { f64::INFINITY };
-        Rules { tol, max_len: max_len.max(tol), turn }
+        Rules { tol, max_len: max_len.max(tol), turn, meter }
     }
 
     /// The side length for a curvature `k` (1/mm): the chord sags at most the tolerance across

@@ -507,6 +507,43 @@ pub fn interpolated(points: &[[f64; 3]], params: &[f64], degree: usize) -> Resul
     spline_record(&c)
 }
 
+/// A B-spline's knots and points without its dead control points: a knot repeated `m` times,
+/// past `degree + 1`, puts `m - degree - 1` basis functions on spans of no length, which are zero
+/// everywhere, so those points and as many copies of the knot go and every other basis function
+/// (and so the curve, on its whole domain) is the same. The kernel keeps such a knot (a trim made
+/// from its edge's form, a leading span of no length); a record allows `degree + 1` copies at most.
+/// Only indices move: no knot or point is computed.
+fn without_dead_points<P>(knots: Vec<f64>, points: Vec<P>) -> (Vec<f64>, Vec<P>) {
+    let Some(degree) = knots.len().checked_sub(points.len() + 1) else {
+        return (knots, points);
+    };
+    // In each run of `m` equal knots, the first `m - degree - 1`: the functions starting on
+    // them span no length.
+    let dead: Vec<bool> = knots
+        .chunk_by(|a, b| a == b)
+        .flat_map(|run| {
+            let gone = run.len().saturating_sub(degree + 1);
+            (0..run.len()).map(move |i| i < gone)
+        })
+        .collect();
+    if !dead.contains(&true) {
+        return (knots, points);
+    }
+    let knots = knots
+        .into_iter()
+        .zip(&dead)
+        .filter(|(_, &d)| !d)
+        .map(|(t, _)| t)
+        .collect();
+    let points = points
+        .into_iter()
+        .zip(&dead)
+        .filter(|(_, &d)| !d)
+        .map(|(p, _)| p)
+        .collect();
+    (knots, points)
+}
+
 /// A B-spline curve's NURBS as the record's spline (every weight 1) or rational spline
 /// (homogeneous points copied as NLib holds them).
 fn spline_record(c: &BSplineCurve) -> Result<Record> {
@@ -516,22 +553,21 @@ fn spline_record(c: &BSplineCurve) -> Result<Record> {
     let knots = nurb.knots().to_vec();
     let polynomial = nurb.cpts().iter().all(|p| p.w == NOW || p.w == 1.0);
     Ok(if polynomial {
-        Record::Spline {
-            knots,
-            points: nurb.cpts().iter().map(|p| [p.x, p.y, p.z]).collect(),
-        }
+        let (knots, points) =
+            without_dead_points(knots, nurb.cpts().iter().map(|p| [p.x, p.y, p.z]).collect());
+        Record::Spline { knots, points }
     } else {
-        Record::RationalSpline {
+        let (knots, homogeneous) = without_dead_points(
             knots,
-            homogeneous: nurb
-                .cpts()
+            nurb.cpts()
                 .iter()
                 .map(|p| {
                     let w = if p.w == NOW { 1.0 } else { p.w };
                     [p.x, p.y, p.z, w]
                 })
                 .collect(),
-        }
+        );
+        Record::RationalSpline { knots, homogeneous }
     })
 }
 
@@ -585,36 +621,34 @@ pub fn record_trim(
     let same = su == 1.0 && sv == 1.0;
     let polynomial = nurb.cpts().iter().all(|p| p.w == NOW || p.w == 1.0);
     Ok(if polynomial {
-        Record2::Spline {
-            knots,
-            points: nurb
-                .cpts()
-                .iter()
-                .map(|p| {
-                    if same {
-                        [p.x, p.y]
-                    } else {
-                        [su * p.x, sv * p.y]
-                    }
-                })
-                .collect(),
-        }
+        let points = nurb
+            .cpts()
+            .iter()
+            .map(|p| {
+                if same {
+                    [p.x, p.y]
+                } else {
+                    [su * p.x, sv * p.y]
+                }
+            })
+            .collect();
+        let (knots, points) = without_dead_points(knots, points);
+        Record2::Spline { knots, points }
     } else {
-        Record2::RationalSpline {
-            knots,
-            homogeneous: nurb
-                .cpts()
-                .iter()
-                .map(|p| {
-                    let w = if p.w == NOW { 1.0 } else { p.w };
-                    if same {
-                        [p.x, p.y, w]
-                    } else {
-                        [su * p.x, sv * p.y, w]
-                    }
-                })
-                .collect(),
-        }
+        let homogeneous = nurb
+            .cpts()
+            .iter()
+            .map(|p| {
+                let w = if p.w == NOW { 1.0 } else { p.w };
+                if same {
+                    [p.x, p.y, w]
+                } else {
+                    [su * p.x, sv * p.y, w]
+                }
+            })
+            .collect();
+        let (knots, homogeneous) = without_dead_points(knots, homogeneous);
+        Record2::RationalSpline { knots, homogeneous }
     })
 }
 

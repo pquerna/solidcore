@@ -610,3 +610,47 @@ fn an_interpolated_spline_goes_through_its_points() {
     assert!(interpolated(&points, &[0.0, 0.5, 0.2, 0.7, 1.0], 3).is_err());
     assert!(interpolated(&points, &params[..4], 3).is_err());
 }
+
+/// A knot the kernel repeats past its degree plus one (a trim's leading span of no length)
+/// goes to the record with the dead points left out: the same curve, a record that validates.
+#[test]
+fn a_trims_dead_points_are_left_out_of_its_record() {
+    assert_eq!(
+        without_dead_points(
+            vec![4.0, 4.0, 4.0, 4.0, 5.0, 5.0],
+            vec![[9.0, 9.0], [8.0, 8.0], [0.0, 0.0], [2.0, 4.0]],
+        ),
+        (vec![4.0, 4.0, 5.0, 5.0], vec![[0.0, 0.0], [2.0, 4.0]]),
+    );
+    // Interior and trailing runs alike; a run of degree + 1 stays.
+    assert_eq!(
+        without_dead_points(
+            vec![0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0],
+            vec!["a", "b", "c", "d", "e", "f"],
+        ),
+        (vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0], vec!["a", "b", "d", "e"]),
+    );
+    let same = (vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![1, 2, 3]);
+    assert_eq!(without_dead_points(same.0.clone(), same.1.clone()), same);
+
+    let k = k();
+    // As the kernel makes them: the dead points on the curve's start.
+    let dead = Record2::Spline {
+        knots: vec![4.0, 4.0, 4.0, 4.0, 5.0, 5.0],
+        points: vec![[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [2.0, 4.0]],
+    };
+    let kernel = Extent1d::from_raw(4.0, 5.0);
+    let t = uv_trim(&dead, &kernel, [1.0, 1.0]).unwrap();
+    let made = record_trim(&k, &t, &kernel, [4.0, 5.0], [1.0, 1.0]).unwrap();
+    assert_eq!(
+        made,
+        Record2::Spline {
+            knots: vec![4.0, 4.0, 5.0, 5.0],
+            points: vec![[0.0, 0.0], [2.0, 4.0]],
+        }
+    );
+    let back = uv_trim(&made, &kernel, [1.0, 1.0]).unwrap();
+    for t_ in [4.0, 4.25, 4.5, 5.0] {
+        assert_eq!(at(&k, &t, t_), at(&k, &back, t_));
+    }
+}

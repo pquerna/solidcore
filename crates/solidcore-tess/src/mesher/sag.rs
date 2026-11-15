@@ -34,6 +34,14 @@ pub(crate) fn refine(s: &super::poles::Face, tol: f64, poles: &Poles, fixed: &[V
         None => at(q).dist(c),
     };
     let mut pos: Vec<Vec3> = uv.iter().enumerate().map(|(i, q)| fixed.get(i).copied().unwrap_or_else(|| at(*q))).collect();
+    // How far each node already lies off the surface: a boundary node is its edge's point, which
+    // may stand off the face's surface by the record's own edge-to-face gap; a node put in is the
+    // surface's point. A flat triangle carries its corners' gaps, and no split inside the face
+    // removes them, so a triangle is refined only for the surface's departure beyond them (else a
+    // triangle on boundary nodes farther off than the tolerance is split without end, its apex
+    // driven onto the boundary chord, into slivers that fold).
+    let gap: Vec<f64> = uv.iter().zip(&pos).take(fixed.len()).map(|(q, p)| off(*q, *p)).collect();
+    let gap_of = |gap: &[f64], i: u32| gap.get(i as usize).copied().unwrap_or(0.0);
     // No side is split below this length: a surface whose parameters bend sharply (at a pole) is
     // not chased to the last bit.
     let shortest = tol * 1e-3;
@@ -69,7 +77,7 @@ pub(crate) fn refine(s: &super::poles::Face, tol: f64, poles: &Poles, fixed: &[V
                 continue;
             }
             let sag = *sag_of.entry(e).or_insert_with(|| off(mean(&[ua, ub]), (xa + xb) * 0.5));
-            inner.push((sag, len, e));
+            inner.push(((sag - 0.5 * (gap_of(&gap, a) + gap_of(&gap, b))).max(0.0), len, e));
         }
         // The surface's departure from a flat triangle is about quadratic over it: at the
         // centroid it is 4/9 of the sum of the sags at the sides' middles, which splitting a side
@@ -77,10 +85,11 @@ pub(crate) fn refine(s: &super::poles::Face, tol: f64, poles: &Poles, fixed: &[V
         // the face that sags most, while that side still contributes; what is left comes from
         // its boundary sides, which the edges' own sampling keeps within the tolerance.
         let centroid = mean(&[qa, qb, qc]);
+        let carried = (gap_of(&gap, t[0]) + gap_of(&gap, t[1]) + gap_of(&gap, t[2])) / 3.0;
         let worst = inner.iter().max_by(|x, y| x.0.total_cmp(&y.0)).copied();
         let split = match worst {
             Some((sag, _, e)) if sag > tol => e,
-            Some((sag, _, e)) if sag > 0.25 * tol && off(centroid, (pa + pb + pc) * (1.0 / 3.0)) > tol => e,
+            Some((sag, _, e)) if sag > 0.25 * tol && off(centroid, (pa + pb + pc) * (1.0 / 3.0)) - carried > tol => e,
             _ => continue,
         };
         // Splitting a triangle's shorter side leaves a child with its long side and a wider
@@ -393,6 +402,35 @@ pub(crate) fn flip(s: &super::poles::Face, tol: f64, poles: &Poles, fixed: &[Vec
 mod tests {
     use super::*;
     use solidcore::eval::plan::EvalSurface;
+
+    /// A face whose boundary nodes (its edges' points) stand off its surface by more than the
+    /// tolerance, as a record's edge-to-face gap may: refinement chases only the surface's own
+    /// departure from the triangles, which is none on a plane, and stops; it never drives an
+    /// apex onto a boundary chord until its point bound.
+    #[test]
+    fn a_boundary_gap_over_the_tolerance_is_no_reason_to_refine() {
+        let s = EvalSurface::Plane { origin: Vec3::ZERO, du: Vec3::X, dv: Vec3::Y };
+        let tol = 5e-3;
+        let lift = Vec3::new(0.0, 0.0, 2.5 * tol);
+        // A strip of tall triangles on a row of boundary nodes (lifted off the plane) and a far
+        // row of inner nodes, as a structured layout leaves them.
+        let n = 8u32;
+        let mut uv: Vec<[f64; 2]> = (0..=n).map(|i| [f64::from(i) * 0.06, 0.0]).collect();
+        let fixed: Vec<Vec3> = uv.iter().map(|q| Vec3::new(q[0], q[1], 0.0) + lift).collect();
+        uv.extend((0..=n).map(|i| [f64::from(i) * 0.06, 5.5]));
+        let mut tris: Vec<[u32; 3]> = Vec::new();
+        for i in 0..n {
+            let (a, b, c, d) = (i, i + 1, n + 1 + i, n + 2 + i);
+            tris.push([a, b, d]);
+            tris.push([a, d, c]);
+        }
+        let face = super::super::poles::Face::new(s, 0.0);
+        let poles = Poles::new(&face, 1e-9);
+        let start = uv.len();
+        let capped = refine(&face, tol, &poles, &fixed, &mut uv, &mut tris, 20_000);
+        assert!(!capped, "refined to its point bound: {} nodes", uv.len());
+        assert!(uv.len() < start + 64, "{} nodes put in for a plane", uv.len() - start);
+    }
 
     /// Refining and flipping a coarse patch of a cylinder (every sag over the tolerance, so the
     /// nodes are looked at by many triangles, sides and rounds) asks the pole question once per

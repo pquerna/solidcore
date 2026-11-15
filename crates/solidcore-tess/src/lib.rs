@@ -9,6 +9,7 @@
 //! in a compute shader.
 //!
 //! - [`plan`]: the face planner and its display entry point, at a [`MeshTolerance`];
+//!   [`plan_with`] the same under a caller's [`Control`] of its work and memory;
 //! - [`mesh()`]: the mesh path, not for display: every face by constrained Delaunay with lattice
 //!   seeds and Ruppert shaping to a [`MeshSpec`], for mesh bodies, mesh export and analysis
 //!   meshers, slow by design; [`TessPlan::welded`] joins its faces at their shared vertices;
@@ -23,6 +24,7 @@
 //! Library code never panics, unwraps or indexes on input-derived data: a face the planner
 //! cannot mesh is named in its [`PlanStats`], and the rest of the body is meshed.
 
+mod control;
 mod curve;
 #[cfg(test)]
 mod fixtures;
@@ -44,10 +46,11 @@ mod stats;
 mod tolerance;
 mod vec;
 
+pub use control::{Control, Stop, Unlimited};
 pub use curve::curve_points;
 pub use iso::{MAX_ISOPARMS, isoparms};
 pub use mesh::Mesh;
-pub use mesher::{MAX_ANGLE_BOUNDARY, plan};
+pub use mesher::{MAX_ANGLE_BOUNDARY, plan, plan_with};
 pub use par::guarded;
 pub use plan::{FacePlan, TessPlan};
 pub use pole::{AveragedPole, PoleNode, PoleRule};
@@ -76,6 +79,9 @@ pub enum TessError {
     /// A panic inside the mesher, caught there.
     #[error("kernel internal error: {0}")]
     Internal(String),
+    /// The caller's [`Control`] stopped the plan: it is refused whole.
+    #[error("stopped by the caller: {0:?}")]
+    Stopped(Stop),
 }
 
 /// The mesher's result.

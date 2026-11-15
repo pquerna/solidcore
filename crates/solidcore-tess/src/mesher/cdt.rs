@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use solidcore::Vec3;
 
 use super::size::{SizeAt, Turn};
+use crate::control::Meter;
 use spade::handles::FixedVertexHandle;
 use spade::{AngleLimit, ConstrainedDelaunayTriangulation, Point2, PositionInTriangulation, RefinementParameters, Triangulation};
 
@@ -47,6 +48,8 @@ pub(crate) struct Sag<'a> {
     pub turn: Option<Turn>,
     /// Scale of u and v in the triangulation (the surface's mean |S_u|, |S_v|).
     pub scale: [f64; 2],
+    /// The caller's control: each triangle measured and each point added is a step of work.
+    pub meter: Meter<'a>,
 }
 
 /// How to fill the inside of the loops.
@@ -615,6 +618,9 @@ fn refine_sag(
             if !region.get(face.index()).copied().unwrap_or(false) {
                 continue;
             }
+            if !sag.meter.charge(1) {
+                return (added, false);
+            }
             let vs = face.vertices();
             let ps = vs.map(|v| v.position());
             let c = Point2::new((ps[0].x + ps[1].x + ps[2].x) / 3.0, (ps[0].y + ps[1].y + ps[2].y) / 3.0);
@@ -664,7 +670,7 @@ fn refine_sag(
         todo.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
         todo.dedup();
         for p in todo {
-            if added >= budget {
+            if added >= budget || !sag.meter.charge(1) {
                 return (added, false);
             }
             // The boundary's nodes are its edges', shared with the neighbouring face: a point that
@@ -883,7 +889,7 @@ mod tests {
         let loops = [0..4, 4..8];
         let flat = |u: f64, v: f64| Some((Vec3::new(u, v, 0.0), Some(Vec3::Z)));
         for refine in [false, true] {
-            let refine = refine.then_some((Sag { eval: &flat, tol: 1e-3, h: 0.1, turn: None, scale: [2.0, 1.0] }, 2000));
+            let refine = refine.then_some((Sag { eval: &flat, tol: 1e-3, h: 0.1, turn: None, scale: [2.0, 1.0], meter: Meter::NONE }, 2000));
             let label = refine.is_some();
             let Some((extra, tris)) = triangulate(&b, &loops, Fill { seeds: &[[0.2, 0.2], [0.5, 0.5]], refine, shape: true, lenient: false, flat: None }) else {
                 panic!("meshes")

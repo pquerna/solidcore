@@ -65,6 +65,8 @@ pub(crate) struct Rules<'a> {
     /// `None`: a boundary side a point would encroach on is returned to be split. Otherwise the
     /// sides are kept whole, and this is why, where it leaves a triangle short.
     pub whole: Option<ShapeLimit>,
+    /// The caller's control: each triangle looked at is a step of work.
+    pub meter: crate::control::Meter<'a>,
     /// The parameters of a 3D point on or near the surface (within the distance given), from
     /// the parameters given, unwrapped to them: the face's surface's closest point.
     pub project: &'a dyn Fn(Vec3, [f64; 2], f64) -> Option<[f64; 2]>,
@@ -387,6 +389,9 @@ pub(crate) fn shape(
     };
     let mut queue: VecDeque<u32> = (0..m.tris.len()).filter_map(|t| u32::try_from(t).ok()).collect();
     while let Some(ti) = queue.pop_front() {
+        if !rules.meter.charge(1) {
+            break;
+        }
         let Some(&t) = m.tris.get(ti as usize) else { continue };
         if m.stuck.get(ti as usize).copied().unwrap_or(true) || m.is_frozen(ti) || m.collapsed(t) || dead.contains(&sorted(t)) {
             continue;

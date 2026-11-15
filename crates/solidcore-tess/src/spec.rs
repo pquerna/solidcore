@@ -113,7 +113,13 @@ pub fn mesh(
             .as_ref()
             .map(|f| f as &(dyn Fn(solidcore::Vec3) -> f64 + Sync)),
     };
-    let (plan, stats) = plan_at(b, tol, None, Purpose::Mesh(shape))?;
+    let (plan, stats) = plan_at(
+        b,
+        tol,
+        None,
+        Purpose::Mesh(shape),
+        crate::control::Meter::NONE,
+    )?;
     if let Some(left_out) = stats.unmeshed.first() {
         return Err(TessError::Failed(format!(
             "mesh: face {}: {}",

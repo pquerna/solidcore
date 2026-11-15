@@ -82,7 +82,7 @@ fn a_slit_in_a_trimmed_face_has_the_face_on_both_sides() {
 /// A doubly curved patch 40 mm across, and a loop on it in (u, v) whose right side folds back
 /// past itself near the top: the last chord of the fold crosses the side, as a cusp or a sliver
 /// whose sides sag across each other leaves a face's boundary.
-fn a_face_crossing_itself() -> (EvalSurface, seam::Loop, size::Rules) {
+fn a_face_crossing_itself() -> (EvalSurface, seam::Loop, size::Rules<'static>) {
     let mut ctrl = Vec::new();
     for j in 0..3 {
         for i in 0..3 {
@@ -209,7 +209,7 @@ fn sag_refinement_across_an_inflection_ends_without_slivers() {
     let tol = 0.5;
     let start = uv.len();
     let face = poles::Face::new(s.clone(), 0.0);
-    sag::refine(&face, tol, &sag::Poles::new(&face, 1e-9), &fixed, &mut uv, &mut tris, 20_000);
+    sag::refine(&face, tol, &sag::Poles::new(&face, 1e-9), &fixed, &mut uv, &mut tris, 20_000, Meter::NONE);
     assert!(uv.len() - start < 1_000, "{} points added: refinement ran to its budget", uv.len() - start);
     for t in &tris {
         let [p, q, r] = t.map(|i| uv[i as usize]);

@@ -81,6 +81,10 @@ pub(crate) fn sample_edge_sized(b: &brep::Brep, ei: usize, rules: &Rules, h: f64
             let local = |pa: Vec3, pb: Vec3| super::size::local(h, Some(f), (pa + pb) * 0.5);
             return bisect_at(&on_line, [t0, t1], [front, back], initial, rules, &local);
         }
+        // A line's nodes are counted and admitted together, before they are made.
+        if !(rules.meter.charge(n as u64 + 1) && rules.meter.admit((n + 1) * (size_of::<Vec3>() + size_of::<f64>()))) {
+            return Err(TessError::Stopped(rules.meter.stop().unwrap_or(crate::Stop::Cancelled)));
+        }
         let mut pts: Vec<Vec3> = (0..=n).map(|i| front + (back - front) * (i as f64 / n as f64)).collect();
         let mut params: Vec<f64> = (0..=n).map(|i| t0 + (t1 - t0) * (i as f64 / n as f64)).collect();
         if let (Some(p), Some(t)) = (pts.last_mut(), params.last_mut()) {
@@ -145,7 +149,12 @@ pub(crate) fn bisect_at(
         stack.push(Seg { a: t_at(i), b: t_at(i + 1), pa, pb, mid: None, depth: 0 });
     }
     let (mut worst_sag, mut capped): (f64, Option<(crate::EdgeCap, f64, f64)>) = (0.0, None);
+    // Each segment tried is a step of work; each node kept, its point and parameter, is admitted.
+    let kept = size_of::<Vec3>() + size_of::<f64>();
     while let Some(sg) = stack.pop() {
+        if !rules.meter.charge(1) {
+            return Err(TessError::Stopped(rules.meter.stop().unwrap_or(crate::Stop::Cancelled)));
+        }
         let (a, b, pa, pb) = (sg.a, sg.b, sg.pa, sg.pb);
         let m = 0.5 * (a + b);
         let pm = match sg.mid {
@@ -182,6 +191,9 @@ pub(crate) fn bisect_at(
                     Some((c, _, x)) => (if c == cap { c } else { crate::EdgeCap::Nodes }, 0.0, x.max(over)),
                     None => (cap, 0.0, over),
                 });
+            }
+            if !rules.meter.admit(kept) {
+                return Err(TessError::Stopped(rules.meter.stop().unwrap_or(crate::Stop::Cancelled)));
             }
             out.push((b, pb));
         }
@@ -357,7 +369,7 @@ mod tests {
         let cyl = crate::fixtures::fixture("cylinder_r10_h5");
         for tol in [0.1, 0.01, 0.001] {
             for (ei, e) in cyl.edges.iter().enumerate() {
-                let pts = sample(&cyl, ei, &Rules { tol, max_len: f64::INFINITY, turn: None }, f64::INFINITY).points;
+                let pts = sample(&cyl, ei, &Rules { tol, max_len: f64::INFINITY, turn: None, meter: crate::control::Meter::NONE }, f64::INFINITY).points;
                 assert!(pts.len() >= 2);
                 let [front, back] = ends(&cyl, ei);
                 assert_eq!(pts.first().copied(), Some(front));
@@ -380,7 +392,7 @@ mod tests {
     fn edges_are_split_to_the_side_length_and_turn() {
         let cyl = crate::fixtures::fixture("cylinder_r10_h5");
         for (ei, e) in cyl.edges.iter().enumerate() {
-            let pts = sample(&cyl, ei, &Rules { tol: 1.0, max_len: f64::INFINITY, turn: None }, 1.2).points;
+            let pts = sample(&cyl, ei, &Rules { tol: 1.0, max_len: f64::INFINITY, turn: None, meter: crate::control::Meter::NONE }, 1.2).points;
             for w in pts.windows(2) {
                 assert!(w[0].dist(w[1]) <= 1.2 + 1e-9, "side {}", w[0].dist(w[1]));
             }
@@ -396,7 +408,7 @@ mod tests {
         // A coarse tolerance alone would leave a few long chords; a 30° facet angle keeps every
         // side within 30° of arc: at least 12 around each of the two circles.
         let thirty =
-            Rules { tol: 5.0, max_len: f64::INFINITY, turn: Some(crate::mesher::size::Turn { angle: std::f64::consts::PI / 6.0, floor: 0.0 }) };
+            Rules { tol: 5.0, max_len: f64::INFINITY, turn: Some(crate::mesher::size::Turn { angle: std::f64::consts::PI / 6.0, floor: 0.0 }), meter: crate::control::Meter::NONE };
         let sides: usize = (0..cyl.edges.len())
             .filter(|&ei| !matches!(cyl.edges[ei].curve, Curve::Line { .. }))
             .map(|ei| sample(&cyl, ei, &thirty, f64::INFINITY).points.len() - 1)
@@ -410,7 +422,7 @@ mod tests {
     fn edge_nodes_carry_their_parameters_on_both_faces() {
         // A pin with a cross hole cut through it.
         let body = crate::fixtures::fixture("cylinder_with_cross_hole");
-        let rules = Rules { tol: 0.01, max_len: f64::INFINITY, turn: None };
+        let rules = Rules { tol: 0.01, max_len: f64::INFINITY, turn: None, meter: crate::control::Meter::NONE };
         let curved = |f: u32| !matches!(body.faces[f as usize].surface, brep::Surface::Plane { .. } | brep::Surface::PlaneThrough { .. });
         let (mut edges, mut checked) = (0, 0);
         for (ei, e) in body.edges.iter().enumerate() {

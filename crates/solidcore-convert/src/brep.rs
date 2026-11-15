@@ -185,6 +185,37 @@ fn at<T>(v: &[T], i: u32) -> R<&T> {
         .ok_or(Unsupported::Invalid("index past its list"))
 }
 
+/// A conic edge's NURBS form cut to `[lo, hi]` (knot insertion), where that is inside the form's
+/// domain and shorter than it; `None` otherwise.
+fn form_piece(form: &r::Curve, lo: f64, hi: f64) -> Option<r::Curve> {
+    let (knots, rows, rational): (&[f64], Vec<[f64; 4]>, bool) = match form {
+        r::Curve::Spline { knots, points } => (
+            knots,
+            points.iter().map(|p| [p[0], p[1], p[2], 1.0]).collect(),
+            false,
+        ),
+        r::Curve::RationalSpline { knots, homogeneous } => (knots, homogeneous.clone(), true),
+        _ => return None,
+    };
+    let degree = knots.len().checked_sub(rows.len() + 1)?;
+    let (a, b) = (*knots.get(degree)?, *knots.get(rows.len())?);
+    if !(a <= lo && lo < hi && hi <= b && (a < lo || hi < b)) {
+        return None;
+    }
+    let (knots, ctrl) = solidcore::eval::pcurve::segment(degree, knots, &rows, lo, hi).ok()?;
+    Some(if rational {
+        r::Curve::RationalSpline {
+            knots,
+            homogeneous: ctrl,
+        }
+    } else {
+        r::Curve::Spline {
+            knots,
+            points: ctrl.iter().map(|h| [h[0], h[1], h[2]]).collect(),
+        }
+    })
+}
+
 /// The record's topology fields left undefined, as the kernel's data reader expects them.
 fn undefined(t: &mut TopologyData) {
     t.flags = 0;
@@ -414,10 +445,19 @@ fn data(k: &Kernel, rec: &r::Brep, bare: &[(u32, u32, u32)]) -> R<BrepData> {
         let (curve, interval): (KernelCurve, Extent1d) = match (&e.curve, &e.nurbs) {
             (r::Curve::Circle { .. } | r::Curve::Ellipse { .. }, Some(n)) => {
                 let [lo, hi] = e.interval;
-                (
-                    curves::conic_on_form(k, &crate::curve(&e.curve)?, &crate::curve(n)?)?,
-                    Extent1d::from_raw(lo, hi),
-                )
+                let conic = crate::curve(&e.curve)?;
+                let made = match curves::conic_on_form(k, &conic, &crate::curve(n)?) {
+                    // A closed conic whose vertex is off its face's quarter grid has a form of a
+                    // turn and a quarter; the edge runs one turn of it. Its piece on the edge's
+                    // interval is the conic once round.
+                    Err(whole) => match form_piece(n, lo, hi) {
+                        Some(piece) => curves::conic_on_form(k, &conic, &crate::curve(&piece)?)
+                            .map_err(|_| whole)?,
+                        None => return Err(whole.into()),
+                    },
+                    Ok(c) => c,
+                };
+                (made, Extent1d::from_raw(lo, hi))
             }
             (_, Some(n)) => {
                 let c = curves::from_parameters(k, &crate::curve(n)?, e.interval)?;
@@ -739,3 +779,54 @@ pub fn recognised(
 
 mod record;
 pub use record::to_record;
+
+#[cfg(test)]
+mod conic_piece_tests {
+    use super::*;
+
+    /// A circle of radius 5 about the origin at height 8 as a form of five quarters (a turn and a
+    /// quarter from the x axis): the standard quarter arcs, middle weights cos π/4.
+    fn five_quarters() -> r::Curve {
+        let (rad, z, c) = (5.0, 8.0, std::f64::consts::FRAC_1_SQRT_2);
+        let dirs = [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]];
+        let mut homogeneous = Vec::new();
+        for q in 0..5 {
+            let (a, b) = (dirs[q % 4], dirs[(q + 1) % 4]);
+            if q == 0 {
+                homogeneous.push([rad * a[0], rad * a[1], z, 1.0]);
+            }
+            let corner = [rad * (a[0] + b[0]), rad * (a[1] + b[1])];
+            homogeneous.push([c * corner[0], c * corner[1], c * z, c]);
+            homogeneous.push([rad * b[0], rad * b[1], z, 1.0]);
+        }
+        let mut knots = vec![0.0; 3];
+        for q in 1..5 {
+            knots.extend([f64::from(q); 2]);
+        }
+        knots.extend([5.0; 3]);
+        r::Curve::RationalSpline { knots, homogeneous }
+    }
+
+    /// A closed circle edge off its face's quarter grid: its form runs a turn and a quarter, the
+    /// edge one turn of it. The whole form is no conic once round; its piece on the edge is.
+    #[test]
+    fn a_closed_conics_form_past_a_turn_is_cut_to_its_edge() {
+        let k = Kernel::default();
+        let circle = r::Curve::Circle {
+            frame: r::Frame {
+                origin: [0.0, 0.0, 8.0],
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 1.0, 0.0],
+            },
+            radius: 5.0,
+        };
+        let conic = crate::curve(&circle).unwrap();
+        let form = five_quarters();
+        assert!(curves::conic_on_form(&k, &conic, &crate::curve(&form).unwrap()).is_err());
+        let piece = form_piece(&form, 0.3, 4.3).expect("a piece inside the form");
+        assert!(curves::conic_on_form(&k, &conic, &crate::curve(&piece).unwrap()).is_ok());
+        // Not a piece: the whole form, or past its ends.
+        assert!(form_piece(&form, 0.0, 5.0).is_none());
+        assert!(form_piece(&form, -0.1, 3.9).is_none());
+    }
+}

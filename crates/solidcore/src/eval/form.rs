@@ -229,15 +229,31 @@ fn face_arcs(
     Some((arcs(grid.0, grid.1), d))
 }
 
+/// The unit circle's point on quarter line `q`: exact on a whole quarter (`(1, 0)`, `(0, 1)`,
+/// `(-1, 0)`, `(0, -1)` by `q` mod 4), so a form on the quarter grid closes and its quarter
+/// points agree exactly whichever turn it starts in; `(cos, sin)` of the angle otherwise.
+fn quarter_point(q: f64) -> [f64; 2] {
+    if q == q.round() && q.is_finite() {
+        match q.rem_euclid(4.0) as u8 {
+            0 => [1.0, 0.0],
+            1 => [0.0, 1.0],
+            2 => [-1.0, 0.0],
+            _ => [0.0, -1.0],
+        }
+    } else {
+        let a = q * FRAC_PI_2;
+        [a.cos(), a.sin()]
+    }
+}
+
 /// Quarter arcs from quarter `q0`, `n` of them: their knot vector (in form parameter) and their
 /// control points (as `(cos, sin)` factors on the unit circle's plane) with weights.
 fn arcs(q0: f64, n: usize) -> (Vec<f64>, Vec<([f64; 2], f64)>) {
-    let at = |a: f64| [a.cos(), a.sin()];
     let mut pts = Vec::new();
     let mut knots = vec![q0; 3];
     for k in 0..n {
         let q = q0 + k as f64;
-        let (p, r) = (at(q * FRAC_PI_2), at((q + 1.0) * FRAC_PI_2));
+        let (p, r) = (quarter_point(q), quarter_point(q + 1.0));
         if k == 0 {
             pts.push((p, 1.0));
         }
@@ -1254,5 +1270,32 @@ fn ixm<T>(a: &mut [T; 2], d: usize) -> &mut T {
         x
     } else {
         y
+    }
+}
+
+#[cfg(test)]
+mod quarter_tests {
+    use super::*;
+
+    /// A turn of quarter arcs closes exactly whichever quarter it starts on (a seam a turn round,
+    /// a form on quarters 4 to 8), and its quarter-line points are exact.
+    #[test]
+    fn quarter_arcs_close_exactly_on_any_turn() {
+        for q0 in [-4.0, -1.0, 0.0, 3.0, 4.0, 9.0] {
+            let (knots, pts) = arcs(q0, 4);
+            assert_eq!(knots.first(), Some(&q0));
+            assert_eq!(knots.last(), Some(&(q0 + 4.0)));
+            assert_eq!(pts.first().map(|p| p.0), pts.last().map(|p| p.0), "q0 {q0}");
+            for (i, (p, w)) in pts.iter().enumerate() {
+                if i % 2 == 0 {
+                    assert_eq!(*w, 1.0);
+                    assert!(p.iter().all(|c| [-1.0, 0.0, 1.0].contains(c)), "{p:?}");
+                    assert_eq!(p[0].abs() + p[1].abs(), 1.0);
+                }
+            }
+        }
+        // Off the grid, the angle's own point.
+        let p = quarter_point(0.5);
+        assert!((p[0] - FRAC_1_SQRT_2).abs() < 1e-15 && (p[1] - FRAC_1_SQRT_2).abs() < 1e-15);
     }
 }

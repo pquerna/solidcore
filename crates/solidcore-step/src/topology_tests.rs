@@ -2373,3 +2373,55 @@ fn a_round_face_past_its_frames_first_quarter_keeps_its_kernel_support() {
     let made = body.face(order.faces[0]).unwrap().surface.as_ref().unwrap();
     assert!(matches!(made.kind(), solidcore::surface::surface::p2::SurfaceKind::Cone(_)), "{}", made.type_string());
 }
+
+/// A cylinder band (radius 3, from height 0.3 to 4.7 along a tilted axis) between its two end
+/// circles and a seam: the heights the boundary projects to round differently from the circles'
+/// own pcurves. The face's domain along the axis ends exactly on its boundary's lines, its
+/// pcurves' heights.
+#[test]
+fn a_cylinder_faces_domain_ends_on_its_boundarys_own_heights() {
+    let r = 3.0;
+    let z = {
+        let l = (0.36_f64 + 0.64 + 0.0001).sqrt();
+        [0.01 / l, 0.6 / l, 0.8 / l]
+    };
+    let x = {
+        let t = [1.0, 0.0, 0.0];
+        let d = t[0] * z[0];
+        let v = [t[0] - d * z[0], -d * z[1], -d * z[2]];
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        v.map(|c| c / l)
+    };
+    let o = [1.1, -2.3, 0.7];
+    let at = |h: f64| [o[0] + h * z[0] + r * x[0], o[1] + h * z[1] + r * x[1], o[2] + h * z[2] + r * x[2]];
+    let centre = |h: f64| [o[0] + h * z[0], o[1] + h * z[1], o[2] + h * z[2]];
+    let (h0, h1) = (0.3, 4.7);
+    let mut w = W::default();
+    let (v0, v1) = (w.vertex(at(h0)), w.vertex(at(h1)));
+    let ring = |w: &mut W, v: u64, h: f64| {
+        let c = w.circle(centre(h), z, x, r);
+        w.add(format!("EDGE_CURVE('',#{v},#{v},#{c},.T.)"))
+    };
+    let (bottom, top) = (ring(&mut w, v0, h0), ring(&mut w, v1, h1));
+    let seam = w.line_edge((v0, at(h0)), (v1, at(h1)), true, 1.0);
+    let oes: Vec<u64> = [(bottom, true), (seam, true), (top, false), (seam, false)].iter().map(|&(e, d)| w.oe(e, d)).collect();
+    let bound = w.bound(&oes, true, true);
+    let axis = w.axis(o, z, x);
+    let cylinder = w.add(format!("CYLINDRICAL_SURFACE('',#{axis},{})", real(r)));
+    let face = w.face(&[bound], cylinder, true);
+    let shell = w.add(format!("OPEN_SHELL('',(#{face}))"));
+    let model = w.add(format!("SHELL_BASED_SURFACE_MODEL('',(#{shell}))"));
+    let s = one_solid(&w.file(&[model]));
+    let f = &s.brep.faces[0];
+    let Loop::Edges { edges } = &f.loops[0] else { panic!("an edge loop") };
+    let heights: Vec<f64> = edges
+        .iter()
+        .flat_map(|u| match &u.pcurve {
+            Curve2::Spline { points, .. } => points.iter().map(|p| p[1]).collect::<Vec<_>>(),
+            Curve2::RationalSpline { homogeneous, .. } => homogeneous.iter().map(|h| h[1] / h[2]).collect(),
+        })
+        .collect();
+    let lo = heights.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = heights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    assert_eq!(f.domain[1], [lo, hi], "domain {:?}", f.domain);
+}

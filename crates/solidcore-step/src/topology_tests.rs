@@ -2360,3 +2360,45 @@ fn restarted_curve_errors_keep_their_step_messages() {
     let open = BCurve::Polyline { points: vec![[0.; 3], [1.; 3], [2.; 3]] };
     assert_eq!(crate::kernel::restart_curve(&open, 0.5).unwrap_err(), "spline seam endpoints do not coincide");
 }
+
+/// A whole torus (major radius 6, minor 2) as one face bounded by its two seams alone, each seam
+/// written as two rational half-circle B-splines: no seam has a closed-form pcurve on the torus,
+/// so the kernel makes them, and the face is a closed shell of one face (`KernelTrims` builds it
+/// as a closed sheet, bounding its inside as well as the infinite region).
+#[test]
+fn a_whole_torus_face_bounded_by_spline_seams_gets_the_kernels_pcurves() {
+    let (big, small) = (6.0, 2.0);
+    let mut w = W::default();
+    let half = |w: &mut W, a: u64, b: u64, pts: [V; 5], second: bool| {
+        let ids: Vec<u64> = pts.iter().map(|p| w.pt(*p)).collect();
+        let (k, ws) = if second { ("(2.,3.,4.)", "(4.,4.,8.,8.,16.)") } else { ("(0.,1.,2.)", "(1.,1.,2.,2.,4.)") };
+        let c = w.add(format!(
+            "(BOUNDED_CURVE()B_SPLINE_CURVE(2,({}),.UNSPECIFIED.,.F.,.U.)B_SPLINE_CURVE_WITH_KNOTS((3,2,3),{k},.UNSPECIFIED.)CURVE()GEOMETRIC_REPRESENTATION_ITEM()RATIONAL_B_SPLINE_CURVE({ws})REPRESENTATION_ITEM(''))",
+            list(&ids)
+        ));
+        w.add(format!("EDGE_CURVE('',#{a},#{b},#{c},.T.)"))
+    };
+    let (o, i) = (big + small, big - small);
+    let (v0, v1, v2) = (w.vertex([o, 0.0, 0.0]), w.vertex([-o, 0.0, 0.0]), w.vertex([i, 0.0, 0.0]));
+    // Round the axis on the outer equator, and round the tube in the plane y = 0.
+    let a0 = half(&mut w, v0, v1, [[o, 0.0, 0.0], [o, o, 0.0], [0.0, o, 0.0], [-o, o, 0.0], [-o, 0.0, 0.0]], false);
+    let a1 = half(&mut w, v1, v0, [[-o, 0.0, 0.0], [-o, -o, 0.0], [0.0, -o, 0.0], [o, -o, 0.0], [o, 0.0, 0.0]], true);
+    let t0 = half(&mut w, v0, v2, [[o, 0.0, 0.0], [o, 0.0, small], [big, 0.0, small], [i, 0.0, small], [i, 0.0, 0.0]], false);
+    let t1 = half(&mut w, v2, v0, [[i, 0.0, 0.0], [i, 0.0, -small], [big, 0.0, -small], [o, 0.0, -small], [o, 0.0, 0.0]], true);
+    let oes: Vec<u64> = [(a0, true), (a1, true), (t0, true), (t1, true), (a1, false), (a0, false), (t1, false), (t0, false)]
+        .iter()
+        .map(|&(e, d)| w.oe(e, d))
+        .collect();
+    let bound = w.bound(&oes, true, true);
+    let axis = w.axis([0.0; 3], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]);
+    let torus = w.add(format!("TOROIDAL_SURFACE('',#{axis},{},{})", real(big), real(small)));
+    let face = w.face(&[bound], torus, true);
+    let shell = w.add(format!("CLOSED_SHELL('',(#{face}))"));
+    let solid = w.add(format!("MANIFOLD_SOLID_BREP('',#{shell})"));
+    let ex = w.file(&[solid]);
+    let read = read_solids_with(&ex, &solidcore_ops::trims::KernelTrims);
+    assert!(read.failures.is_empty(), "{:?}", read.failures);
+    let [solid] = read.solids.as_slice() else { panic!("one solid") };
+    solidcore_ops::record_check::validate(&solid.brep).unwrap();
+    assert_eq!(solid.brep.faces.len(), 1);
+}

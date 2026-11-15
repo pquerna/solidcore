@@ -78,15 +78,42 @@ fn trims(face: &TrimFace<'_>) -> Result<Vec<Vec<Curve2>>, String> {
     let ours = face.loops.iter().flatten();
     let once = ours
         .clone()
-        .find(|u| ours.clone().filter(|v| v.edge == u.edge).count() == 1)
-        .ok_or("a face of seam edges only")?;
-    let at = edge_of(once.edge)?;
-    let reversed = made_uses
-        .iter()
-        .find(|m| m.edge == at)
-        .ok_or("a use the kernel did not keep")?
-        .forward
-        != once.forward;
+        .find(|u| ours.clone().filter(|v| v.edge == u.edge).count() == 1);
+    let reversed = if let Some(once) = once {
+        let at = edge_of(once.edge)?;
+        made_uses
+            .iter()
+            .find(|m| m.edge == at)
+            .ok_or("a use the kernel did not keep")?
+            .forward
+            != once.forward
+    } else {
+        // A face of seam edges only (a whole torus within its two seams) uses every edge both
+        // ways; its way round is the one its loop's sequence of uses matches.
+        {
+            let mut ours: Vec<(u32, bool)> = Vec::new();
+            for u in face.loops.iter().flatten() {
+                ours.push((edge_of(u.edge)?, u.forward));
+            }
+            let theirs: Vec<(u32, bool)> = made_uses.iter().map(|m| (m.edge, m.forward)).collect();
+            let rotation_of = |a: &[(u32, bool)], b: &[(u32, bool)]| {
+                a.len() == b.len()
+                    && (0..a.len().max(1))
+                        .any(|k| a.iter().cycle().skip(k).take(a.len()).eq(b.iter()))
+            };
+            let back: Vec<(u32, bool)> = ours.iter().rev().map(|&(e, f)| (e, !f)).collect();
+            if rotation_of(&ours, &theirs) {
+                false
+            } else if rotation_of(&back, &theirs) {
+                true
+            } else {
+                return Err(
+                    "a face of seam edges only whose way round the kernel's loop does not show"
+                        .into(),
+                );
+            }
+        }
+    };
     let mut result = Vec::with_capacity(face.loops.len());
     for l in &face.loops {
         let mut pcs = Vec::with_capacity(l.len());
@@ -174,13 +201,33 @@ fn sheet(face: &TrimFace<'_>) -> Result<(b::Brep, Vec<UsePlace>), String> {
             tolerance: face.tolerance,
         })
         .collect();
+    // A face whose every edge it uses twice (a whole torus, a closed spline band capped by its
+    // seams) is a closed shell: it bounds the region inside it as well as the infinite one.
+    let mut uses = vec![0usize; edges.len()];
+    for u in face.loops.iter().flatten() {
+        if let Some(n) = uses.get_mut(u.edge as usize) {
+            *n += 1;
+        }
+    }
+    let closed = face
+        .loops
+        .iter()
+        .flatten()
+        .all(|u| uses.get(u.edge as usize).is_some_and(|n| *n >= 2));
+    let mut regions = vec![Region {
+        shells: vec![0],
+        void: false,
+    }];
+    if closed {
+        regions.push(Region {
+            shells: vec![0],
+            void: false,
+        });
+    }
     let record = b::Brep {
         version: b::VERSION,
         tolerance: face.tolerance,
-        regions: vec![Region {
-            shells: vec![0],
-            void: false,
-        }],
+        regions,
         shells: vec![Shell::Faces {
             faces: vec![OrientedFace {
                 face: 0,

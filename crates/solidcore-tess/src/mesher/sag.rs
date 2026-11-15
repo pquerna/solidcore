@@ -428,7 +428,7 @@ mod tests {
         let face = super::super::poles::Face::new(s, 0.0);
         let poles = Poles::new(&face, 1e-9);
         let start = uv.len();
-        let capped = refine(&face, tol, &poles, &fixed, &mut uv, &mut tris, 20_000);
+        let capped = refine(&face, tol, &poles, &fixed, &mut uv, &mut tris, 20_000, crate::control::Meter::NONE);
         assert!(!capped, "refined to its point bound: {} nodes", uv.len());
         assert!(uv.len() < start + 64, "{} nodes put in for a plane", uv.len() - start);
     }

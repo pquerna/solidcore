@@ -8,6 +8,7 @@
 use crate::ring::Ring;
 
 use super::cdt;
+use super::comp;
 use super::motorcycle::Trace;
 
 /// A cell is kept when the boundary stays at least this fraction of its smaller side away from
@@ -25,13 +26,16 @@ struct Lines {
 }
 
 /// The full lines `grid` plus the traces' lines in this direction (see [`SNAP`]; the first and
-/// last grid lines, the face's parameter box, never move). Returns the lines and, per trace
-/// (in order), its line's index.
-fn lines(grid: &[f64], traces: &[f64]) -> Option<(Lines, Vec<usize>)> {
+/// last grid lines, the face's parameter box, never move). A trace whose line the boundary runs
+/// along beyond the trace (`along`, its flag) moves no grid line onto it: the moved line would
+/// run on the boundary there for the rest of the face, so no cell beside it would clear the
+/// boundary, and the band left would be no strip. Returns the lines and, per trace (in order),
+/// its line's index.
+fn lines(grid: &[f64], traces: &[(f64, bool)]) -> Option<(Lines, Vec<usize>)> {
     let mut at: Vec<f64> = grid.to_vec();
     let mut full = vec![true; at.len()];
     let mut place = Vec::with_capacity(traces.len());
-    for &c in traces {
+    for &(c, along) in traces {
         // The full-grid cell around c, and every line inside it.
         let k = grid.partition_point(|g| *g < c);
         let (lo, hi) = (*grid.get(k.saturating_sub(1))?, *grid.get(k.min(grid.len().saturating_sub(1)))?);
@@ -41,12 +45,13 @@ fn lines(grid: &[f64], traces: &[f64]) -> Option<(Lines, Vec<usize>)> {
         match near {
             // An earlier trace, or a box edge: join it.
             Some((i, _)) if !full.get(i).copied().unwrap_or(false) || i == 0 || i == last => place.push(i),
-            // An inner grid line: it moves onto the trace.
-            Some((i, _)) => {
+            // An inner grid line: it moves onto the trace, unless the boundary runs on (a line
+            // already on the trace's line is joined as it stands).
+            Some((i, x)) if !along || *x == c => {
                 *at.get_mut(i)? = c;
                 place.push(i);
             }
-            None => {
+            _ => {
                 at.push(c);
                 full.push(false);
                 place.push(at.len() - 1);
@@ -98,8 +103,23 @@ pub(crate) fn cut_grid(
         let cap = us.len().saturating_mul(vs.len()).saturating_mul(9) / 10;
         super::grid::thin(&mut us, &mut vs, cap);
     }
-    let (lu, pu) = lines(&us, &tu.iter().map(|t| t.at).collect::<Vec<_>>())?;
-    let (lv, pv) = lines(&vs, &tv.iter().map(|t| t.at).collect::<Vec<_>>())?;
+    // Whether the boundary runs along a trace's line beyond the trace itself.
+    let span = |g: &[f64]| g.last().copied().unwrap_or(0.0) - g.first().copied().unwrap_or(0.0);
+    let eps = 1e-9 * span(&us).abs().max(span(&vs).abs()).max(f64::MIN_POSITIVE);
+    let along = |t: &Trace| {
+        let (d, e) = (t.axis, 1 - t.axis);
+        let close = |x: f64| (x - t.at).abs() <= eps;
+        loops.iter().any(|r| {
+            let n = r.len();
+            (0..n).any(|k| {
+                let (Some(a), Some(b)) = (boundary.get(r.start + k), boundary.get(r.start + (k + 1) % n)) else { return false };
+                let (lo, hi) = (comp(a, e).min(comp(b, e)), comp(a, e).max(comp(b, e)));
+                close(comp(a, d)) && close(comp(b, d)) && hi - lo > eps && (lo < t.from - eps || hi > t.to + eps)
+            })
+        })
+    };
+    let (lu, pu) = lines(&us, &tu.iter().map(|t| (t.at, along(t))).collect::<Vec<_>>())?;
+    let (lv, pv) = lines(&vs, &tv.iter().map(|t| (t.at, along(t))).collect::<Vec<_>>())?;
     let (nu, nv) = (lu.at.len(), lv.at.len());
     let (cu, cv) = (nu - 1, nv - 1);
     let cells = cu.checked_mul(cv)?;
@@ -513,6 +533,47 @@ mod tests {
         // along u = 1.7 from its v-extremes; their lines are in the grid.
         for (d, x) in [(0, 1.7), (1, 2.3)] {
             assert!(out.0.iter().any(|p| (p[d] - x).abs() < 1e-9), "a grid point on line {d} = {x}");
+        }
+    }
+
+    /// A cylinder's full ring below a half ring, in its (u, v). The reflex corner's trace along
+    /// the step lies on the line the step's boundary runs on for the rest of the ring: a full
+    /// grid row moved onto it would run on that boundary, no cell beside it would clear the
+    /// boundary, and the band left would span half the ring with no point in it (flat chords
+    /// across the cylinder). The row stays, the trace gets its own line, the band stays a strip.
+    #[test]
+    fn a_trace_along_the_boundary_keeps_the_band_a_strip() {
+        let run = |from: [f64; 2], to: [f64; 2], n: usize| -> Vec<[f64; 2]> {
+            (0..n).map(|k| {
+                let t = k as f64 / n as f64;
+                [from[0] + (to[0] - from[0]) * t, from[1] + (to[1] - from[1]) * t]
+            }).collect()
+        };
+        let mut b = run([0.0, 0.4], [4.0, 0.4], 64);
+        b.extend(run([4.0, 0.4], [4.0, 14.6], 64));
+        b.extend(run([4.0, 14.6], [2.0, 14.6], 32));
+        b.extend(run([2.0, 14.6], [2.0, 28.25], 64));
+        b.extend(run([2.0, 28.25], [0.0, 28.25], 32));
+        b.extend(run([0.0, 28.25], [0.0, 0.4], 128));
+        let loops = one(b.len());
+        // About a cylinder of radius 2.05 with quarter-turn units: u runs 3.2 mm a unit.
+        let scale = [3.22, 1.0];
+        let traces = super::super::motorcycle::traces(&b, &loops, scale, 0.0);
+        assert!(!traces.is_empty(), "the step's reflex corner spawns traces");
+        let vs = [0.4, 7.3625, 14.325, 21.2875, 28.25];
+        let Some(out) = cut_grid(&b, &loops, &lines(0.0, 4.0, 64), &vs, &traces, scale) else { panic!("meshes") };
+        check(&b, &loops, 4.0 * 14.2 + 2.0 * 13.65, &out);
+        // Below the step no triangle reaches across half the ring with no point in it (before
+        // the trace got its own line, the band there did: 2.06 of the ring's 4).
+        let mut all = b.clone();
+        all.extend_from_slice(&out.0);
+        for t in &out.1 {
+            if t.iter().any(|&i| all[i as usize][1] > 14.6) {
+                continue;
+            }
+            let u = t.map(|i| all[i as usize][0]);
+            let span = u.iter().copied().fold(f64::MIN, f64::max) - u.iter().copied().fold(f64::MAX, f64::min);
+            assert!(span < 1.5, "a triangle spans {span} of the ring: {:?}", t.map(|i| all[i as usize]));
         }
     }
 

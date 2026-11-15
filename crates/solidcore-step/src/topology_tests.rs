@@ -2425,3 +2425,52 @@ fn a_cylinder_faces_domain_ends_on_its_boundarys_own_heights() {
     let hi = heights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     assert_eq!(f.domain[1], [lo, hi], "domain {:?}", f.domain);
 }
+
+/// A hemisphere (radius 3 on a tilted frame) bounded by its equator: the equator lies on the
+/// form's quarter line, and its pcurve, which rounds a few ulps off the line, is put on it, so it
+/// runs exactly along the face's domain edge.
+#[test]
+fn a_boundary_on_a_forms_quarter_line_lies_exactly_on_it() {
+    let r = 3.0;
+    let unit = |v: [f64; 3]| {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        v.map(|c| c / l)
+    };
+    let z = unit([0.1, 0.6, 0.8]);
+    let x = {
+        let t = [1.0, 0.0, 0.0];
+        let d = t[0] * z[0];
+        unit([t[0] - d * z[0], -d * z[1], -d * z[2]])
+    };
+    let o = [1.1, -2.3, 0.7];
+    let mut w = W::default();
+    let start = [o[0] + r * x[0], o[1] + r * x[1], o[2] + r * x[2]];
+    let v = w.vertex(start);
+    let c = w.circle(o, z, x, r);
+    let equator = w.add(format!("EDGE_CURVE('',#{v},#{v},#{c},.T.)"));
+    let oes = vec![w.oe(equator, true)];
+    let bound = w.bound(&oes, true, true);
+    let axis = w.axis(o, z, x);
+    let sphere = w.add(format!("SPHERICAL_SURFACE('',#{axis},{})", real(r)));
+    let face = w.face(&[bound], sphere, true);
+    let shell = w.add(format!("OPEN_SHELL('',(#{face}))"));
+    let model = w.add(format!("SHELL_BASED_SURFACE_MODEL('',(#{shell}))"));
+    let s = one_solid(&w.file(&[model]));
+    let f = &s.brep.faces[0];
+    let edges: Vec<&OrientedEdge> = f
+        .loops
+        .iter()
+        .flat_map(|l| match l {
+            Loop::Edges { edges } => edges.iter().collect::<Vec<_>>(),
+            Loop::Vertex { .. } => Vec::new(),
+        })
+        .collect();
+    let equator_use = edges.iter().find(|u| s.brep.edges[u.edge as usize].uses.len() == 1).expect("the equator");
+    let vs: Vec<f64> = match &equator_use.pcurve {
+        Curve2::Spline { points, .. } => points.iter().map(|p| p[1]).collect(),
+        Curve2::RationalSpline { homogeneous, .. } => homogeneous.iter().map(|h| h[1] / h[2]).collect(),
+    };
+    let line = vs[0];
+    assert!(vs.iter().all(|v| *v == line), "{vs:?}");
+    assert!(f.domain[1].contains(&line), "equator {line} on domain {:?}", f.domain);
+}

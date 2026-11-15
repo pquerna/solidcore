@@ -1808,6 +1808,7 @@ impl<'b, 'a> Builder<'b, 'a> {
         // tolerances cover the move.
         if let (Some(f), Some(e)) = (&form, extent) {
             onto_form(f, &label, e, tol, &mut pcs);
+            onto_form_lines(f, &mut pcs);
         }
         // A cylinder's or cone's form runs along its axis over the extent its boundary was
         // projected to, which may differ from its pcurves' own heights by rounding (an end circle
@@ -2159,6 +2160,38 @@ fn pcurve_extent(pcs: &[Vec<Curve2>], d: usize) -> Option<[f64; 2]> {
         }
     }
     (range[0].is_finite() && range[1].is_finite()).then_some(range)
+}
+
+/// The pcurves' coordinates within rounding of the form's range ends put on those ends: a
+/// boundary on the form's quarter line (a circle at a sphere's or torus's quarter latitude) whose
+/// closed form rounds a few ulps inside it lies on the line exactly, as the face's domain does.
+fn onto_form_lines(form: &BSurface, pcs: &mut [Vec<Curve2>]) {
+    let ranges = solidcore_ops::label::surface_natural(form);
+    let snap = |p: &mut [f64; 2]| {
+        for (d, x) in p.iter_mut().enumerate() {
+            let Some(Natural::Range(a, b)) = ranges.get(d) else { continue };
+            for end in [*a, *b] {
+                if *x != end && (*x - end).abs() <= 64.0 * f64::EPSILON * end.abs().max(1.0) {
+                    *x = end;
+                }
+            }
+        }
+    };
+    for c in pcs.iter_mut().flatten() {
+        match c {
+            Curve2::Spline { points, .. } => points.iter_mut().for_each(snap),
+            Curve2::RationalSpline { homogeneous, .. } => {
+                for h in homogeneous.iter_mut().filter(|h| h[2] > 0.0) {
+                    let mut p = [h[0] / h[2], h[1] / h[2]];
+                    let before = p;
+                    snap(&mut p);
+                    if p != before {
+                        (h[0], h[1]) = (p[0] * h[2], p[1] * h[2]);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn onto_form(form: &BSurface, label: &BSurface, domain: [[f64; 2]; 2], tolerance: f64, pcs: &mut [Vec<Curve2>]) -> usize {

@@ -1775,11 +1775,11 @@ impl<'b, 'a> Builder<'b, 'a> {
             }
             None => None,
         };
-        let (form, box_on_form, extent) = match form {
+        let (mut form, box_on_form, extent) = match form {
             Some((f, d, e)) => (Some(f), Some(d), Some(e)),
             None => (None, None, None),
         };
-        let surface = form.clone().unwrap_or_else(|| label.clone());
+        let mut surface = form.clone().unwrap_or_else(|| label.clone());
         // A face that winds round its axis more than a turn is on a form that does not close:
         // no analytic surface has it (SMLib's cylinder is one turn), so it is a spline face.
         let wound = extent.is_some_and(crate::kernel::form::winds);
@@ -1823,6 +1823,29 @@ impl<'b, 'a> Builder<'b, 'a> {
         // tolerances cover the move.
         if let (Some(f), Some(e)) = (&form, extent) {
             onto_form(f, &label, e, tol, &mut pcs);
+        }
+        // A cylinder's or cone's form runs along its axis over the extent its boundary was
+        // projected to, which may differ from its pcurves' own heights by rounding (an end circle
+        // at 2 on a form from 1.9999999999999998). The form is made again over the pcurves' exact
+        // extent there, so the face's domain ends on its boundary's own lines; the pcurves stay as
+        // they are (the form's height is the label's).
+        if !wound
+            && matches!(label, BSurface::Cylinder { .. } | BSurface::Cone { .. })
+            && let (Some(f), Some(e)) = (&form, extent)
+            && let Some(Natural::Range(a, b)) = solidcore_ops::label::surface_natural(f).get(1).copied()
+            && let Some([lo, hi]) = pcurve_extent(&pcs, 1)
+            && (lo != a || hi != b)
+            && (lo - a).abs() <= tol
+            && (hi - b).abs() <= tol
+            && lo < hi
+            && let Some((made, _)) = crate::kernel::form::surface_within(&label, [e[0], [lo, hi]], tol)
+            && matches!(solidcore_ops::label::surface_natural(&made).get(1), Some(Natural::Range(x, y)) if *x == lo && *y == hi)
+        {
+            surface = made.clone();
+            form = Some(made);
+            if let Some(face) = self.faces.get_mut(fi) {
+                face.extent = Some([e[0], [lo, hi]]);
+            }
         }
         self.raise_edges(&surface, &edge_loops, &pcs)?;
         // Signed areas of the loops that close in (u, v).
@@ -2269,6 +2292,24 @@ fn form_reach(label: &BSurface, v: [f64; 2], tolerance: f64) -> [f64; 2] {
 /// the form's, holds it; the pcurve moves by no more than its points did, a gap the edges'
 /// tolerances are measured to cover (`raise_edges`). A point further out is left as it is, for
 /// the record check to refuse. The number of control point coordinates moved.
+/// The exact range the pcurves' control points span in direction `d`: a pcurve lies in its
+/// control points' hull, and an iso boundary on them is that line exactly.
+fn pcurve_extent(pcs: &[Vec<Curve2>], d: usize) -> Option<[f64; 2]> {
+    let mut range = [f64::INFINITY, f64::NEG_INFINITY];
+    for c in pcs.iter().flatten() {
+        let points: Vec<f64> = match c {
+            Curve2::Spline { points, .. } => points.iter().filter_map(|p| p.get(d).copied()).collect(),
+            Curve2::RationalSpline { homogeneous, .. } => {
+                homogeneous.iter().filter(|h| h[2] > 0.0).filter_map(|h| h.get(d).map(|x| x / h[2])).collect()
+            }
+        };
+        for x in points {
+            range = [range[0].min(x), range[1].max(x)];
+        }
+    }
+    (range[0].is_finite() && range[1].is_finite()).then_some(range)
+}
+
 fn onto_form(form: &BSurface, label: &BSurface, domain: [[f64; 2]; 2], tolerance: f64, pcs: &mut [Vec<Curve2>]) -> usize {
     let reach = form_reach(label, domain[1], tolerance);
     let ranges = solidcore_ops::label::surface_natural(form);

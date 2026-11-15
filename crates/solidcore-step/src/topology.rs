@@ -1772,6 +1772,11 @@ impl<'b, 'a> Builder<'b, 'a> {
             };
             wound::unwind(&edge_loops, &mut pcs, range)?;
         }
+        // On a spline closed across a bounded direction, a use along the line its two boundaries
+        // make one (a seam's) is on the side its loop arrives at.
+        if !wound {
+            self.closed_seam_sides(&surface, &edge_loops, &mut pcs)?;
+        }
         // A form ends on a quarter line its face's boundary runs past by up to the tolerance: the
         // pcurves are put on its range, as the face's domain is ([`face_domain`]), and the edges'
         // tolerances cover the move.
@@ -2002,6 +2007,140 @@ fn uses_of<'e>(edges: &'e [EdgeB], edge_loops: &[Vec<(u32, bool)>], given: Optio
 }
 
 /// A spline surface's parameter box: its knot ranges.
+/// The bounded directions across which `surface` closes: its two boundaries `d = a` and `d = b`
+/// one line (to within `tol`, sampled along it), with that range.
+fn closed_ranges(surface: &BSurface, tol: f64) -> [Option<[f64; 2]>; 2] {
+    let natural = solidcore_ops::label::surface_natural(surface);
+    let Ok(eval) = SurfaceEval::new(surface) else { return [None, None] };
+    let range = |d: usize| match natural.get(d) {
+        Some(Natural::Range(a, b)) if a.is_finite() && b.is_finite() && a < b => Some([*a, *b]),
+        _ => None,
+    };
+    let closes = |d: usize| -> Option<[f64; 2]> {
+        let [a, b] = range(d)?;
+        let [c, e] = range(1 - d)?;
+        let at = |x: f64, y: f64| eval.point(if d == 0 { [x, y] } else { [y, x] });
+        let samples = 8;
+        (0..=samples)
+            .map(|i| c + (e - c) * i as f64 / samples as f64)
+            .all(|y| matches!((at(a, y), at(b, y)), (Some(p), Some(q)) if p.dist(q) <= tol))
+            .then_some([a, b])
+    };
+    [closes(0), closes(1)]
+}
+
+/// A pcurve's control points in (u, v), unweighted.
+fn pcurve_points(c: &Curve2) -> Vec<[f64; 2]> {
+    match c {
+        Curve2::Spline { points, .. } => points.clone(),
+        Curve2::RationalSpline { homogeneous, .. } => homogeneous.iter().map(|h| [h[0] / h[2], h[1] / h[2]]).collect(),
+    }
+}
+
+/// The pcurve with every control point's coordinate `d` set to `x`: an iso line moved to the
+/// other side of a closed surface's seam (exact: the points were all on one boundary).
+fn on_side(c: &Curve2, d: usize, x: f64) -> Curve2 {
+    match c {
+        Curve2::Spline { knots, points } => Curve2::Spline {
+            knots: knots.clone(),
+            points: points
+                .iter()
+                .map(|p| {
+                    let mut p = *p;
+                    if let Some(c) = p.get_mut(d) {
+                        *c = x;
+                    }
+                    p
+                })
+                .collect(),
+        },
+        Curve2::RationalSpline { knots, homogeneous } => Curve2::RationalSpline {
+            knots: knots.clone(),
+            homogeneous: homogeneous
+                .iter()
+                .map(|h| {
+                    let mut h = *h;
+                    let w = h[2];
+                    if let Some(c) = h.get_mut(d) {
+                        *c = x * w;
+                    }
+                    h
+                })
+                .collect(),
+        },
+    }
+}
+
+impl Builder<'_, '_> {
+    /// On a spline surface that closes across a bounded direction `d` (its boundaries `d = a` and
+    /// `d = b` one line, a closed NURBS cylinder's or torus's seam), a use running along that line
+    /// has its pcurve on either boundary and the kernel puts it on one. Each such use is put on
+    /// the side its loop meets it at, from the use before it (or, where that junction is at a
+    /// pole, where every `d` is one point, from the use after), so the loop runs on in (u, v): a
+    /// seam's two uses a range apart, as on a periodic surface. Only iso lines on the boundary
+    /// move, and only from one boundary to the other; no point moves.
+    fn closed_seam_sides(&self, surface: &BSurface, edge_loops: &[Vec<(u32, bool)>], pcs: &mut [Vec<Curve2>]) -> R<()> {
+        let poles = SurfaceEval::new(surface).ok();
+        for (d, range) in closed_ranges(surface, self.tol).into_iter().enumerate() {
+            let Some([a, b]) = range else { continue };
+            let width = b - a;
+            let near = |x: f64, y: f64| (x - y).abs() <= 1e-9 * width.max(1.0);
+            // Which boundary a use's pcurve lies all along, if one.
+            let side = |c: &Curve2| -> Option<f64> {
+                let xs: Vec<f64> = pcurve_points(c).iter().filter_map(|p| p.get(d).copied()).collect();
+                [a, b].into_iter().find(|&s| !xs.is_empty() && xs.iter().all(|&x| near(x, s)))
+            };
+            // A use's (u, v) where it starts and where it ends, along the loop.
+            let ends = |c: &Curve2, forward: bool| -> Option<([f64; 2], [f64; 2])> {
+                let [t0, t1] = c.interval()?;
+                let (p, q) = (solidcore_ops::pcurve::eval(c, t0)?, solidcore_ops::pcurve::eval(c, t1)?);
+                Some(if forward { (p, q) } else { (q, p) })
+            };
+            for (l, pc) in edge_loops.iter().zip(pcs.iter_mut()) {
+                let n = pc.len();
+                let Some(anchor) = pc.iter().position(|c| side(c).is_none()) else { continue };
+                for i in 1..n {
+                    let k = (anchor + i) % n;
+                    let (before, after) = ((k + n - 1) % n, (k + 1) % n);
+                    let (Some(c), Some(&(e, forward))) = (pc.get(k), l.get(k)) else { continue };
+                    let Some(s) = side(c) else { continue };
+                    let Some((start, end)) = ends(c, forward) else { continue };
+                    // The vertex at a junction, and how far a pole may be from it.
+                    let edge = self.edges.get(e as usize).ok_or("edge reference")?;
+                    let reach = |v: u32| self.vertices.get(v as usize).map_or(self.tol, |x| x.tolerance.max(self.tol));
+                    let (first, last) = if forward { (edge.vertices[0], edge.vertices[1]) } else { (edge.vertices[1], edge.vertices[0]) };
+                    let at_pole = |uv: [f64; 2], v: u32| -> R<bool> {
+                        Ok(match &poles {
+                            Some(p) => p.pole_within(uv, reach(v))?.iter().any(|x| *x),
+                            None => false,
+                        })
+                    };
+                    // Where the loop meets this use: from the use before, else from the one after.
+                    let meet = if !at_pole(start, first)? {
+                        let prev = pc.get(before).zip(l.get(before)).and_then(|(c, &(_, f))| ends(c, f));
+                        prev.map(|(_, arrive)| (start, arrive))
+                    } else if !at_pole(end, last)? {
+                        let next = pc.get(after).zip(l.get(after)).and_then(|(c, &(_, f))| ends(c, f));
+                        next.map(|(leave, _)| (end, leave))
+                    } else {
+                        None
+                    };
+                    let Some((here, there)) = meet else { continue };
+                    let (Some(x), Some(y)) = (here.get(d), there.get(d)) else { continue };
+                    if !((x - y).abs() > 0.5 * width) {
+                        continue;
+                    }
+                    let other = if near(s, a) { b } else { a };
+                    if let Some(slot) = pc.get_mut(k) {
+                        *slot = on_side(slot, d, other);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn natural_box(s: &BSurface) -> Option<[[f64; 2]; 2]> {
     match solidcore_ops::label::surface_natural(s) {
         [Natural::Range(a, b), Natural::Range(c, d)] if [a, b, c, d].iter().all(|x| x.is_finite()) => Some([[a, b], [c, d]]),

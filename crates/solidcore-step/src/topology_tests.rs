@@ -2360,3 +2360,67 @@ fn restarted_curve_errors_keep_their_step_messages() {
     let open = BCurve::Polyline { points: vec![[0.; 3], [1.; 3], [2.; 3]] };
     assert_eq!(crate::kernel::restart_curve(&open, 0.5).unwrap_err(), "spline seam endpoints do not coincide");
 }
+
+/// A whole rational NURBS cylinder band (radius 5, height 8: nine control rows, the last the
+/// first, its quarter circles' weights each scaled, so its end rows' weights differ) bounded by its two rims (each two half circles) and a seam line up
+/// its boundary `u = 0`, the surface's own `u = 4`. The seam's two uses are on its two sides, a
+/// range apart, so the loop runs on in (u, v) and bounds the band.
+#[test]
+fn a_closed_spline_cylinders_seam_uses_are_on_its_two_sides() {
+    let (r, h) = (5.0, 8.0);
+    let square: [[f64; 2]; 9] = [[r, 0.0], [r, r], [0.0, r], [-r, r], [-r, 0.0], [-r, -r], [0.0, -r], [r, -r], [r, 0.0]];
+    // The quarter circles' weights scaled by a common factor each (1, 1, 2 is 1, 1/sqrt 2, 1):
+    // the same circle, its end rows' weights 1 and 16.
+    let weights = [1.0, 1.0, 2.0, 2.0, 4.0, 4.0, 8.0, 8.0, 16.0];
+    let mut w = W::default();
+    // Each rim as two half circles, (r, 0) round to (-r, 0) and on back, as exporters split it.
+    let half = |w: &mut W, z: f64, k: usize| {
+        let ids: Vec<u64> = square.iter().skip(4 * k).take(5).map(|p| w.pt([p[0], p[1], z])).collect();
+        let hw = weights.iter().skip(4 * k).take(5).map(|x| real(*x)).collect::<Vec<_>>().join(",");
+        let (a, b) = (2 * k, 2 * k + 2);
+        w.add(format!(
+            "(BOUNDED_CURVE()B_SPLINE_CURVE(2,({}),.UNSPECIFIED.,.F.,.F.)B_SPLINE_CURVE_WITH_KNOTS((3,2,3),({a}.,{}.,{b}.),.UNSPECIFIED.)CURVE()GEOMETRIC_REPRESENTATION_ITEM()RATIONAL_B_SPLINE_CURVE(({hw}))REPRESENTATION_ITEM(''))",
+            list(&ids),
+            a + 1
+        ))
+    };
+    let rows: Vec<String> = square.iter().map(|p| format!("(#{},#{})", w.pt([p[0], p[1], 0.0]), w.pt([p[0], p[1], h]))).collect();
+    let row_weights: Vec<String> = weights.iter().map(|x| format!("({},{})", real(*x), real(*x))).collect();
+    let surface = w.add(format!(
+        "(BOUNDED_SURFACE()B_SPLINE_SURFACE(2,1,({}),.UNSPECIFIED.,.T.,.F.,.F.)B_SPLINE_SURFACE_WITH_KNOTS((3,2,2,2,3),(2,2),(0.,1.,2.,3.,4.),(0.,{}),.UNSPECIFIED.)GEOMETRIC_REPRESENTATION_ITEM()RATIONAL_B_SPLINE_SURFACE(({}))REPRESENTATION_ITEM('')SURFACE())",
+        rows.join(","),
+        real(h),
+        row_weights.join(",")
+    ));
+    let (v0, w0, v1, w1) = (w.vertex([r, 0.0, 0.0]), w.vertex([-r, 0.0, 0.0]), w.vertex([r, 0.0, h]), w.vertex([-r, 0.0, h]));
+    let edge = |w: &mut W, a: u64, b: u64, z: f64, k: usize| {
+        let c = half(w, z, k);
+        w.add(format!("EDGE_CURVE('',#{a},#{b},#{c},.T.)"))
+    };
+    let (b0, b1) = (edge(&mut w, v0, w0, 0.0, 0), edge(&mut w, w0, v0, 0.0, 1));
+    let (t0, t1) = (edge(&mut w, v1, w1, h, 0), edge(&mut w, w1, v1, h, 1));
+    let seam = w.line_edge((v0, [r, 0.0, 0.0]), (v1, [r, 0.0, h]), true, 1.0);
+    let oes: Vec<u64> = [(b0, true), (b1, true), (seam, true), (t1, false), (t0, false), (seam, false)].iter().map(|&(e, o)| w.oe(e, o)).collect();
+    let bound = w.bound(&oes, true, true);
+    let face = w.face(&[bound], surface, true);
+    let shell = w.add(format!("OPEN_SHELL('',(#{face}))"));
+    let model = w.add(format!("SHELL_BASED_SURFACE_MODEL('',(#{shell}))"));
+    let read = read_solids_with(&w.file(&[model]), &solidcore_ops::trims::KernelTrims);
+    assert!(read.failures.is_empty(), "{:?}", read.failures);
+    let [solid] = read.solids.as_slice() else { panic!("one sheet") };
+    let b = &solid.brep;
+    solidcore_ops::record_check::validate(b).unwrap();
+    solidcore_ops::record_check::agreement(b).unwrap();
+    assert_eq!(counts(b), [1, 1, 1, 5, 4]);
+    let Loop::Edges { edges } = &b.faces[0].loops[0] else { panic!("an edge loop") };
+    let seam_us: Vec<f64> = edges
+        .iter()
+        .filter(|u| b.edges[u.edge as usize].uses.len() == 2)
+        .map(|u| {
+            let [t0, _] = u.pcurve.interval().unwrap();
+            solidcore_ops::pcurve::eval(&u.pcurve, t0).unwrap()[0]
+        })
+        .collect();
+    let [x, y] = seam_us.as_slice() else { panic!("a seam's two uses: {seam_us:?}") };
+    assert!(((x - y).abs() - 4.0).abs() < 1e-9, "{seam_us:?}");
+}

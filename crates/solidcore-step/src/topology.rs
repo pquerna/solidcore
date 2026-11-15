@@ -1697,7 +1697,8 @@ impl<'b, 'a> Builder<'b, 'a> {
     /// face's outer boundary.
     fn face_pcurves(&mut self, fi: usize) -> R<(Vec<Vec<Curve2>>, [[f64; 2]; 2], bool, Option<BSurface>)> {
         let face = self.faces.get(fi).ok_or("face reference")?;
-        let label = face.surface.clone();
+        let mut label = face.surface.clone();
+        let mut return_extent: Option<[[f64; 2]; 2]> = None;
         let edge_loops: Vec<Vec<(u32, bool)>> = face
             .loops
             .iter()
@@ -1728,9 +1729,39 @@ impl<'b, 'a> Builder<'b, 'a> {
                     crate::kernel::form::wound_surface(&label, extent, tol)
                         .ok_or_else(|| unsupported(format!("a face that winds {turns:.1} turns about its axis, past the 64 a form takes")))?
                 } else {
-                    crate::kernel::form::surface_within(&label, extent, tol).ok_or_else(|| unsupported("a face of more than one turn"))?
+                    let (f, d) =
+                        crate::kernel::form::surface_within(&label, extent, tol).ok_or_else(|| unsupported("a face of more than one turn"))?;
+                    let _ = &d;
+                    // A form starting `q` whole quarters round from its label's frame: the frame
+                    // turned by those quarters (exactly), so the form starts on the frame's
+                    // first quarter line, as the kernel's support of a form reads it; every
+                    // circle on the old quarter grid is on the new one.
+                    let form_start = match &f {
+                        BSurface::Spline { u_knots, .. } | BSurface::RationalSpline { u_knots, .. } => u_knots.first().copied(),
+                        _ => None,
+                    };
+                    match form_start.and_then(frames::whole_quarters).and_then(|q| Some((q, frames::quarter_turned(&label, q)?))) {
+                        Some((q, turned)) => {
+                            let shift = f64::from(q) * std::f64::consts::FRAC_PI_2;
+                            let extent = [[extent[0][0] - shift, extent[0][1] - shift], extent[1]];
+                            match crate::kernel::form::surface_within(&turned, extent, tol) {
+                                Some((tf, td)) if matches!(&tf, BSurface::Spline { u_knots, .. } | BSurface::RationalSpline { u_knots, .. } if u_knots.first().is_some_and(|k| k.abs() <= 1e-9)) =>
+                                {
+                                    label = turned;
+                                    if let Some(face) = self.faces.get_mut(fi) {
+                                        face.surface = label.clone();
+                                        face.extent = Some(extent);
+                                    }
+                                    return_extent = Some(extent);
+                                    (tf, td)
+                                }
+                                _ => (f, d),
+                            }
+                        }
+                        None => (f, d),
+                    }
                 };
-                Some((f, d, extent))
+                Some((f, d, return_extent.unwrap_or(extent)))
             }
             None => None,
         };

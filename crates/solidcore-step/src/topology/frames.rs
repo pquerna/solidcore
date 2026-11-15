@@ -276,3 +276,38 @@ impl Builder<'_, '_> {
         Ok(turned)
     }
 }
+
+/// `x` as a whole number of quarters other than none (a form's start on its frame's quarter grid), to
+/// rounding.
+pub(super) fn whole_quarters(x: f64) -> Option<i32> {
+    let q = x.round();
+    ((x - q).abs() <= 1e-9 && (1.0..=3.0).contains(&q.abs())).then_some(q as i32)
+}
+
+/// A cylinder's, cone's, sphere's or torus's label with its frame turned `q` quarters about its
+/// axis, exactly: its x and y axes swapped and negated, no rounding.
+pub(super) fn quarter_turned(s: &solidcore_record::brep::Surface, q: i32) -> Option<solidcore_record::brep::Surface> {
+    use solidcore_record::brep::{self as brep, Surface as BSurface};
+    let turn = |f: &brep::Frame| -> brep::Frame {
+        let (x, y) = (f.x_axis, f.y_axis);
+        let neg = |a: [f64; 3]| a.map(|c| -c);
+        let (nx, ny) = match q.rem_euclid(4) {
+            1 => (y, neg(x)),
+            2 => (neg(x), neg(y)),
+            3 => (neg(y), x),
+            _ => (x, y),
+        };
+        brep::Frame { origin: f.origin, x_axis: nx, y_axis: ny }
+    };
+    Some(match s {
+        BSurface::Cylinder { frame, radius } => BSurface::Cylinder { frame: turn(frame), radius: *radius },
+        BSurface::Cone { frame, radius_at_origin, half_angle } => {
+            BSurface::Cone { frame: turn(frame), radius_at_origin: *radius_at_origin, half_angle: *half_angle }
+        }
+        BSurface::Sphere { frame, radius } => BSurface::Sphere { frame: turn(frame), radius: *radius },
+        BSurface::Torus { frame, major_radius, minor_radius, tube_start } => {
+            BSurface::Torus { frame: turn(frame), major_radius: *major_radius, minor_radius: *minor_radius, tube_start: *tube_start }
+        }
+        _ => return None,
+    })
+}

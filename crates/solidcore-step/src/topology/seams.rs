@@ -405,6 +405,14 @@ impl Builder<'_, '_> {
             // The face lies to the left of its loops in (u, v): above a loop running +u, and on
             // the side of lower u of a loop running +v.
             let (left_of_up, left_of_down) = if ax.kind.winds_in() == 1 { (ax.poles[0], ax.poles[1]) } else { (ax.poles[1], ax.poles[0]) };
+            // A loop winding once round an open surface with no pole on its side bounds nothing:
+            // the half of a face cut along an edge off it, laid again inside the two ([`super::splits`]).
+            if let ([l], [], None) | ([], [l], None) = (up.as_slice(), down.as_slice(), if up.is_empty() { left_of_down } else { left_of_up })
+                && self.relay_split(fi, *l, &eval, periods)?
+            {
+                self.cuts_relaid += 1;
+                continue;
+            }
             match (up.as_slice(), down.as_slice()) {
                 ([l], []) => self.pole_seam(fi, *l, &ax, left_of_up, &eval)?,
                 ([], [l]) => self.pole_seam(fi, *l, &ax, left_of_down, &eval)?,
@@ -529,7 +537,7 @@ impl Builder<'_, '_> {
         Ok(if forward { edge.vertices[0] } else { edge.vertices[1] })
     }
 
-    fn vpoint(&self, v: u32) -> R<Vec3> {
+    pub(super) fn vpoint(&self, v: u32) -> R<Vec3> {
         self.vertices.get(v as usize).map(|v| Vec3::from(v.point)).ok_or_else(|| "vertex reference".to_string())
     }
 

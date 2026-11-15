@@ -1199,6 +1199,16 @@ fn segment_data(
     Ok((out, points))
 }
 
+/// The B-spline of degree `degree` through `points` at increasing `params`: the kernel's
+/// interpolation ([`crate::curve::from_parameters::interpolated`]).
+///
+/// # Errors
+/// Too few points, a parameter per point missing, parameters not increasing, or the
+/// interpolation's own.
+pub fn interpolate(points: &[[f64; 3]], params: &[f64], degree: usize) -> crate::Result<Curve> {
+    crate::curve::from_parameters::interpolated(points, params, degree)
+}
+
 /// Start a closed spline or polyline at `start` inside its natural domain `[a, b]`.
 /// The result has domain `[start, start + b - a]`. Parameters before `start` move
 /// forward by `b - a`; all other parameters keep their points.

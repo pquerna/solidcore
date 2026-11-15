@@ -587,3 +587,26 @@ fn an_unevenly_parameterised_closed_form_is_the_whole_turn() {
     let d = e.step_interval();
     assert_eq!(d.max() - d.min(), 360.0, "{d:?}");
 }
+
+/// The kernel's interpolation goes through its points at their parameters and keeps a cubic
+/// it is given points of; too few points or parameters out of order are refused.
+#[test]
+fn an_interpolated_spline_goes_through_its_points() {
+    let k = k();
+    let cubic = |t: f64| [t, t * t, t * t * t];
+    let params = [0.0, 0.2, 0.5, 0.7, 1.0];
+    let points: Vec<[f64; 3]> = params.iter().map(|&t| cubic(t)).collect();
+    let made = interpolated(&points, &params, 3).unwrap();
+    let Record::Spline { ref knots, .. } = made else {
+        panic!("a polynomial spline")
+    };
+    assert_eq!(knots.first(), Some(&0.0));
+    assert_eq!(knots.last(), Some(&1.0));
+    let e = from_parameters(&k, &made, [0.0, 1.0]).unwrap();
+    for t in [0.0, 0.1, 0.2, 0.35, 0.5, 0.7, 0.9, 1.0] {
+        near(at(&k, &e.curve, t), cubic(t), 1e-12);
+    }
+    assert!(interpolated(&points[..3], &params[..3], 3).is_err());
+    assert!(interpolated(&points, &[0.0, 0.5, 0.2, 0.7, 1.0], 3).is_err());
+    assert!(interpolated(&points, &params[..4], 3).is_err());
+}

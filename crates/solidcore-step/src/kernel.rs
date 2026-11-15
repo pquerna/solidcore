@@ -41,6 +41,12 @@ pub(crate) fn restart_curve(curve: &Curve, start: f64) -> Result<Curve, Error> {
     c::record_curve(restarted).map_err(|e| e.to_string())
 }
 
+/// The B-spline of degree `degree` through `points` at increasing `params`, by the kernel.
+pub(crate) fn interpolate(points: &[[f64; 3]], params: &[f64], degree: usize) -> Result<Curve, Error> {
+    let made = k::pcurve::interpolate(points, params, degree).map_err(|e| e.to_string())?;
+    c::record_curve(made).map_err(|e| e.to_string())
+}
+
 /// A surface record ready to evaluate.
 pub(crate) struct SurfaceEval(k::SurfaceEval);
 

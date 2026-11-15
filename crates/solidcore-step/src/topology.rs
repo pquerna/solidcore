@@ -54,6 +54,7 @@ use crate::units;
 
 mod frames;
 mod seams;
+mod splits;
 mod swept;
 mod wound;
 
@@ -626,6 +627,8 @@ struct Builder<'b, 'a> {
     inner_loops_turned: usize,
     /// Spline surfaces whose first and last control lines met within the tolerance, closed.
     splines_closed: usize,
+    /// Edges splitting a face along a cut off it, laid again inside the two faces it parts.
+    cuts_relaid: usize,
     /// Edges whose tolerance was raised to the gap their curve has to a face's surface.
     raised_edges: HashSet<u32>,
     /// The line edges of POLY_LOOPs, by their two CARTESIAN_POINTs (lower id first): faces that
@@ -651,6 +654,7 @@ impl<'b, 'a> Builder<'b, 'a> {
             lines_between_vertices: 0,
             inner_loops_turned: 0,
             splines_closed: 0,
+            cuts_relaid: 0,
             raised_edges: HashSet::new(),
             poly_edges: HashMap::new(),
         }
@@ -1248,6 +1252,12 @@ impl<'b, 'a> Builder<'b, 'a> {
         let seams = self.add_seams()?;
         if seams > 0 {
             notes.push(format!("{seams} seam edges added to faces that wind around their surface"));
+        }
+        if self.cuts_relaid > 0 {
+            notes.push(format!(
+                "{} edges splitting a face along a cut off it (each half winding once round an open surface) laid again inside the two faces",
+                self.cuts_relaid
+            ));
         }
         if self.splines_closed > 0 {
             notes.push(format!(

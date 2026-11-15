@@ -39,6 +39,7 @@ use crate::geom::vector3d::{Point3, Vec3};
 use crate::kernel::Kernel;
 use crate::nurbs::b_spline_curve::{BSplineCurve, BSplineCurveForm, CanonicalData, KnotType};
 use crate::nurbs::crv_basic::Curve as NurbCurve;
+use crate::nurbs::crv_fit::p1::ParamMethod;
 use crate::nurbs::math::{CPoint, NOW, NOZ};
 use crate::surface::implicit::{conic_turn, curve_on_quadrics, QuadricEquation};
 
@@ -476,6 +477,34 @@ pub(crate) fn b_spline_part<'c>(k: &Kernel, c: &'c Curve) -> Result<Option<Cow<'
         CurveKind::Parabola(p) => Cow::Borrowed(p.base()),
         _ => return Ok(None),
     }))
+}
+
+/// The B-spline of degree `degree` through `points` at `params` (increasing), as the record's
+/// spline: the kernel's interpolation (`N_CrvInterp`, knots by averaging the parameters).
+///
+/// # Errors
+///
+/// `InvalidInput` for fewer than `degree + 1` points, a parameter per point missing or
+/// parameters not increasing; the interpolation's own.
+pub fn interpolated(points: &[[f64; 3]], params: &[f64], degree: usize) -> Result<Record> {
+    let bad = |reason: &'static str| SolidError::invalid_input(OP, reason);
+    if degree == 0 || points.len() <= degree || params.len() != points.len() {
+        return Err(bad("too few points to interpolate"));
+    }
+    if !params.windows(2).all(|w| matches!(w, [a, b] if a < b)) {
+        return Err(bad("interpolation parameters not increasing"));
+    }
+    let points: Vec<Point3> = points.iter().map(|&p| p3(p)).collect();
+    let c = BSplineCurve::interpolate_points(
+        &points,
+        Some(params),
+        degree,
+        None,
+        None,
+        false,
+        ParamMethod::Uniform,
+    )?;
+    spline_record(&c)
 }
 
 /// A B-spline curve's NURBS as the record's spline (every weight 1) or rational spline

@@ -2360,3 +2360,95 @@ fn restarted_curve_errors_keep_their_step_messages() {
     let open = BCurve::Polyline { points: vec![[0.; 3], [1.; 3], [2.; 3]] };
     assert_eq!(crate::kernel::restart_curve(&open, 0.5).unwrap_err(), "spline seam endpoints do not coincide");
 }
+
+/// A B_SPLINE_CURVE_WITH_KNOTS edge from `a` to `b`: the kernel's cubic through `at` at `n + 1`
+/// even parameters on [0, 1].
+fn spline_edge(w: &mut W, a: u64, b: u64, n: usize, at: impl Fn(f64) -> V) -> u64 {
+    let params: Vec<f64> = (0..=n).map(|i| i as f64 / n as f64).collect();
+    let points: Vec<V> = params.iter().map(|&t| at(t)).collect();
+    let BCurve::Spline { knots, points: ctrl } = crate::kernel::interpolate(&points, &params, 3).unwrap() else { panic!("a spline") };
+    let ids: Vec<u64> = ctrl.iter().map(|p| w.pt(*p)).collect();
+    let mut runs: Vec<(f64, usize)> = Vec::new();
+    for k in &knots {
+        match runs.last_mut() {
+            Some(last) if last.0 == *k => last.1 += 1,
+            _ => runs.push((*k, 1)),
+        }
+    }
+    let mults: Vec<String> = runs.iter().map(|k| k.1.to_string()).collect();
+    let values: Vec<String> = runs.iter().map(|k| real(k.0)).collect();
+    let curve = w.add(format!(
+        "B_SPLINE_CURVE_WITH_KNOTS('',3,({}),.UNSPECIFIED.,.F.,.F.,({}),({}),.UNSPECIFIED.)",
+        list(&ids),
+        mults.join(","),
+        values.join(",")
+    ));
+    w.add(format!("EDGE_CURVE('',#{a},#{b},#{curve},.T.)"))
+}
+
+/// One turn of a helical band on a cylinder of radius 5 (a thread's root), between helices of
+/// pitch 2 a width 0.5 apart, written as two faces on two equal surface records split along the
+/// straight ruling from the start of the upper helix to the end of the lower one: off the band,
+/// so each face alone winds once round the open cylinder and bounds nothing. The cut is laid
+/// again inside the band (the helices' pcurves are the kernel's: a helix has no closed form).
+#[test]
+fn a_face_split_along_an_edge_off_it_gets_the_cut_inside() {
+    let (r, pitch, width) = (5.0, 2.0, 0.5);
+    let helix = |z0: f64| move |t: f64| [r * (TAU * t).cos(), r * (TAU * t).sin(), z0 + pitch * t];
+    let mut w = W::default();
+    let corner = |z: f64| [r, 0.0, z];
+    let (a0, b0, a1, b1) = (w.vertex(corner(0.0)), w.vertex(corner(width)), w.vertex(corner(pitch)), w.vertex(corner(pitch + width)));
+    let lower = spline_edge(&mut w, a0, a1, 256, helix(0.0));
+    let upper = spline_edge(&mut w, b0, b1, 256, helix(width));
+    let start = w.line_edge((a0, corner(0.0)), (b0, corner(width)), true, 1.0);
+    let end = w.line_edge((a1, corner(pitch)), (b1, corner(pitch + width)), true, 1.0);
+    let cut = w.line_edge((b0, corner(width)), (a1, corner(pitch)), true, 1.0);
+    let cylinder = |w: &mut W| {
+        let a = w.axis([0.0; 3], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]);
+        w.add(format!("CYLINDRICAL_SURFACE('',#{a},{})", real(r)))
+    };
+    // The band counter-clockwise in (angle, height): the lower helix, its end, the upper helix
+    // back, its start. The cut takes each half's share.
+    let ring = |w: &mut W, uses: &[(u64, bool)]| uses.iter().map(|&(e, o)| w.oe(e, o)).collect::<Vec<_>>();
+    let upper_half = ring(&mut w, &[(upper, false), (cut, true), (end, true)]);
+    let lower_half = ring(&mut w, &[(lower, true), (cut, false), (start, false)]);
+    let mut faces = Vec::new();
+    for oes in [upper_half, lower_half] {
+        let bound = w.bound(&oes, true, true);
+        let surface = cylinder(&mut w);
+        faces.push(w.face(&[bound], surface, true));
+    }
+    let shell = w.add(format!("OPEN_SHELL('',({}))", list(&faces)));
+    let model = w.add(format!("SHELL_BASED_SURFACE_MODEL('band',(#{shell}))"));
+    let ex = w.file(&[model]);
+    let read = read_solids_with(&ex, &solidcore_ops::trims::KernelTrims);
+    assert!(read.failures.is_empty(), "{:?}", read.failures);
+    let [s] = read.solids.as_slice() else { panic!("one solid") };
+    solidcore_ops::record_check::validate(&s.brep).unwrap();
+    solidcore_ops::record_check::agreement(&s.brep).unwrap();
+    assert!(s.notes.iter().any(|n| n.contains("1 edges splitting a face")), "{:?}", s.notes);
+    assert_eq!(counts(&s.brep), [1, 1, 2, 5, 4]);
+    // The cut now runs inside the band: halfway along it, half a turn round, between the helices.
+    let used_twice: Vec<&brep::Edge> = s.brep.edges.iter().filter(|e| e.uses.len() == 2).collect();
+    let [e] = used_twice.as_slice() else { panic!("one shared edge") };
+    let c = CurveEval::new(&e.curve).unwrap();
+    let m = c.point(0.5 * (e.interval[0] + e.interval[1])).unwrap();
+    assert!((m.x.hypot(m.y) - r).abs() < 1e-6, "{m:?}");
+    assert!((m.y.atan2(m.x).abs() - PI).abs() < 1e-3, "{m:?}");
+    let (lo, hi) = (0.5 * pitch, 0.5 * pitch + width);
+    assert!(m.z > lo && m.z < hi, "{m:?}");
+    // Without the relay each half refuses as bounding nothing; one half alone still does.
+    let mut alone = W::default();
+    let (a0, b0, a1) = (alone.vertex(corner(0.0)), alone.vertex(corner(width)), alone.vertex(corner(pitch)));
+    let lower = spline_edge(&mut alone, a0, a1, 256, helix(0.0));
+    let start = alone.line_edge((a0, corner(0.0)), (b0, corner(width)), true, 1.0);
+    let cut = alone.line_edge((b0, corner(width)), (a1, corner(pitch)), true, 1.0);
+    let half = ring(&mut alone, &[(lower, true), (cut, false), (start, false)]);
+    let bound = alone.bound(&half, true, true);
+    let surface = cylinder(&mut alone);
+    let face = alone.face(&[bound], surface, true);
+    let shell = alone.add(format!("OPEN_SHELL('',(#{face}))"));
+    let model = alone.add(format!("SHELL_BASED_SURFACE_MODEL('half',(#{shell}))"));
+    let read = read_solids_with(&alone.file(&[model]), &solidcore_ops::trims::KernelTrims);
+    assert!(read.failures.iter().any(|f| f.message.contains("open surface of revolution with one bound")), "{:?}", read.failures);
+}

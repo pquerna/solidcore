@@ -1768,5 +1768,8 @@ fn a_pcurve_made_on_a_moved_interval_is_put_on_the_edges_own() {
     assert!((knots[2] - mid).abs() <= 1e-15, "{knots:?}");
     assert_eq!(points, vec![[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]]);
     let far = on_interval(made, &line, [0.0, 1.0], [0.001, 1.0], 0.005);
-    assert!(matches!(&far, Err(Error::Failed(m)) if m.contains("moved an edge's interval")), "{far:?}");
+    assert!(
+        matches!(&far, Err(Error::Failed(m)) if m.contains("moved an edge's interval")),
+        "{far:?}"
+    );
 }

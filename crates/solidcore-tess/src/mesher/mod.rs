@@ -1833,7 +1833,10 @@ fn plan_face(
         let fill = cdt::Fill {
             seeds: &seeds,
             refine: if bare { None } else { Some((sag, MAX_REFINE)) },
-            shape: !matches!(**s, EvalSurface::Plane { .. }),
+            // Shaped for shading only when a facet angle is asked: a chord-only caller asks for
+            // the surface within the tolerance alone, and shaping round a trim corner sharper
+            // than its angle crowds points onto each other until triangles have no area.
+            shape: !planar && rules.turn.is_some(),
             lenient: lenient == Lenient::Yes,
             flat: (bare && lenient == Lenient::No).then(|| cdt::Flat { min_angle: FLAT_MIN_ANGLE_DEG, max_points: uvs.len(), min_area: cdt::smallest_area(tol) }),
         };

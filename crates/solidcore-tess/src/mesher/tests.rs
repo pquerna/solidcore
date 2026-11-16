@@ -376,7 +376,7 @@ mod refusals {
 
     /// A cylinder's side, whose loop starts two edges at its bottom seam vertex: the bottom circle
     /// at (0, 0) and the seam going up at (2 pi r, 0). Moved so the seam's pcurve starts 2e-8 above
-    /// the circle's (within the vertex's tolerance, as a record's pcurves end), the face's boundary
+    /// the circle's (a step no chord resolves, as a record's pcurves end), the face's boundary
     /// still takes one height for the vertex, the circle's, a period along: no step in (u, v) for a
     /// neighbouring side to cross.
     #[test]

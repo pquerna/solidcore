@@ -734,8 +734,27 @@ fn boundary(
             if let (Some(&v), Some(q)) = (edge.vertices.get(usize::from(!oe.forward)), eq.first_mut()) {
                 match at_vertex.get(&v) {
                     Some(first) => {
-                        if first.iter().zip(q.iter()).all(|(f, x)| (f - x).abs() <= 1e-9 * f.abs().max(x.abs()).max(1.0)) {
-                            *q = *first;
+                        // One vertex, one point of the face: the use met first gives it its
+                        // parameters. Another use whose pcurve ends a hair away (one edge's pcurve
+                        // ends on the vertex, the next one's within the vertex's tolerance of it)
+                        // takes them too, a period along where that is nearer, unless either is at
+                        // a pole, where the vertex stands for a whole line of the parameters. Left
+                        // apart, the two ends make a step in the boundary too small for any chord
+                        // to follow beside a neighbouring side, and the face is not meshed.
+                        let mut w = *first;
+                        for (d, per) in dom.period.into_iter().enumerate() {
+                            if let Some(wd) = w.get_mut(d) {
+                                *wd = uv::unwrap(*wd, comp(q, d), per);
+                            }
+                        }
+                        let equal = w.iter().zip(q.iter()).all(|(f, x)| (f - x).abs() <= 1e-9 * f.abs().max(x.abs()).max(1.0));
+                        let near = || {
+                            let tol = vertex_point(v).map_or(0.0, |(_, tv)| tv).min(rules.tol);
+                            !(0..2).any(|d| pole_along(w, d) || pole_along(*q, d))
+                                && s.derivs(w[0], w[1]).zip(s.derivs(q[0], q[1])).is_some_and(|(a, b)| a.0.dist(b.0) <= tol)
+                        };
+                        if equal || near() {
+                            *q = w;
                         }
                     }
                     None => {
@@ -833,7 +852,41 @@ fn boundary(
             }
         }
     }
+    let pole = |q: [f64; 2]| (0..2).any(|d| pole_along(q, d));
+    separate_coincident(s, &dom, &mut out.loops, &pole, (rules.tol * 10.0).max(1e-6));
     Ok(out)
+}
+
+/// Loop nodes the face's pcurves put at one point of (u, v) though they stand apart in space (a
+/// pcurve that ends where its neighbour starts, though its edge ends a hair off it: the foot of a
+/// spike the face runs out along and back) would be one vertex of the triangulation, drawn at the
+/// first of them, and the edges of the others left open against the faces that share them. Each
+/// later one takes the parameters of its own point, projected from the shared ones, a period
+/// along where that is nearer. Nodes at a pole (`pole`), where one point stands for a line of the
+/// parameters, and nodes that are one point (a pinch) are left as they are.
+pub(crate) fn separate_coincident(s: &EvalSurface, dom: &uv::Domain, loops: &mut [seam::Loop], pole: &dyn Fn([f64; 2]) -> bool, accept: f64) {
+    let mut first: HashMap<[u64; 2], Vec3> = HashMap::new();
+    for l in loops.iter_mut() {
+        for (q, p) in l.uv.iter_mut().zip(&l.pts) {
+            let key = q.map(f64::to_bits);
+            match first.get(&key) {
+                None => {
+                    first.insert(key, *p);
+                }
+                Some(seen) if seen != p && !pole(*q) => {
+                    if let Some(mut own) = solidcore::eval::plan::uv::project(s, dom, *p, Some(*q), accept) {
+                        for (d, per) in dom.period.into_iter().enumerate() {
+                            if let Some(od) = own.get_mut(d) {
+                                *od = uv::unwrap(*od, comp(q, d), per);
+                            }
+                        }
+                        *q = own;
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+    }
 }
 
 /// A face's boundary loops, and for each loop node the edge segment that starts there: the

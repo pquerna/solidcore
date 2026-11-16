@@ -46,6 +46,28 @@ fn loops_touching_at_a_shared_vertex_bound_the_face() {
     assert!(closed_boundary(&ranges, &fixed, &uvs, &triangles), "the triangles follow both holes through their shared vertex");
 }
 
+/// Two nodes of a loop that its pcurves put at one point of (u, v) though they stand apart in
+/// space (a pcurve ending where its neighbour starts, its edge ending a hair off): the later one
+/// takes the parameters of its own point, the others are left as they were. One (u, v) for both
+/// would be one vertex of the triangulation, drawn at the first of them, the second's edges left
+/// open against the faces that share them.
+#[test]
+fn nodes_at_one_parameter_point_apart_in_space_are_separated() {
+    let (s, _, _) = a_face_crossing_itself();
+    let at = |q: [f64; 2]| s.derivs(q[0], q[1]).map(|d| d.0).expect("evaluates");
+    let uv = vec![[0.2, 0.2], [0.8, 0.2], [0.5, 0.5], [0.5, 0.8], [0.5, 0.5], [0.2, 0.8]];
+    let mut pts: Vec<Vec3> = uv.iter().map(|q| at(*q)).collect();
+    let apart = [0.5 + 1e-4, 0.5];
+    pts[4] = at(apart);
+    let mut loops = vec![seam::Loop { uv: uv.clone(), pts }];
+    separate_coincident(&s, &uv::domain(&s), &mut loops, &|_| false, 0.05);
+    for k in [0, 1, 2, 3, 5] {
+        assert_eq!(loops[0].uv[k], uv[k], "node {k} unchanged");
+    }
+    let q = loops[0].uv[4];
+    assert!((q[0] - apart[0]).abs() < 1e-9 && (q[1] - apart[1]).abs() < 1e-9, "node 4 at its own point: {q:?}");
+}
+
 /// A face meeting itself along a line (a hole's wall tangent inside the wall round it, cut from
 /// the boss side's top rim down to the hole's bottom): its loop runs up the slit and back down
 /// it, with the face on both sides. The iso-line grid's band beside the slit is the face on
@@ -350,6 +372,28 @@ mod refusals {
             }
         }
         oe.edge
+    }
+
+    /// A cylinder's side, whose loop starts two edges at its bottom seam vertex: the bottom circle
+    /// at (0, 0) and the seam going up at (2 pi r, 0). Moved so the seam's pcurve starts 2e-8 above
+    /// the circle's (within the vertex's tolerance, as a record's pcurves end), the face's boundary
+    /// still takes one height for the vertex, the circle's, a period along: no step in (u, v) for a
+    /// neighbouring side to cross.
+    #[test]
+    fn a_vertex_whose_pcurves_end_a_hair_apart_takes_one_parameter_point() {
+        let mut b = fixture("cylinder_r10_h5");
+        let Loop::Edges { edges } = &mut b.faces[0].loops[0] else { panic!("an edge loop") };
+        let up = &mut edges[2];
+        assert!(up.forward && up.edge == 0, "the seam going up");
+        let brep::Curve2::Spline { points, .. } = &mut up.pcurve else { panic!("a line") };
+        points[0][1] += 2e-8;
+        let (p, stats) = ok(plan(&b, &MeshTolerance::chord(0.01), size_of("cylinder_r10_h5")));
+        assert!(stats.lenient.is_empty() && stats.unmeshed.is_empty(), "{stats:?}");
+        let f = p.faces.iter().find(|f| f.face == 0).expect("the side planned");
+        let corner = b.vertices[0].point;
+        let at_corner: Vec<[f64; 2]> = f.fixed.iter().zip(&f.uv).filter(|(x, _)| [x.x, x.y, x.z] == corner).map(|(_, q)| *q).collect();
+        assert!(at_corner.len() >= 2, "the vertex starts two edges of the loop: {at_corner:?}");
+        assert!(at_corner.iter().all(|q| q[1] == at_corner[0][1]), "one height for the vertex: {at_corner:?}");
     }
 
     /// A cylinder face without its NURBS form (a label alone, an unvalidated record): the mesher

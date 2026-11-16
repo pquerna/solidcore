@@ -736,7 +736,7 @@ fn boundary(
                     Some(first) => {
                         // One vertex, one point of the face: the use met first gives it its
                         // parameters. Another use whose pcurve ends a hair away (one edge's pcurve
-                        // ends on the vertex, the next one's within the vertex's tolerance of it)
+                        // ends on the vertex, the next one's a step no chord resolves from it)
                         // takes them too, a period along where that is nearer, unless either is at
                         // a pole, where the vertex stands for a whole line of the parameters. Left
                         // apart, the two ends make a step in the boundary too small for any chord
@@ -748,9 +748,15 @@ fn boundary(
                             }
                         }
                         let equal = w.iter().zip(q.iter()).all(|(f, x)| (f - x).abs() <= 1e-9 * f.abs().max(x.abs()).max(1.0));
+                        // Only a step no chord resolves: below the shortest side refinement
+                        // makes (see `sag::refine`). A larger one, within the vertex's tolerance
+                        // or not, is the record's own (a face winding just past one turn).
+                        // Near in (u, v) too: the two ends of a closed chart that is not marked
+                        // periodic are one point in space, a whole side apart in (u, v).
                         let near = || {
-                            let tol = vertex_point(v).map_or(0.0, |(_, tv)| tv).min(rules.tol);
-                            !(0..2).any(|d| pole_along(w, d) || pole_along(*q, d))
+                            let tol = vertex_point(v).map_or(0.0, |(_, tv)| tv).min(rules.tol * 1e-3);
+                            w.iter().zip(q.iter()).all(|(f, x)| (f - x).abs() <= 1e-6 * f.abs().max(x.abs()).max(1.0))
+                                && !(0..2).any(|d| pole_along(w, d) || pole_along(*q, d))
                                 && s.derivs(w[0], w[1]).zip(s.derivs(q[0], q[1])).is_some_and(|(a, b)| a.0.dist(b.0) <= tol)
                         };
                         if equal || near() {

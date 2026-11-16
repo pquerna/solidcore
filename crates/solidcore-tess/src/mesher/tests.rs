@@ -520,3 +520,56 @@ fn a_sliver_whose_vertices_come_twice_is_still_drawn() {
     }
 }
 
+
+/// A quarter of a cone (60 degree half angle, radius 2.75 mm, in its rational quadratic form) cut
+/// by a plane along its axis: an arch in (u, v) standing on the parameter box's lower side, meeting
+/// it at about nine degrees at each foot and touching the upper side at its top. Meshed for the
+/// chord alone (no facet angle), no two of its points coincide. Shaping by angle round those feet
+/// crowded points onto each other, down to triangles with no area.
+#[test]
+fn a_chord_only_cone_cut_by_a_plane_has_no_coincident_points() {
+    let v0 = -1.922962686383559e-16;
+    let v1 = 0.24562009306186885;
+    let s = EvalSurface::Nurbs {
+        degree: [2, 1],
+        knots: [vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![v0, v0, v1, v1]],
+        count: [3, 2],
+        ctrl: vec![
+            [0.0, 1.2000000000000002, -2.7499999999999996, 1.0],
+            [1.9445436482630054, 0.8485281374238572, -1.9445436482630054, std::f64::consts::FRAC_1_SQRT_2],
+            [2.7499999999999996, 1.2000000000000002, 0.0, 1.0],
+            [0.0, 0.9543799069381311, -3.175426480542955, 1.0],
+            [2.245365597551256, 0.6748485040241388, -2.245365597551256, std::f64::consts::FRAC_1_SQRT_2],
+            [3.175426480542955, 0.9543799069381311, 0.0, 1.0],
+        ],
+        closed: [false, false],
+    };
+    // The arch (the plane's cut), then back along the lower side.
+    let mut uv: Vec<[f64; 2]> = vec![
+        [1.0, v0],
+        [0.9078232861558841, 0.014313313341410653],
+        [0.8204928934031376, 0.05803807757283692],
+        [0.7376364085392237, 0.13363886392894497],
+        [0.6589186225978865, v1],
+        [0.581507390734672, 0.13363886392894986],
+        [0.5027544379751694, 0.05803807757284536],
+        [0.42262457655060076, 0.01431331334142186],
+    ];
+    for k in 0..15 {
+        uv.push([0.3410813774021079 + 0.04118241391236825 * f64::from(k), v0]);
+    }
+    let pts: Vec<Vec3> = uv.iter().filter_map(|q| s.derivs(q[0], q[1]).map(|(p, _, _)| p)).collect();
+    assert_eq!(pts.len(), uv.len());
+    let l = seam::Loop { uv, pts };
+    let tol = 0.005;
+    let rules = size::Rules::new(tol, 9.296594373850136, None);
+    let size = size::face_size(&s, &uv::domain(&s), &rules);
+    let mut stats = PlanStats::default();
+    let Ok(Planned::Face(fp)) = plan_face(0, "cone", &poles::Face::new(s.clone(), 0.0), std::slice::from_ref(&l), &rules, size, 0.0, &mut stats, Lenient::No, Purpose::Display) else { panic!("planned") };
+    // Points closer than this in (u, v) (the box is about one unit across) evaluate to one point.
+    let apart = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs().max((a[1] - b[1]).abs()) > 1e-9;
+    for t in &fp.triangles {
+        let [a, b, c] = t.map(|i| fp.uv[i as usize]);
+        assert!(apart(a, b) && apart(b, c) && apart(c, a), "triangle {t:?} at {a:?} {b:?} {c:?} ({} triangles, {} points)", fp.triangles.len(), fp.uv.len());
+    }
+}
